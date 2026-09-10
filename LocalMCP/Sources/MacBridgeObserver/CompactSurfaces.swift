@@ -512,21 +512,11 @@ struct FloatingTabView: View {
         Button {
             controller.openDashboard()
         } label: {
-          ZStack(alignment: .bottomTrailing) {
-            MacBridgeMark(size: MBMetrics.edgeLogoSize)
-            if preferences.showTaskCount, let badge = summary.activeBadgeText {
-                Text(badge)
-                    .font(.system(size: 8, weight: .bold, design: .rounded))
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 2).frame(minWidth: 14, minHeight: 14)
-                    .background(MBPalette.brandBlue.opacity(0.92), in: Capsule())
-                    .offset(x: 1, y: 3)
-                    .accessibilityLabel("\(summary.activeCount) active tasks")
-            }
-          }.frame(width: MBMetrics.edgeTargetSize, height: MBMetrics.edgeTargetSize)
+            CompactBrandBadge(summary: summary, showCount: preferences.showTaskCount)
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Open MacBridge Dashboard")
+        .help(summary.runningBadgeHelp)
     }
 
     private var railContent: some View {
@@ -568,7 +558,7 @@ struct FloatingTabView: View {
 
     private var panelHeader: some View {
         HStack(spacing: 9) {
-            MacBridgeMark(size: 28)
+            MacBridgeMark(size: 28, style: .monochrome)
             VStack(alignment: .leading, spacing: 1) {
                 Text("MacBridge").font(.system(size: 15, weight: .semibold))
                 Text(panelStatusText).font(.system(size: 11)).foregroundStyle(MBPalette.textSecondary)
@@ -634,7 +624,7 @@ struct FloatingTabView: View {
 
     private func taskDetailPanel(id: String) -> some View {
         let task = summary.tasks.first { $0.id == id }
-        let work = model.activityFeed.groups.first { $0.id == id }
+        let work = model.allActivityFeed.groups.first { $0.id == id }
         return VStack(alignment: .leading, spacing: 14) {
             HStack {
                 Button { controller.show(.recentTasks) } label: { Image(systemName: "chevron.left").frame(width: 28, height: 28) }
@@ -694,6 +684,31 @@ struct FloatingTabView: View {
                             onOpenFullSettings: controller.openSettings,
                             onClose: controller.closeDeepest)
             .padding(16)
+    }
+}
+
+/// One narrow, transparent brand target in both idle and expanded states.
+/// Count changes do not resize/move the window or add polling/animation work.
+struct CompactBrandBadge: View {
+    let summary: CompactSummary
+    let showCount: Bool
+
+    var body: some View {
+        VStack(spacing: 2) {
+            MacBridgeMark(size: MBMetrics.edgeLogoSize, style: .monochrome)
+            if showCount {
+                Text(summary.runningBadgeText)
+                    .font(.system(size: 8.5, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                    .frame(minWidth: 18, maxWidth: 26, minHeight: 12, maxHeight: 12)
+                    .background(Color.primary.opacity(0.10), in: Capsule())
+                    .accessibilityLabel(summary.runningBadgeHelp)
+                    .accessibilityIdentifier("floating-running-count")
+            }
+        }
+        .foregroundStyle(.primary)
+        .frame(width: MBMetrics.edgeTargetSize, height: MBMetrics.edgeBrandHeight)
+        .animation(nil, value: summary.runningBadgeText)
     }
 }
 
@@ -777,7 +792,7 @@ struct CompactSettingsView: View {
             Picker("Appearance", selection: $preferences.appearance) {
                 ForEach(ObserverAppearance.allCases, id: \.self) { Text($0.label).tag($0) }
             }.pickerStyle(.segmented)
-            Toggle("Show active task count", isOn: $preferences.showTaskCount)
+            Toggle("Show running task count", isOn: $preferences.showTaskCount)
             Toggle("Reduce MacBridge motion", isOn: $preferences.reduceMacBridgeMotion)
             Toggle("Reduce transparency", isOn: $preferences.reduceTransparency)
             HStack(spacing: 8) {

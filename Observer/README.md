@@ -6,9 +6,11 @@ full Activity/Details dashboard. It does not start MCP, a tunnel, an AI model,
 XPC, a daemon or a terminal window. Closing its windows does not stop the owner.
 Building it does not change the installed normal-Chat runtime.
 
-Raw packages include the canonical blue PNG and ICNS. The mark appears in the
-menu bar, edge tab, panels and dashboard; the full icon remains available to
-Finder and Spotlight. The app is an `LSUIElement`, so it does not add a permanent
+Raw packages retain the canonical blue PNG and ICNS for app identity, Dashboard,
+Finder and Spotlight. Compact chrome (menu bar, edge tab and its panel header)
+uses a transparent native ribbon template, black in light appearance and white
+in dark appearance, without a blue square behind it. Template images are cached
+at bounded UI sizes. The app is an `LSUIElement`, so it does not add a permanent
 Dock tile. Packaging tests compare both bundled assets to the reviewed source
 hashes; packaging does not download or regenerate artwork.
 
@@ -17,10 +19,13 @@ hashes; packaging does not download or regenerate artwork.
 - Launch initializes the menu-bar item and right-edge tab without opening or
   focusing the dashboard. `--dashboard` is the explicit developer/test opt-in.
 - The idle edge tab is a static 30×58 organic handle on the main display at a
-  saved per-display vertical position. It shows the blue mark and only shows a
-  task badge for a positive active count (running plus waiting; `1`–`99`, then
-  `99+`). The textual summary distinguishes those states.
-- A 100 ms hover dwell opens one inward 36×196 rail. The 26pt logo opens
+  saved per-display vertical position. Its transparent 22pt monochrome mark
+  has a running-count badge underneath, visible without hovering: `0`–`99`,
+  then `99+`. Waiting tasks are reported separately, not counted as running.
+  A disconnected, busy, missing or stale jobs snapshot shows `–`, not a false
+  zero. The badge uses all observed workspaces regardless of the Dashboard
+  filter; it can be hidden with the existing count preference.
+- A 100 ms hover dwell opens one inward 36×196 rail. The 22pt logo opens
   Dashboard directly; the other four targets are connection refresh, Recent
   Tasks, Settings and Hide Widget. Quick Actions and its lightning shortcut are
   removed. Recent Tasks does not duplicate Dashboard with a View all footer,
@@ -30,7 +35,9 @@ hashes; packaging does not download or regenerate artwork.
 - The logo stays at the same screen position when the rail opens. All panels
   share that fixed rail anchor, including near display edges; changing task
   counts does not move it. Its center remains 15pt from the right edge. The
-  display remains pinned until it disconnects.
+  upper curve keeps its compact height as the rail grows below the logo, so
+  neither the mark nor its badge crosses the glass silhouette during the morph.
+  The display remains pinned until it disconnects.
 - Only Recent Tasks offers a 100 ms icon-hover preview. Connection, Settings
   and Hide Widget are click-only, so crossing them does not switch panels or
   perform an action. Clicking a preview pins it; hover cannot replace a pinned
@@ -76,7 +83,8 @@ hashes; packaging does not download or regenerate artwork.
   this does not activate MacBridge. Changes to these material values still
   require exact-binary native acceptance; offscreen arithmetic or layout tests
   do not establish visual equivalence to a mockup or compositor smoothness.
-- The menu-bar item shows the canonical mark and an optional active count.
+- The menu-bar item shows the monochrome template and the same optional running
+  count, including zero. Count visibility changes apply immediately.
   Its native menu contains at most two task rows, then Dashboard, Recent Tasks,
   Show/Hide Widget, connection, Settings and Quit Interface.
 - Compact task state is derived from the same bounded owner snapshot as the
@@ -104,8 +112,11 @@ hashes; packaging does not download or regenerate artwork.
   These bounds reduce avoidable work, but are not measured CPU, RAM or battery
   savings. No periodic polling is created for an unattached model.
 - Rendering tests inject the exact canonical PNG from source, rather than the
-  source-binary fallback mark. Opaque layout snapshots exercise accessibility
-  fallback only; they must not be presented as native glass acceptance.
+  source-binary fallback mark, for full-color app surfaces. Compact branding is
+  separately rendered from its native template in both appearances and checked
+  for transparent corners, no blue tile, count visibility and shape containment.
+  Opaque layout snapshots exercise accessibility fallback only; they must not
+  be presented as native glass acceptance.
 - Full-screen display is off by default. The tab and panels clamp to the actual
   `visibleFrame`, including offset displays and space reserved by the Dock/menu
   bar. Keyboard Escape closes the deepest layer first; hover never activates or

@@ -83,11 +83,27 @@ final class ObserverModel: ObservableObject {
         activityFeed.items.filter { $0.kind == .call }.map(\.raw)
     }
     var activityFeed: ActivityFeed {
+        makeActivityFeed(workspace: workspace)
+    }
+    var allActivityFeed: ActivityFeed {
+        makeActivityFeed(workspace: "all")
+    }
+    private func makeActivityFeed(workspace: String) -> ActivityFeed {
         ActivityFeed(history: allHistory, jobs: jobs, workItems: workItems,
                      workspaces: snapshot["workspaces"] as? [[String: Any]] ?? [],
                      workspace: workspace, connected: connected,
                      stale: busy || snapshot["snapshot_stale"] as? Bool == true || snapshot["jobs"] == nil,
                      now: contextNow)
+    }
+
+    func selectGlobalActivity(_ id: String) {
+        let visible = activityFeed
+        if !visible.items.contains(where: { $0.id == id })
+            && !visible.groups.contains(where: { $0.id == id })
+            && !visible.contextGroups.contains(where: { $0.id == id }) {
+            workspace = "all"
+        }
+        selection = id
     }
     var selectedActivity: ActivityItem? {
         activityFeed.items.first { $0.id == selection }

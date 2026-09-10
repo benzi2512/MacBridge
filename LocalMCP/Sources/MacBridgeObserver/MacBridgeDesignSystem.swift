@@ -6,7 +6,8 @@ enum MBMetrics {
     static let edgeIdleHeight: CGFloat = 58
     static let edgeRailWidth: CGFloat = 36
     static let edgeRailHeight: CGFloat = 196
-    static let edgeLogoSize: CGFloat = 26
+    static let edgeLogoSize: CGFloat = 22
+    static let edgeBrandHeight: CGFloat = 38
     static let edgeTargetSize: CGFloat = 28
     static let edgeRailSpacing: CGFloat = 7
     static let panelGap: CGFloat = 0
@@ -97,6 +98,7 @@ struct CompactTaskPresentation: Identifiable, Equatable, Sendable {
 struct CompactSummary: Equatable, Sendable {
     let connected: Bool
     let busy: Bool
+    let countIsCurrent: Bool
     let tasks: [CompactTaskPresentation]
 
     var runningCount: Int { tasks.filter { $0.status == .running }.count }
@@ -104,9 +106,15 @@ struct CompactSummary: Equatable, Sendable {
     var activeCount: Int { runningCount + waitingCount }
     var activeBadgeText: String? { activeCount == 0 ? nil : activeCount > 99 ? "99+" : String(activeCount) }
     var failedCount: Int { tasks.filter { $0.status == .failed }.count }
-    var runningBadgeText: String? {
-        guard runningCount > 0 else { return nil }
+    var runningBadgeText: String {
+        guard countIsCurrent else { return "–" }
         return runningCount > 99 ? "99+" : String(runningCount)
+    }
+
+    var runningBadgeHelp: String {
+        guard countIsCurrent else { return "Running task count unavailable · waiting for a current MacBridge snapshot" }
+        return "\(runningCount) \(runningCount == 1 ? "task" : "tasks") running across all workspaces"
+            + (waitingCount > 0 ? " · \(waitingCount) waiting for the next step" : "")
     }
 
     var globalStatus: CompactTaskStatus {
@@ -118,6 +126,7 @@ struct CompactSummary: Equatable, Sendable {
 
     var statusText: String {
         guard connected else { return "disconnected" }
+        guard countIsCurrent else { return busy ? "updating" : "status unavailable" }
         if runningCount > 0 { return "\(runningCount) running" }
         if waitingCount > 0 { return "\(waitingCount) waiting" }
         if failedCount > 0 { return "\(failedCount) failed" }
@@ -127,6 +136,7 @@ struct CompactSummary: Equatable, Sendable {
     init(feed: ActivityFeed, connected: Bool, busy: Bool) {
         self.connected = connected
         self.busy = busy
+        countIsCurrent = connected && feed.jobsCurrent
         var rows: [CompactTaskPresentation] = []
         rows.reserveCapacity(feed.groups.count + feed.contextGroups.count + feed.ungroupedItems.count)
 
@@ -208,7 +218,9 @@ struct CompactSummary: Equatable, Sendable {
 
 extension ObserverModel {
     var compactSummary: CompactSummary {
-        CompactSummary(feed: activityFeed, connected: connected, busy: busy)
+        // The menu bar and widget describe the owner, not the Dashboard's
+        // selected workspace. A local filter must never hide another task.
+        CompactSummary(feed: allActivityFeed, connected: connected, busy: busy)
     }
 }
 
@@ -522,7 +534,9 @@ struct OrganicEdgeShape: Shape {
         // with a long straight reading edge, matching the approved Concept 7
         // instead of producing a large semicircular bulge.
         let inner: CGFloat = 0
-        let upperShoulder = h * (0.28 - 0.08 * amount)
+        // The rail grows below the fixed brand target. Scaling the shoulder
+        // with the whole rail height cuts into that target when expanded.
+        let upperShoulder = min(h * (0.28 - 0.08 * amount), MBMetrics.edgeIdleHeight * 0.28)
         let lowerShoulder = h - upperShoulder
         var path = Path()
         path.move(to: CGPoint(x: w, y: 0))
@@ -540,31 +554,34 @@ struct OrganicEdgeShape: Shape {
 }
 
 enum MacBridgeMarkRenderer {
+    enum Style: Hashable { case appIcon, monochrome }
+    private struct CacheKey: Hashable { let size: CGFloat; let style: Style }
     // Keep the original pixel representations. Cache only the finite UI sizes;
     // a new model publication must not allocate another logo image each time.
-    @MainActor private static var images: [CGFloat: NSImage] = [:]
-    private static let cachedSizes: Set<CGFloat> = [18, 24, 26, 28, 32, 40, 48, 64, 96]
+    @MainActor private static var images: [CacheKey: NSImage] = [:]
+    private static let cachedSizes: Set<CGFloat> = [18, 22, 24, 26, 28, 32, 40, 48, 64, 96]
     private static let canonicalImage: NSImage? = {
         guard let url = Bundle.main.url(forResource: "MacBridge", withExtension: "png") else { return nil }
         return NSImage(contentsOf: url)
     }()
 
-    @MainActor static func image(size: CGFloat) -> NSImage {
-        if let image = images[size] { return image }
-        let image = makeImage(size: size)
-        if cachedSizes.contains(size) { images[size] = image }
+    @MainActor static func image(size: CGFloat, style: Style = .appIcon) -> NSImage {
+        let key = CacheKey(size: size, style: style)
+        if let image = images[key] { return image }
+        let image = makeImage(size: size, style: style)
+        if cachedSizes.contains(size) { images[key] = image }
         return image
     }
 
-    private static func makeImage(size: CGFloat) -> NSImage {
-        if let exact = canonicalImage?.copy() as? NSImage {
+    private static func makeImage(size: CGFloat, style: Style) -> NSImage {
+        if style == .appIcon, let exact = canonicalImage?.copy() as? NSImage {
             exact.size = CGSize(width: size, height: size)
             exact.isTemplate = false
             return exact
         }
-        // Source/test binaries do not carry bundle resources. Keep a bounded
-        // mark fallback for offscreen tests; packaged UI always takes the exact
-        // user-approved PNG path above.
+        // Reuse the native ribbon for template chrome, without the blue bitmap
+        // tile. Template rendering adapts to the system appearance and scale;
+        // the full-color user artwork remains the Dock/Finder app icon.
         let image = NSImage(size: CGSize(width: size, height: size), flipped: false) { rect in
             let w = rect.width, h = rect.height
             let ribbon = NSBezierPath()
@@ -583,18 +600,50 @@ enum MacBridgeMarkRenderer {
             ribbon.curve(to: CGPoint(x: 0.08 * w, y: 0.22 * h),
                          controlPoint1: CGPoint(x: 0.28 * w, y: 0.58 * h), controlPoint2: CGPoint(x: 0.17 * w, y: 0.31 * h))
             ribbon.close()
-            NSGradient(colors: [MBPalette.nsCyan, MBPalette.nsBrandBlue, MBPalette.nsElectricBlue])?
-                .draw(in: ribbon, angle: -24)
+            if style == .monochrome {
+                // Rounded ribbon silhouette, including both substantial feet;
+                // keep the app artwork's shape at small sizes, not its tile.
+                ribbon.removeAllPoints()
+                ribbon.move(to: CGPoint(x: 0.05 * w, y: 0.22 * h))
+                ribbon.curve(to: CGPoint(x: 0.35 * w, y: 0.80 * h),
+                             controlPoint1: CGPoint(x: 0.12 * w, y: 0.46 * h), controlPoint2: CGPoint(x: 0.20 * w, y: 0.78 * h))
+                ribbon.curve(to: CGPoint(x: 0.60 * w, y: 0.58 * h),
+                             controlPoint1: CGPoint(x: 0.47 * w, y: 0.82 * h), controlPoint2: CGPoint(x: 0.50 * w, y: 0.58 * h))
+                ribbon.curve(to: CGPoint(x: 0.78 * w, y: 0.64 * h),
+                             controlPoint1: CGPoint(x: 0.70 * w, y: 0.58 * h), controlPoint2: CGPoint(x: 0.72 * w, y: 0.71 * h))
+                ribbon.curve(to: CGPoint(x: 0.95 * w, y: 0.22 * h),
+                             controlPoint1: CGPoint(x: 0.82 * w, y: 0.56 * h), controlPoint2: CGPoint(x: 0.90 * w, y: 0.32 * h))
+                ribbon.curve(to: CGPoint(x: 0.928 * w, y: 0.17 * h),
+                             controlPoint1: CGPoint(x: 0.965 * w, y: 0.19 * h), controlPoint2: CGPoint(x: 0.953 * w, y: 0.17 * h))
+                ribbon.line(to: CGPoint(x: 0.772 * w, y: 0.175 * h))
+                ribbon.curve(to: CGPoint(x: 0.697 * w, y: 0.24 * h),
+                             controlPoint1: CGPoint(x: 0.737 * w, y: 0.175 * h), controlPoint2: CGPoint(x: 0.716 * w, y: 0.19 * h))
+                ribbon.curve(to: CGPoint(x: 0.51 * w, y: 0.555 * h),
+                             controlPoint1: CGPoint(x: 0.641 * w, y: 0.34 * h), controlPoint2: CGPoint(x: 0.62 * w, y: 0.48 * h))
+                ribbon.curve(to: CGPoint(x: 0.287 * w, y: 0.216 * h),
+                             controlPoint1: CGPoint(x: 0.428 * w, y: 0.61 * h), controlPoint2: CGPoint(x: 0.352 * w, y: 0.405 * h))
+                ribbon.curve(to: CGPoint(x: 0.227 * w, y: 0.17 * h),
+                             controlPoint1: CGPoint(x: 0.274 * w, y: 0.178 * h), controlPoint2: CGPoint(x: 0.258 * w, y: 0.17 * h))
+                ribbon.line(to: CGPoint(x: 0.073 * w, y: 0.17 * h))
+                ribbon.curve(to: CGPoint(x: 0.05 * w, y: 0.22 * h),
+                             controlPoint1: CGPoint(x: 0.048 * w, y: 0.17 * h), controlPoint2: CGPoint(x: 0.039 * w, y: 0.19 * h))
+                ribbon.close()
+                NSColor.black.setFill()
+                ribbon.fill()
+            } else {
+                NSGradient(colors: [MBPalette.nsCyan, MBPalette.nsBrandBlue, MBPalette.nsElectricBlue])?
+                    .draw(in: ribbon, angle: -24)
+            }
 
             let stem = NSBezierPath()
             stem.move(to: CGPoint(x: 0.50 * w, y: 0.19 * h))
             stem.line(to: CGPoint(x: 0.50 * w, y: 0.52 * h))
             stem.lineWidth = max(0.8, size * 0.035)
-            MBPalette.nsCyan.withAlphaComponent(0.75).setStroke()
+            (style == .monochrome ? NSColor.black : MBPalette.nsCyan.withAlphaComponent(0.75)).setStroke()
             stem.stroke()
             return true
         }
-        image.isTemplate = false
+        image.isTemplate = style == .monochrome
         return image
     }
 }
@@ -612,9 +661,12 @@ extension EnvironmentValues {
 
 struct MacBridgeMark: View {
     let size: CGFloat
+    var style: MacBridgeMarkRenderer.Style = .appIcon
     @Environment(\.mbBrandImage) private var previewImage
     var body: some View {
-        Image(nsImage: previewImage ?? MacBridgeMarkRenderer.image(size: size))
+        Image(nsImage: style == .appIcon ? previewImage ?? MacBridgeMarkRenderer.image(size: size)
+              : MacBridgeMarkRenderer.image(size: size, style: style))
+            .renderingMode(style == .monochrome ? .template : .original)
             .resizable().interpolation(.high).frame(width: size, height: size)
             .accessibilityHidden(true)
     }

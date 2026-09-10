@@ -47,7 +47,8 @@ final class CompactSurfaceTests: XCTestCase {
     }
 
     func testRunningBadgeUsesZeroExactAndNinetyNinePlusRules() {
-        XCTAssertNil(summary(works: []).runningBadgeText)
+        XCTAssertEqual(summary(works: []).runningBadgeText, "0")
+        XCTAssertEqual(summary(works: [], connected: false).runningBadgeText, "–")
         for count in [1, 2, 99, 100, 140] {
             let value = summary(works: (0..<count).map { work($0) })
             XCTAssertEqual(value.runningCount, count)

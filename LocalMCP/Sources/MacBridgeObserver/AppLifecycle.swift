@@ -21,7 +21,7 @@ final class DashboardWindowController: NSObject, NSWindowDelegate {
     }
 
     func show(selection: String? = nil) {
-        if let selection { model.selection = selection }
+        if let selection { model.selectGlobalActivity(selection) }
         let window = prepareWindow()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -174,6 +174,9 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         preferences.$showMenuBar.removeDuplicates().sink { [weak self] _ in
             DispatchQueue.main.async { self?.applyVisibility() }
         }.store(in: &subscriptions)
+        preferences.$showTaskCount.removeDuplicates().sink { [weak self] _ in
+            DispatchQueue.main.async { self?.update() }
+        }.store(in: &subscriptions)
     }
 
     func start() { applyVisibility() }
@@ -211,14 +214,14 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private func update() {
         guard let button = statusItem?.button else { return }
         let summary = model.compactSummary
-        let image = MacBridgeMarkRenderer.image(size: 18)
+        let image = MacBridgeMarkRenderer.image(size: 18, style: .monochrome)
         image.size = NSSize(width: 18, height: 18)
         button.image = image
         button.imagePosition = .imageLeading
         button.font = .systemFont(ofSize: 12, weight: .medium)
-        button.title = preferences.showTaskCount ? (summary.activeBadgeText.map { " " + $0 } ?? "") : ""
-        button.toolTip = "MacBridge — \(summary.statusText)"
-        button.setAccessibilityLabel("MacBridge, \(summary.statusText)")
+        button.title = preferences.showTaskCount ? " " + summary.runningBadgeText : ""
+        button.toolTip = "MacBridge — \(summary.statusText). \(summary.runningBadgeHelp)"
+        button.setAccessibilityLabel("MacBridge, \(summary.statusText). \(summary.runningBadgeHelp)")
     }
 
     private func rebuildMenu(_ menu: NSMenu) {
