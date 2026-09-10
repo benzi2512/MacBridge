@@ -1,0 +1,9 @@
+interface:
+  display_name: "MB Operator"
+  short_description: "Run complete MacBridge workflows with evidence"
+  icon_small: "./assets/macbridge-icon-card.png"
+  icon_large: "./assets/macbridge-icon.png"
+  default_prompt: "Use $mb-operator to complete this MacBridge task and verify the result."
+  brand_color: "#0B4FE8"
+policy:
+  allow_implicit_invocation: true

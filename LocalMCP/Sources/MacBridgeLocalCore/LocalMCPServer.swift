@@ -1,0 +1,1565 @@
+import Darwin
+import Foundation
+
+public enum MacBridgeConnectorSurface: String, Sendable {
+    case desktopLocal = "desktop-local"
+    case webTunnel = "web-tunnel"
+
+    var capabilityName: String {
+        switch self {
+        case .desktopLocal: "CHATGPT_DESKTOP_LOCAL"
+        case .webTunnel: "CHATGPT_WEB_TUNNEL"
+        }
+    }
+
+    var transportName: String {
+        switch self {
+        case .desktopLocal: "local_stdio"
+        case .webTunnel: "outbound_tunnel_stdio"
+        }
+    }
+
+    var runtimeProfile: String {
+        switch self {
+        case .desktopLocal: "direct-local"
+        case .webTunnel: "web-tunnel-adapter"
+        }
+    }
+
+    var runtimeArchitecture: String {
+        switch self {
+        case .desktopLocal: "single_process"
+        case .webTunnel: "single_process_core_plus_outbound_adapter"
+        }
+    }
+
+    var connectorNetwork: String {
+        switch self {
+        case .desktopLocal: "none"
+        case .webTunnel: "outbound_tunnel_only"
+        }
+    }
+
+    var instructions: String {
+        switch self {
+        case .desktopLocal:
+            "Direct local MCP. File and process actions stay inside configured workspaces; commands have loopback-only networking and open no Terminal window."
+        case .webTunnel:
+            "MacBridge functional core behind an outbound Web tunnel adapter. File and process actions stay inside configured workspaces; commands have loopback-only networking and open no Terminal window."
+        }
+    }
+}
+
+public final class LocalMCPServer: @unchecked Sendable {
+    public static let version = "0.3.0-functional-first"
+    public static let maximumFrameBytes = 24 * 1_024 * 1_024
+    public static let supportedProtocolVersions = [
+        "2026-07-28", "2025-11-25", "2025-06-18",
+    ]
+    private static var protocolCapabilities: JSONObject {
+        ["tools": ["listChanged": false], "resources": ["listChanged": false]]
+    }
+
+    private var workspaceService: LocalWorkspaceService
+    private var processService: LocalProcessService
+    private let configurationURL: URL
+    private let selfExecutable: URL
+    private let connectorSurface: MacBridgeConnectorSurface
+    // Snapshot the executable path once for this server lifetime. Replacing that
+    // path during an upgrade must not relabel an already-running instance.
+    private let executableHash: String
+    private let instanceID = UUID().uuidString.lowercased()
+    private let startedUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
+    private var initializeResponded = false
+    private var initialized = false
+    private var negotiatedProtocol = "2025-06-18"
+    private let operationLock = NSRecursiveLock()
+    private let outputLock = NSLock()
+    private var searchInProgress = false
+    private var commandRunInProgress = false
+    // One admitted Brevo operation across the whole family, including direct
+    // callTool callers. Protected by operationLock, never held across HTTP.
+    private var brevoInProgress = false
+    // Immutable test instrumentation; public/runtime initialization always uses
+    // nil. There is no CLI, config, environment or MCP path that installs it.
+    private let searchStartForTesting: (@Sendable () -> Void)?
+    // Immutable offline-test dependency only; never configurable by MCP, CLI or environment.
+    private let brevoTransportForTesting: BrevoOperations.Transport?
+    private let observerLock = NSLock()
+    private var observerHistory: [JSONObject] = []
+    private var observerCached: JSONObject = [:]
+    private let workActivity = WorkActivity()
+    private let requestIdentityProbe = RequestIdentityProbe()
+    // Fixed-size diagnostics only: never retain a requested URI, _meta, HTML,
+    // credentials or other request payload. Protected by observerLock.
+    private var uiResourceReadCount = 0
+    private var uiResourceReadOutcome = "not_requested"
+    private let observationEnabled: Bool
+    public convenience init(
+        configurationURL: URL,
+        selfExecutable: URL,
+        connectorSurface: MacBridgeConnectorSurface = .desktopLocal,
+        observationEnabled: Bool = false
+    ) throws {
+        try self.init(configurationURL: configurationURL, selfExecutable: selfExecutable,
+                      connectorSurface: connectorSurface, observationEnabled: observationEnabled,
+                      searchStartForTesting: nil)
+    }
+
+    init(configurationURL: URL, selfExecutable: URL,
+         connectorSurface: MacBridgeConnectorSurface = .desktopLocal,
+         observationEnabled: Bool = false,
+         searchStartForTesting: (@Sendable () -> Void)?,
+         brevoTransportForTesting: BrevoOperations.Transport? = nil) throws {
+        self.searchStartForTesting = searchStartForTesting
+        self.brevoTransportForTesting = brevoTransportForTesting
+        self.observationEnabled = observationEnabled
+        // The configured executable may use a trusted installation alias (for
+        // example SwiftPM's debug symlink); workspace readers never resolve aliases.
+        let canonicalExecutable = URL(fileURLWithPath: try canonicalExistingPath(selfExecutable.path))
+        executableHash = try LocalHash.sha256(fileAt: canonicalExecutable)
+        let registry = try LocalWorkspaceRegistry(configurationURL: configurationURL)
+        let workspaceService = LocalWorkspaceService(registry: registry)
+        self.workspaceService = workspaceService
+        processService = LocalProcessService(
+            workspaceService: workspaceService,
+            selfExecutable: selfExecutable
+        )
+        self.configurationURL = configurationURL
+        self.selfExecutable = selfExecutable
+        self.connectorSurface = connectorSurface
+    }
+
+    public func run(
+        input: FileHandle = .standardInput,
+        output: FileHandle = .standardOutput
+    ) throws {
+        let responses = PendingToolResponses()
+        defer { responses.group.wait() }
+        var buffer = Data()
+        var scannedBytes = 0
+        var discardingOversizedFrame = false
+        var readBuffer = [UInt8](repeating: 0, count: 65_536)
+        while true {
+            let byteCount = readBuffer.withUnsafeMutableBytes { bytes in
+                Darwin.read(input.fileDescriptor, bytes.baseAddress, bytes.count)
+            }
+            if byteCount == 0 { break }
+            if byteCount < 0 {
+                if errno == EINTR { continue }
+                throw LocalMCPError.operationFailed("stdio read failed")
+            }
+            let chunk = Data(readBuffer.prefix(byteCount))
+            buffer.append(chunk)
+            while true {
+                let searchStart = buffer.index(
+                    buffer.startIndex,
+                    offsetBy: min(scannedBytes, buffer.count)
+                )
+                if let newline = buffer[searchStart...].firstIndex(of: 0x0A) {
+                    if discardingOversizedFrame {
+                        buffer.removeSubrange(...newline)
+                        scannedBytes = 0
+                        discardingOversizedFrame = false
+                        continue
+                    }
+                    let frame = buffer.prefix(upTo: newline)
+                    buffer.removeSubrange(...newline)
+                    scannedBytes = 0
+                    if frame.isEmpty { continue }
+                    if frame.count > Self.maximumFrameBytes {
+                        try write(
+                            rpcError(
+                                id: NSNull(), code: -32_600,
+                                message: "JSON-RPC frame too large."
+                            ),
+                            to: output
+                        )
+                        continue
+                    }
+                    try processFrame(Data(frame), output: output, responses: responses)
+                    continue
+                }
+                if discardingOversizedFrame {
+                    buffer.removeAll(keepingCapacity: true)
+                    scannedBytes = 0
+                } else if buffer.count > Self.maximumFrameBytes {
+                    try write(
+                        rpcError(
+                            id: NSNull(), code: -32_600,
+                            message: "JSON-RPC frame too large."
+                        ),
+                        to: output
+                    )
+                    buffer.removeAll(keepingCapacity: true)
+                    scannedBytes = 0
+                    discardingOversizedFrame = true
+                } else {
+                    scannedBytes = buffer.count
+                }
+                break
+            }
+        }
+        if !discardingOversizedFrame, !buffer.isEmpty {
+            try processFrame(buffer, output: output, responses: responses)
+        }
+        responses.group.wait()
+        if responses.writeFailed {
+            throw LocalMCPError.operationFailed("background tool response output failed")
+        }
+    }
+
+    public func handle(_ message: JSONObject) -> JSONObject? {
+        let isNotification = message["id"] == nil
+        let id = message["id"] ?? NSNull()
+        var resourceOutcome = "invalid_request"
+        defer {
+            if observationEnabled, message["method"] as? String == "resources/read" {
+                observerLock.lock()
+                if uiResourceReadCount < Int.max { uiResourceReadCount += 1 }
+                uiResourceReadOutcome = resourceOutcome
+                observerLock.unlock()
+            }
+        }
+        do {
+            try message.requireOnlyKeys(["jsonrpc", "id", "method", "params"])
+            guard message["jsonrpc"] as? String == "2.0",
+                let method = message["method"] as? String, !method.isEmpty
+            else { throw LocalMCPError.invalidRequest("Invalid JSON-RPC request.") }
+            switch method {
+            case "initialize":
+                let params = try object(message["params"], label: "initialize params")
+                try params.requireOnlyKeys([
+                    "protocolVersion", "capabilities", "clientInfo", "_meta",
+                ])
+                let requested = try params.requiredString("protocolVersion", maximumBytes: 32)
+                guard params["capabilities"] is JSONObject,
+                    params["clientInfo"] is JSONObject
+                else { throw LocalMCPError.invalidRequest("MCP client identity is required.") }
+                negotiatedProtocol =
+                    Self.supportedProtocolVersions.contains(requested)
+                    ? requested : "2025-11-25"
+                initializeResponded = true
+                return rpcSuccess(
+                    id: id,
+                    result: [
+                        "protocolVersion": negotiatedProtocol,
+                        "serverInfo": ["name": "macbridge-local", "version": Self.version],
+                        "capabilities": Self.protocolCapabilities,
+                        "instructions": connectorSurface.instructions + " " + Self.discoveryGuide,
+                        "catalogEpoch": catalogDigest,
+                    ]
+                )
+            case "notifications/initialized":
+                guard initializeResponded else {
+                    throw LocalMCPError.invalidRequest("Initialize first.")
+                }
+                initialized = true
+                return nil
+            case "server/discover":
+                return rpcSuccess(
+                    id: id,
+                    result: [
+                        "mode": "CHATGPT_FULL",
+                        "supportedVersions": Self.supportedProtocolVersions,
+                        "ttlMs": 0,
+                        "cacheScope": "private",
+                        "catalogEpoch": catalogDigest,
+                        "connection": [
+                            "surface": connectorSurface.capabilityName,
+                            "transport": connectorSurface.transportName,
+                            "publicListener": false,
+                        ],
+                        "capabilities": Self.protocolCapabilities,
+                    ]
+                )
+            case "ping":
+                return rpcSuccess(id: id, result: [:])
+            case "resources/list":
+                try requireInitializedForCurrentSurface()
+                return rpcSuccess(id: id, result: ["resources": ActivityWidget.resourceDescriptors])
+            case "resources/read":
+                try requireInitializedForCurrentSurface()
+                let params = try object(message["params"], label: "resource params")
+                try params.requireOnlyKeys(["uri", "_meta"])
+                let uri = try params.requiredString("uri", maximumBytes: 256)
+                guard let contents = ActivityWidget.resourceContents(for: uri) else {
+                    resourceOutcome = "unknown_uri"
+                    return rpcError(id: id, code: -32_002, message: "Resource not found.")
+                }
+                resourceOutcome = "response_prepared"
+                return rpcSuccess(id: id, result: ["contents": [contents]])
+            case "tools/list":
+                try requireInitializedForCurrentSurface()
+                return rpcSuccess(
+                    id: id,
+                    result: ["tools": Self.toolSpecs, "catalogEpoch": catalogDigest]
+                )
+            case "tools/call":
+                try requireInitializedForCurrentSurface()
+                let params = try object(message["params"], label: "tool params")
+                try params.requireOnlyKeys(["name", "arguments", "_meta"])
+                let name = try params.requiredString("name", maximumBytes: 128)
+                let arguments = try object(params["arguments"] ?? [:], label: "tool arguments")
+                observeRequestIdentity(name: name, metadata: params["_meta"])
+                do {
+                    let result = try callTool(name: name, arguments: arguments)
+                    return rpcSuccess(id: id, result: toolResult(result,
+                        message: ToolResultSummary.text(name: name, result: result, arguments: arguments)))
+                } catch {
+                    return rpcSuccess(
+                        id: id,
+                        result: toolResult(
+                            ["error": safeMessage(error)],
+                            message: safeMessage(error),
+                            isError: true
+                        )
+                    )
+                }
+            case "notifications/cancelled":
+                return nil
+            default:
+                if isNotification { return nil }
+                return rpcError(id: id, code: -32_601, message: "Method not found.")
+            }
+        } catch {
+            if isNotification { return nil }
+            return rpcError(id: id, code: -32_602, message: safeMessage(error))
+        }
+    }
+
+    public func callTool(name: String, arguments: JSONObject) throws -> JSONObject {
+        // UI reads must neither fill their own activity feed nor wait behind a
+        // long synchronous operation. The snapshot explicitly marks cached data.
+        if name == "bridge_activity_view" || name == "bridge_activity" {
+            if name == "bridge_activity_view" {
+                try arguments.requireOnlyKeys([])
+            } else {
+                try arguments.requireOnlyKeys(["instance_id", "task_id"])
+                guard try arguments.requiredString("instance_id", maximumBytes: 36) == instanceID else {
+                    throw LocalMCPError.conflict("activity owner changed; open a new activity view")
+                }
+            }
+            return try activitySnapshot(taskID: arguments.optionalString("task_id", maximumBytes: 36))
+        }
+        if name == "work_task" {
+            operationLock.lock()
+            defer { operationLock.unlock() }
+            return try workActivity.manage(arguments,
+                validWorkspaces: Set(workspaceService.registry.workspaces.map { $0.id.lowercased() }),
+                jobs: processService.processList()["processes"] as? [JSONObject] ?? [])
+        }
+        var effectiveArguments = arguments
+        var createdDeveloperWorkID: String?
+        if name == "developer_task" {
+            let action = try arguments.requiredString("action", maximumBytes: 32)
+            if action == "execute_task" || action == "run_tests" {
+                let title = try arguments.optionalString("title", maximumBytes: 640)
+                    ?? (action == "run_tests" ? "Run project tests" : "Execute developer task")
+                var begin: JSONObject = [
+                    "action": "begin", "title": title,
+                    "workspace_id": try arguments.requiredString("workspace_id", maximumBytes: 36),
+                ]
+                if let label = try arguments.optionalString("chat_label", maximumBytes: 640) {
+                    begin["chat_label"] = label
+                }
+                let started: JSONObject = try {
+                    operationLock.lock()
+                    defer { operationLock.unlock() }
+                    return try workActivity.manage(
+                        begin,
+                        validWorkspaces: Set(workspaceService.registry.workspaces.map { $0.id.lowercased() }),
+                        jobs: processService.processList()["processes"] as? [JSONObject] ?? []
+                    )
+                }()
+                guard let id = started["work_id"] as? String else {
+                    throw LocalMCPError.operationFailed("developer parent was not retained")
+                }
+                effectiveArguments["work_id"] = id
+                createdDeveloperWorkID = id
+            } else if action == "continue_task" {
+                effectiveArguments["work_id"] = try arguments.requiredString(
+                    "workflow_id", maximumBytes: 36
+                ).lowercased()
+            }
+        }
+        let workID = try workActivity.beginCall(name: name, arguments: effectiveArguments)
+        var prepared = effectiveArguments
+        prepared.removeValue(forKey: "work_id")
+        do {
+            let result = try observedTool(
+                name: name, arguments: effectiveArguments, workID: workID
+            ) {
+                try callPreparedTool(name: name, arguments: prepared, workID: workID)
+            }
+            if name == "developer_task", result["workflow_terminal"] as? Bool == true,
+               let id = workID, let status = result["workflow_terminal_status"] as? String {
+                operationLock.lock()
+                defer { operationLock.unlock() }
+                _ = try workActivity.manage(
+                    ["action": "finish", "work_id": id, "status": status],
+                    validWorkspaces: Set(workspaceService.registry.workspaces.map { $0.id.lowercased() }),
+                    jobs: processService.processList()["processes"] as? [JSONObject] ?? []
+                )
+            }
+            return result
+        } catch {
+            if let id = createdDeveloperWorkID {
+                operationLock.lock()
+                defer { operationLock.unlock() }
+                _ = try? workActivity.manage(
+                    ["action": "finish", "work_id": id, "status": "failed"],
+                    validWorkspaces: Set(workspaceService.registry.workspaces.map { $0.id.lowercased() }),
+                    jobs: processService.processList()["processes"] as? [JSONObject] ?? []
+                )
+            }
+            throw error
+        }
+    }
+
+    private func callPreparedTool(name: String, arguments: JSONObject, workID: String?) throws -> JSONObject {
+        if name == "developer_task" || name == "developer_inspect" {
+            operationLock.lock()
+            defer { operationLock.unlock() }
+            let result = try DeveloperTask.execute(
+                surface: name, arguments, workID: workID, workActivity: workActivity,
+                workspace: workspaceService, processes: processService
+            )
+            workActivity.linkJob(result, workID: workID)
+            return result
+        }
+        if name == "file_search" {
+            let workspace = try beginSearch()
+            defer { endSearch() }
+            return try executeSearch(arguments, workspace: workspace)
+        }
+        if name == "command_run" {
+            let finish = try beginCommandRun(arguments, workID: workID)
+            defer { endCommandRun() }
+            return finish()
+        }
+        if Self.isBrevoTool(name) {
+            try beginBrevo()
+            defer { endBrevo() }
+            return try executeBrevoTool(name: name, arguments: arguments)
+        }
+        operationLock.lock()
+        defer { operationLock.unlock() }
+        let result = try executeTool(name: name, arguments: arguments)
+        if !name.hasPrefix("process_") { workActivity.linkJob(result, workID: workID) }
+        return result
+    }
+
+    private static func isBrevoTool(_ name: String) -> Bool {
+        name == "brevo_read" || name == "brevo_campaign" || BrevoToolCatalog.groups[name] != nil
+    }
+
+    private func beginBrevo() throws {
+        operationLock.lock()
+        defer { operationLock.unlock() }
+        guard !brevoInProgress else {
+            throw LocalMCPError.limitExceeded("a Brevo operation is already active; no additional request was started or queued")
+        }
+        brevoInProgress = true
+    }
+
+    private func endBrevo() {
+        operationLock.lock()
+        defer { operationLock.unlock() }
+        brevoInProgress = false
+    }
+
+    private func executeBrevoTool(name: String, arguments: JSONObject) throws -> JSONObject {
+        switch name {
+        case "brevo_read":
+            return try BrevoOperations.executeRead(arguments, transport: brevoTransportForTesting)
+        case "brevo_campaign":
+            return try BrevoOperations.executeCampaign(arguments, transport: brevoTransportForTesting)
+        default:
+            return try BrevoExtendedOperations.execute(name, arguments, transport: brevoTransportForTesting)
+        }
+    }
+
+    // Small outcome metadata only, never per-item file content or batch payloads.
+    private static let observedOutcomeKeys = [
+        "complete", "partial", "error_count", "skipped_count", "success_count", "read_count",
+        "edits_applied", "replacements",
+    ]
+
+    private func activitySnapshot(taskID: String?) throws -> JSONObject {
+        let snapshot = try observerRequest(["action": "snapshot", "instance_id": instanceID])
+        func select(_ row: JSONObject, _ keys: [String]) -> JSONObject {
+            row.filter { keys.contains($0.key) }
+        }
+        let jobs = (snapshot["jobs"] as? [JSONObject] ?? []).suffix(32).map {
+            select($0, ["task_id", "running", "exit_code", "cancelled", "started_milliseconds", "ended_milliseconds"])
+        }
+        let history = (snapshot["history"] as? [JSONObject] ?? []).suffix(24).map { row in
+            var result = select(row, ["id", "tool", "state", "started_ms", "finished_ms", "path", "cwd", "task_id", "work_id", "detail", "workspace_id"])
+            result["result"] = select(row["result"] as? JSONObject ?? [:],
+                ["task_id", "running", "exit_code", "cancelled", "timed_out", "mutation_performed", "sha256", "operation"]
+                    + Self.observedOutcomeKeys)
+            return result
+        }
+        var result: JSONObject = [
+            "schema_version": 1, "scope": "shared_runtime_not_chat_scoped",
+            "instance_id": instanceID, "build_id": "\(Self.version)+\(String(executableHash.prefix(12)))",
+            "catalog_count": Self.toolSpecs.count, "jobs": Array(jobs), "history": Array(history),
+            "work_items": snapshot["work_items"] ?? [],
+            "jobs_known": snapshot["jobs"] != nil,
+            "jobs_truncated": (snapshot["jobs"] as? [JSONObject] ?? []).count > 32,
+            "transaction_count": snapshot["transaction_count"] ?? NSNull(),
+            "busy": snapshot["busy"] ?? false, "snapshot_stale": snapshot["snapshot_stale"] ?? true,
+            "snapshot_ms": snapshot["snapshot_ms"] ?? NSNull(),
+            "observed_ms": Int64(Date().timeIntervalSince1970 * 1000),
+            "ui_resource_delivery": snapshot["ui_resource_delivery"] ?? [:],
+        ]
+        if let taskID {
+            if operationLock.try() {
+                defer { operationLock.unlock() }
+                do {
+                    result["log"] = try processService.outputTail(taskID: taskID, maximumBytes: 4096)
+                } catch {
+                    result["log_error"] = "Log is no longer available for this retained job."
+                }
+            } else {
+                result["log_error"] = "Runtime busy; log was not read."
+            }
+        }
+        return result
+    }
+
+    private func observedTool(name: String, arguments: JSONObject, workID: String?,
+                              execute: () throws -> JSONObject) throws -> JSONObject {
+        let eventID = UUID().uuidString.lowercased()
+        var event: JSONObject = [
+            "id": eventID, "tool": name, "state": "running",
+            "started_ms": Int64(Date().timeIntervalSince1970 * 1000),
+        ]
+        for key in ["workspace_id", "task_id", "transaction_id", "path", "cwd"] {
+            if let text = arguments[key] as? String { event[key] = String(text.prefix(512)) }
+        }
+        if let workID { event["work_id"] = workID }
+        event["detail"] = ActivityDetail.metadata(name: name, arguments: arguments)
+        if observationEnabled {
+            observerLock.lock()
+            observerHistory.append(event)
+            if observerHistory.count > 64 { observerHistory.removeFirst(observerHistory.count - 64) }
+            observerLock.unlock()
+        }
+        do {
+            var result = try execute()
+            if let workID { result["work_id"] = workID }
+            workActivity.finishCall(workID, name: name, result: result, failed: false)
+            if observationEnabled { finishObservation(eventID, result: result, error: nil) }
+            return result
+        } catch {
+            workActivity.finishCall(workID, name: name, result: [:], failed: true)
+            if observationEnabled { finishObservation(eventID, result: [:], error: safeMessage(error)) }
+            throw error
+        }
+    }
+
+    private func finishObservation(_ id: String, result: JSONObject, error: String?) {
+        observerLock.lock()
+        defer { observerLock.unlock() }
+        guard let index = observerHistory.firstIndex(where: { $0["id"] as? String == id }) else { return }
+        observerHistory[index]["state"] = error == nil ? "returned" : "failed"
+        observerHistory[index]["finished_ms"] = Int64(Date().timeIntervalSince1970 * 1000)
+        var summary: JSONObject = [:]
+        for key in ["task_id", "transaction_id", "running", "exit_code", "cancelled",
+                    "timed_out", "mutation_performed", "sha256", "operation", "session_retained"]
+                    + Self.observedOutcomeKeys {
+            if let value = result[key] { summary[key] = value }
+        }
+        // No request content, stdin, environment or file_read content is retained.
+        if let error { summary["error"] = String(error.prefix(512)) }
+        for key in ["stdout", "stderr"] {
+            if let value = result[key] as? String {
+                summary[key] = String(value.suffix(1024))
+                summary[key + "_preview_truncated"] = value.count > 1024
+            }
+        }
+        observerHistory[index]["result"] = summary
+    }
+
+    public func observerRequest(_ request: JSONObject) throws -> JSONObject {
+        guard observationEnabled else {
+            throw LocalMCPError.invalidRequest("observer was not enabled for this owner")
+        }
+        let action = try request.requiredString("action", maximumBytes: 32)
+        guard ["snapshot", "output", "transaction", "cancel", "restore", "file_preview", "identity_probe"].contains(action) else {
+            throw LocalMCPError.invalidRequest("unsupported observer action")
+        }
+        if action == "identity_probe" {
+            try request.requireOnlyKeys(["action", "instance_id", "operation"])
+            guard request["instance_id"] as? String == instanceID else {
+                throw LocalMCPError.conflict("observer owner changed; reconnect explicitly")
+            }
+            switch try request.requiredString("operation", maximumBytes: 8) {
+            case "start": return requestIdentityProbe.start()
+            case "read": return requestIdentityProbe.snapshot()
+            case "stop": return requestIdentityProbe.stop()
+            default: throw LocalMCPError.invalidRequest("identity probe operation must be start, read or stop")
+            }
+        }
+        if action == "file_preview" {
+            try request.requireOnlyKeys(["action", "instance_id", "event_id", "known_version"])
+        } else if action == "output" {
+            try request.requireOnlyKeys(["action", "instance_id", "task_id", "stdout_cursor", "stderr_cursor"])
+        } else {
+            try request.requireOnlyKeys(["action", "instance_id", "task_id", "transaction_id", "workspace_id"])
+        }
+        if action != "snapshot" || request["instance_id"] != nil {
+            guard request["instance_id"] as? String == instanceID else {
+                throw LocalMCPError.conflict("observer owner changed; reconnect explicitly")
+            }
+        }
+        guard operationLock.try() else {
+            if action != "snapshot" { throw LocalMCPError.conflict("owner busy; no action performed") }
+            observerLock.lock()
+            defer { observerLock.unlock() }
+            var cached = observerCached
+            cached["instance_id"] = instanceID
+            cached["busy"] = true
+            cached["snapshot_stale"] = true
+            cached["history"] = observerHistory
+            cached["work_items"] = workActivity.list(jobs: nil)
+            cached["observer_file_preview"] = true
+            cached["ui_resource_delivery"] = uiResourceDeliveryLocked
+            return cached
+        }
+        defer { operationLock.unlock() }
+        if action == "snapshot" {
+            var snapshot = try executeTool(name: "bridge_capabilities", arguments: [:])
+            snapshot["workspaces"] = workspaceService.workspaceOverview()["workspaces"]
+            snapshot["jobs"] = processService.processList()["processes"]
+            snapshot["work_items"] = workActivity.list(jobs: snapshot["jobs"] as? [JSONObject])
+            snapshot["transactions"] = workspaceService.observerTransactions()
+            snapshot["transaction_count"] = workspaceService.retainedTransactionCount
+            snapshot["observer_file_preview"] = true
+            snapshot["busy"] = brevoInProgress
+            snapshot["snapshot_stale"] = false
+            snapshot["snapshot_ms"] = Int64(Date().timeIntervalSince1970 * 1000)
+            observerLock.lock()
+            snapshot["history"] = observerHistory
+            snapshot["ui_resource_delivery"] = uiResourceDeliveryLocked
+            observerCached = snapshot
+            observerLock.unlock()
+            return snapshot
+        }
+        if action == "file_preview" {
+            let id = try request.requiredString("event_id", maximumBytes: 36).lowercased()
+            guard UUID(uuidString: id) != nil else { throw LocalMCPError.invalidRequest("invalid observed file event") }
+            let known = try request.optionalString("known_version", maximumBytes: 64)
+            if let known, known.count != 64 || !known.allSatisfy({ $0.isASCII && $0.isHexDigit }) {
+                throw LocalMCPError.invalidRequest("invalid preview version")
+            }
+            observerLock.lock()
+            let event = observerHistory.first { $0["id"] as? String == id }
+            observerLock.unlock()
+            let eligible: Set<String> = ["file_read", "file_read_lines", "file_tail", "file_stat",
+                "file_write", "file_patch", "file_apply_edits", "file_append"]
+            guard let event, event["state"] as? String == "returned",
+                  let tool = event["tool"] as? String, eligible.contains(tool),
+                  let workspace = event["workspace_id"] as? String, UUID(uuidString: workspace) != nil,
+                  let path = event["path"] as? String, !path.isEmpty, path.count < 512 else {
+                throw LocalMCPError.invalidRequest("selected event does not retain an exact eligible file path")
+            }
+            var result = try workspaceService.observerFilePreview(workspaceID: workspace, path: path, knownVersion: known)
+            result["instance_id"] = instanceID
+            result["event_id"] = id
+            return result
+        }
+        if action == "output" || action == "cancel" {
+            let id = try request.requiredString("task_id", maximumBytes: 36)
+            _ = try processService.processStatus(taskID: id)
+            if action == "output" {
+                return try processService.processOutput(
+                    taskID: id,
+                    stdoutCursor: request.optionalInt("stdout_cursor", default: 0, range: 0...Int.max),
+                    stderrCursor: request.optionalInt("stderr_cursor", default: 0, range: 0...Int.max),
+                    maximumBytesPerStream: 8192, consumeCompletedHandle: false
+                )
+            }
+            return try callTool(name: "process_cancel", arguments: ["task_id": id])
+        }
+        let id = try request.requiredString("transaction_id", maximumBytes: 36)
+        let workspace = try request.requiredString("workspace_id", maximumBytes: 36)
+        let detail = try workspaceService.observerTransaction(id: id, workspaceID: workspace)
+        if action == "transaction" { return detail }
+        return try workspaceService.observerRestore(id: id, workspaceID: workspace) {
+            try callTool(name: "transaction_restore", arguments: ["transaction_id": id])
+        }
+    }
+
+    // Caller holds observerLock. A prepared response is NOT host receipt/render
+    // acceptance; this only identifies the point reached inside this process.
+    private var uiResourceDeliveryLocked: JSONObject {
+        ["read_count": uiResourceReadCount, "last_outcome": uiResourceReadOutcome]
+    }
+
+    private func observeRequestIdentity(name: String, metadata: Any?) {
+        guard observationEnabled else { return }
+        // Unknown tool names can themselves contain user data; do not retain them.
+        requestIdentityProbe.observe(tool: Self.toolSpecs.contains { $0["name"] as? String == name }
+            ? name : "unknown_tool", metadata: metadata)
+    }
+
+    private func executeTool(name: String, arguments: JSONObject) throws -> JSONObject {
+        switch name {
+        case "bridge_capabilities":
+            try arguments.requireOnlyKeys([])
+            return [
+                "chatgpt_mode": "CHATGPT_FULL",
+                "connector_surface": connectorSurface.capabilityName,
+                "transport": connectorSurface.transportName,
+                "runtime_profile": connectorSurface.runtimeProfile,
+                "runtime_architecture": connectorSurface.runtimeArchitecture,
+                "build_id": "\(Self.version)+\(String(executableHash.prefix(12)))",
+                "instance_id": instanceID,
+                "uptime_milliseconds": Int64(
+                    clamping: (DispatchTime.now().uptimeNanoseconds - startedUptimeNanoseconds)
+                        / 1_000_000
+                ),
+                "workspace_boundary": "configuration_allowlist",
+                "catastrophic_root_removal_blocked": true,
+                "broad_command_scope": "explicit_cwd_subtree_excluding_protected_roots",
+                "privileged_system_commands_blocked": true,
+                "broad_filesystem_access": workspaceService.registry.workspaces.contains {
+                    $0.allowsBroadAccess
+                },
+                "credential_paths_blocked": true,
+                "observer_output_pagination": true,
+                "catalog_count": Self.toolSpecs.count,
+                "catalog_sha256": catalogDigest,
+                "tool_names": Self.toolSpecs.compactMap { $0["name"] as? String },
+                "tool_discovery": "Use host tool discovery to load missing callable schemas. tool_catalog returns the exact live catalog; catalog visibility does not grant permission or guarantee host loading.",
+                "mcp_executable_sha256": executableHash,
+                "terminal_window_opened": false,
+                "network_default": "loopback_only",
+                "connector_network": connectorSurface.connectorNetwork,
+                "public_listener": false,
+                "outbound_tunnel_adapter": connectorSurface == .webTunnel,
+                "shell_execution": "headless_stdio",
+                "interactive_process_input": true,
+                "workspace_reload": true,
+                "active_searches": searchInProgress ? 1 : 0,
+                "maximum_concurrent_searches": 1,
+                "command_run_nonblocking_dispatch": true,
+                "active_command_runs": commandRunInProgress ? 1 : 0,
+                "maximum_concurrent_command_runs": 1,
+                "active_brevo_calls": brevoInProgress ? 1 : 0,
+                "maximum_concurrent_brevo_calls": 1,
+                "workspace_reload_preserves_pending_undo": "refuse_until_restored_or_explicitly_accepted",
+                "transaction_list_available": true,
+                "transaction_accept_available": true,
+                "transaction_accept_purges_disk_recovery": false,
+                "maximum_retained_undo_transactions": LocalWorkspaceService.maximumRetainedTransactions,
+                "maximum_retained_undo_file_bytes": LocalWorkspaceService.maximumRetainedUndoFileBytes,
+                "maximum_aggregate_process_output_bytes": LocalProcessService.maximumAggregateOutputBytes,
+                "process_output_budget_policy": "reserve_both_stream_capacities_until_handle_release",
+                "batch_file_operations": true,
+                "maximum_batch_paths": LocalWorkspaceService.maximumBatchPaths,
+                "maximum_batch_read_bytes": LocalWorkspaceService.maximumBatchReadBytes,
+                "completed_process_status_limit": LocalProcessService.maximumCompletedStatuses,
+                "completed_process_status_ttl_seconds": LocalProcessService.completedStatusLifetime,
+                "sensitive_access_approval": "not_implemented_credentials_remain_blocked",
+                "daemon_used": false,
+                "xpc_used": false,
+                "keychain_used": false,
+            ]
+        case "workspace_overview", "workspace_list":
+            try arguments.requireOnlyKeys([])
+            return workspaceService.workspaceOverview()
+        case "workspace_reload":
+            try arguments.requireOnlyKeys([])
+            guard !commandRunInProgress else {
+                throw LocalMCPError.conflict("a command_run response is pending; workspace configuration was not reloaded")
+            }
+            guard !searchInProgress else {
+                throw LocalMCPError.conflict("a search is active; workspace configuration was not reloaded")
+            }
+            guard processService.trackedProcessCount == 0 else {
+                throw LocalMCPError.conflict(
+                    "workspace configuration cannot reload while a process is tracked"
+                )
+            }
+            guard workspaceService.retainedTransactionCount == 0 else {
+                throw LocalMCPError.conflict(
+                    "workspace configuration cannot reload while undo transactions are retained; restore or explicitly accept selected transactions first"
+                )
+            }
+            let replacementWorkspaceService = LocalWorkspaceService(
+                registry: try LocalWorkspaceRegistry(configurationURL: configurationURL)
+            )
+            workspaceService = replacementWorkspaceService
+            processService = LocalProcessService(
+                workspaceService: replacementWorkspaceService,
+                selfExecutable: selfExecutable
+            )
+            var result = replacementWorkspaceService.workspaceOverview()
+            result["reloaded"] = true
+            return result
+        case "directory_list":
+            try arguments.requireOnlyKeys([
+                "workspace_id", "path", "recursive", "maximum_entries", "cursor",
+            ])
+            return try workspaceService.listDirectory(
+                workspaceID: arguments.requiredString("workspace_id", maximumBytes: 36),
+                path: try arguments.optionalString("path", maximumBytes: 4_096) ?? ".",
+                recursive: arguments.optionalBool("recursive", default: false),
+                maximumEntries: arguments.optionalInt(
+                    "maximum_entries", default: 500, range: 1...10_000
+                ),
+                cursor: arguments.optionalInt(
+                    "cursor", default: 0, range: 0...LocalWorkspaceService.maximumTreeEntries
+                )
+            )
+        case "file_stat":
+            try arguments.requireOnlyKeys(["workspace_id", "path"])
+            return try workspaceService.statPath(
+                workspaceID: arguments.requiredString("workspace_id", maximumBytes: 36),
+                path: arguments.requiredString("path", maximumBytes: 4_096)
+            )
+        case "file_stat_many":
+            try arguments.requireOnlyKeys(["workspace_id", "paths", "include_sha256"])
+            return try workspaceService.statPaths(
+                workspaceID: arguments.requiredString("workspace_id", maximumBytes: 36),
+                paths: arguments.requiredStringArray("paths", maximumItems: 32, maximumItemBytes: 4096),
+                includeSHA256: arguments.optionalBool("include_sha256", default: false)
+            )
+        case "file_read_many":
+            try arguments.requireOnlyKeys(["workspace_id", "paths", "encoding", "maximum_bytes_per_file", "maximum_total_bytes"])
+            return try workspaceService.readFiles(
+                workspaceID: arguments.requiredString("workspace_id", maximumBytes: 36),
+                paths: arguments.requiredStringArray("paths", maximumItems: 32, maximumItemBytes: 4096),
+                encoding: try arguments.optionalString("encoding", maximumBytes: 16) ?? "utf8",
+                maximumBytesPerFile: arguments.optionalInt("maximum_bytes_per_file", default: 65_536, range: 1...262_144),
+                maximumTotalBytes: arguments.optionalInt("maximum_total_bytes", default: 1_048_576, range: 4...1_048_576)
+            )
+        case "file_read":
+            try arguments.requireOnlyKeys([
+                "workspace_id", "path", "encoding", "maximum_bytes", "offset",
+            ])
+            return try workspaceService.readFile(
+                workspaceID: arguments.requiredString("workspace_id", maximumBytes: 36),
+                path: arguments.requiredString("path", maximumBytes: 4_096),
+                encoding: try arguments.optionalString("encoding", maximumBytes: 16) ?? "utf8",
+                maximumBytes: arguments.optionalInt(
+                    "maximum_bytes", default: 1_048_576,
+                    range: 1...LocalWorkspaceService.maximumFileBytes
+                ),
+                offset: arguments.optionalInt("offset", default: 0, range: 0...Int.max)
+            )
+        case "file_search":
+            return try executeSearch(arguments, workspace: workspaceService)
+        case "file_write":
+            try arguments.requireOnlyKeys([
+                "workspace_id", "path", "content", "encoding", "expected_sha256",
+            ])
+            return try workspaceService.writeFile(
+                workspaceID: arguments.requiredString("workspace_id", maximumBytes: 36),
+                path: arguments.requiredString("path", maximumBytes: 4_096),
+                content: try stringAllowingEmpty(arguments, key: "content"),
+                encoding: try arguments.optionalString("encoding", maximumBytes: 16) ?? "utf8",
+                expectedSHA256: try arguments.optionalString(
+                    "expected_sha256", maximumBytes: 64
+                )
+            )
+        case "file_patch":
+            try arguments.requireOnlyKeys([
+                "workspace_id", "path", "old_text", "new_text", "replace_all",
+                "expected_sha256",
+            ])
+            return try workspaceService.patchFile(
+                workspaceID: arguments.requiredString("workspace_id", maximumBytes: 36),
+                path: arguments.requiredString("path", maximumBytes: 4_096),
+                oldText: arguments.requiredString(
+                    "old_text", maximumBytes: LocalWorkspaceService.maximumFileBytes
+                ),
+                newText: try stringAllowingEmpty(arguments, key: "new_text"),
+                replaceAll: arguments.optionalBool("replace_all", default: false),
+                expectedSHA256: arguments.requiredString("expected_sha256", maximumBytes: 64)
+            )
+        case "file_append":
+            try arguments.requireOnlyKeys([
+                "workspace_id", "path", "content", "encoding", "expected_sha256",
+            ])
+            return try workspaceService.appendFile(
+                workspaceID: arguments.requiredString("workspace_id", maximumBytes: 36),
+                path: arguments.requiredString("path", maximumBytes: 4_096),
+                content: try stringAllowingEmpty(arguments, key: "content"),
+                encoding: try arguments.optionalString("encoding", maximumBytes: 16) ?? "utf8",
+                expectedSHA256: arguments.requiredString("expected_sha256", maximumBytes: 64)
+            )
+        case "directory_create":
+            try arguments.requireOnlyKeys(["workspace_id", "path"])
+            return try workspaceService.createDirectory(
+                workspaceID: arguments.requiredString("workspace_id", maximumBytes: 36),
+                path: arguments.requiredString("path", maximumBytes: 4_096)
+            )
+        case "path_copy":
+            try arguments.requireOnlyKeys([
+                "workspace_id", "source_path", "destination_path",
+            ])
+            return try workspaceService.copyPath(
+                workspaceID: arguments.requiredString("workspace_id", maximumBytes: 36),
+                sourcePath: arguments.requiredString("source_path", maximumBytes: 4_096),
+                destinationPath: arguments.requiredString(
+                    "destination_path", maximumBytes: 4_096
+                )
+            )
+        case "path_move":
+            try arguments.requireOnlyKeys([
+                "workspace_id", "source_path", "destination_path",
+            ])
+            return try workspaceService.movePath(
+                workspaceID: arguments.requiredString("workspace_id", maximumBytes: 36),
+                sourcePath: arguments.requiredString("source_path", maximumBytes: 4_096),
+                destinationPath: arguments.requiredString(
+                    "destination_path", maximumBytes: 4_096
+                )
+            )
+        case "path_remove":
+            try arguments.requireOnlyKeys(["workspace_id", "path"])
+            return try workspaceService.removePath(
+                workspaceID: arguments.requiredString("workspace_id", maximumBytes: 36),
+                path: arguments.requiredString("path", maximumBytes: 4_096)
+            )
+        case "transaction_restore":
+            try arguments.requireOnlyKeys(["transaction_id"])
+            return try workspaceService.restoreTransaction(
+                arguments.requiredString("transaction_id", maximumBytes: 36)
+            )
+        case "transaction_list":
+            try arguments.requireOnlyKeys(["cursor", "maximum_transactions"])
+            var result = try workspaceService.listTransactions(
+                cursor: arguments.optionalString("cursor", maximumBytes: 64),
+                maximumTransactions: arguments.optionalInt("maximum_transactions", default: 100, range: 1...100)
+            )
+            result["instance_id"] = instanceID
+            return result
+        case "transaction_accept":
+            try arguments.requireOnlyKeys(["instance_id", "transaction_ids"])
+            guard try arguments.requiredString("instance_id", maximumBytes: 36) == instanceID else {
+                throw LocalMCPError.conflict("owner changed; no undo released")
+            }
+            var result = try workspaceService.acceptTransactions(
+                arguments.requiredStringArray("transaction_ids", maximumItems: 128, maximumItemBytes: 36)
+            )
+            result["instance_id"] = instanceID
+            return result
+        case "command_start":
+            try arguments.requireOnlyKeys([
+                "workspace_id", "executable", "arguments", "cwd", "maximum_output_bytes",
+            ])
+            return try processService.startCommand(
+                workspaceID: arguments.requiredString("workspace_id", maximumBytes: 36),
+                executableID: arguments.requiredString("executable", maximumBytes: 64),
+                arguments: arguments.requiredStringArray("arguments"),
+                cwd: try arguments.optionalString("cwd", maximumBytes: 4_096) ?? ".",
+                maximumOutputBytes: arguments.optionalInt(
+                    "maximum_output_bytes", default: 1_048_576, range: 1...16_777_216
+                )
+            )
+        case "process_status":
+            try arguments.requireOnlyKeys(["task_id"])
+            return try processService.processStatus(
+                taskID: arguments.requiredString("task_id", maximumBytes: 36)
+            )
+        case "process_output":
+            try arguments.requireOnlyKeys([
+                "task_id", "stdout_cursor", "stderr_cursor", "maximum_bytes_per_stream",
+            ])
+            return try processService.processOutput(
+                taskID: arguments.requiredString("task_id", maximumBytes: 36),
+                stdoutCursor: arguments.optionalInt(
+                    "stdout_cursor", default: 0, range: 0...Int.max
+                ),
+                stderrCursor: arguments.optionalInt(
+                    "stderr_cursor", default: 0, range: 0...Int.max
+                ),
+                maximumBytesPerStream: arguments.optionalInt(
+                    "maximum_bytes_per_stream", default: 65_536, range: 1...1_048_576
+                )
+            )
+        case "process_list":
+            try arguments.requireOnlyKeys([])
+            return processService.processList()
+        case "process_input":
+            try arguments.requireOnlyKeys(["task_id", "content", "encoding", "close_stdin"])
+            return try processService.processInput(
+                taskID: arguments.requiredString("task_id", maximumBytes: 36),
+                content: try stringAllowingEmpty(
+                    arguments, key: "content", maximumBytes: 65_536
+                ),
+                encoding: try arguments.optionalString("encoding", maximumBytes: 16) ?? "utf8",
+                closeStdin: arguments.optionalBool("close_stdin", default: false)
+            )
+        case "process_cancel":
+            try arguments.requireOnlyKeys(["task_id"])
+            return try processService.cancelProcess(
+                taskID: arguments.requiredString("task_id", maximumBytes: 36)
+            )
+        default:
+            return try ExpandedToolOperations.execute(name, arguments, workspace: workspaceService,
+                                                      processes: processService)
+        }
+    }
+
+    private var catalogDigest: String {
+        Self.builtInCatalog.digest
+    }
+
+    private func processFrame(_ data: Data, output: FileHandle,
+                              responses: PendingToolResponses) throws {
+        // The headless stdio loop has no AppKit run loop to drain Foundation's
+        // autoreleased temporaries. Bound their lifetime to one complete request,
+        // including serialization; retained jobs/transactions keep their own ARC
+        // references and must remain usable by later requests.
+        try autoreleasepool {
+            do {
+                let message = try LocalJSON.decodeObject(data)
+                if try dispatchLongTool(message, data: data, output: output, responses: responses) { return }
+                if let response = handle(message) { try write(response, to: output) }
+            } catch {
+                try write(
+                    rpcError(id: NSNull(), code: -32_700, message: safeMessage(error)),
+                    to: output
+                )
+            }
+        }
+    }
+
+    private func write(_ value: JSONObject, to output: FileHandle) throws {
+        var data = try LocalJSON.encode(value)
+        data.append(0x0A)
+        outputLock.lock()
+        defer { outputLock.unlock() }
+        try output.write(contentsOf: data)
+    }
+
+    private func beginSearch() throws -> LocalWorkspaceService {
+        operationLock.lock()
+        defer { operationLock.unlock() }
+        guard !searchInProgress else {
+            throw LocalMCPError.limitExceeded("a file_search is already active; no additional search was started")
+        }
+        searchInProgress = true
+        // Keep one immutable registry/scope for this search. Reload is refused
+        // while this lease exists; other jobs, reads and mutations remain usable.
+        return workspaceService
+    }
+
+    private func endSearch() {
+        operationLock.lock()
+        searchInProgress = false
+        operationLock.unlock()
+    }
+
+    private func beginCommandRun(_ arguments: JSONObject, workID: String?) throws -> @Sendable () -> JSONObject {
+        operationLock.lock()
+        defer { operationLock.unlock() }
+        guard !commandRunInProgress else {
+            throw LocalMCPError.limitExceeded("a command_run is already pending; no additional command was started; use command_start for concurrent jobs")
+        }
+        try arguments.requireOnlyKeys([
+            "workspace_id", "executable", "arguments", "cwd", "timeout_milliseconds",
+            "maximum_output_bytes",
+        ])
+        let before = Set((processService.processList()["processes"] as? [JSONObject] ?? []).compactMap { $0["task_id"] as? String })
+        let finish = try processService.prepareCommandRun(
+            workspaceID: arguments.requiredString("workspace_id", maximumBytes: 36),
+            executableID: arguments.requiredString("executable", maximumBytes: 64),
+            arguments: arguments.requiredStringArray("arguments"),
+            cwd: try arguments.optionalString("cwd", maximumBytes: 4_096) ?? ".",
+            timeoutMilliseconds: arguments.optionalInt(
+                "timeout_milliseconds", default: 300_000, range: 100...3_600_000),
+            maximumOutputBytes: arguments.optionalInt(
+                "maximum_output_bytes", default: 1_048_576, range: 1...16_777_216))
+        // This lock serializes admission. Only this launch can add a new job;
+        // other jobs ending concurrently may disappear but cannot join the set.
+        for job in processService.processList()["processes"] as? [JSONObject] ?? [] {
+            if let id = job["task_id"] as? String, !before.contains(id) { workActivity.linkJob(job, workID: workID) }
+        }
+        commandRunInProgress = true
+        return finish
+    }
+
+    private func endCommandRun() {
+        operationLock.lock()
+        commandRunInProgress = false
+        operationLock.unlock()
+    }
+
+    private func executeSearch(_ arguments: JSONObject,
+                               workspace: LocalWorkspaceService) throws -> JSONObject {
+        searchStartForTesting?()
+        try arguments.requireOnlyKeys([
+            "workspace_id", "path", "query", "case_sensitive", "maximum_results",
+            "maximum_file_bytes", "mode", "cursor", "include_ignored",
+            "maximum_duration_milliseconds", "maximum_total_read_bytes",
+        ])
+        return try workspace.searchFiles(
+            workspaceID: arguments.requiredString("workspace_id", maximumBytes: 36),
+            path: try arguments.optionalString("path", maximumBytes: 4_096) ?? ".",
+            query: arguments.requiredString("query", maximumBytes: 4_096),
+            caseSensitive: arguments.optionalBool("case_sensitive", default: true),
+            maximumResults: arguments.optionalInt("maximum_results", default: 200, range: 1...1_000),
+            maximumFileBytes: arguments.optionalInt("maximum_file_bytes", default: 1_048_576,
+                range: 1...LocalWorkspaceService.maximumFileBytes),
+            mode: try arguments.optionalString("mode", maximumBytes: 16) ?? "content",
+            cursor: arguments.optionalInt("cursor", default: 0, range: 0...Int.max),
+            includeIgnored: arguments.optionalBool("include_ignored", default: false),
+            maximumDurationMilliseconds: arguments.optionalInt(
+                "maximum_duration_milliseconds", default: 5_000, range: 1...10_000),
+            maximumTotalReadBytes: arguments.optionalInt(
+                "maximum_total_read_bytes", default: 32 * 1_024 * 1_024, range: 1...(64 * 1_024 * 1_024)))
+    }
+
+    private func dispatchLongTool(_ message: JSONObject, data: Data, output: FileHandle,
+                                  responses: PendingToolResponses) throws -> Bool {
+        guard message["method"] as? String == "tools/call",
+              let params = message["params"] as? JSONObject,
+              let name = params["name"] as? String,
+              name == "file_search" || name == "command_run" || Self.isBrevoTool(name) else { return false }
+        // Validate protocol/session state on the input thread, in frame order.
+        // Invalid envelopes retain handle()'s existing JSON-RPC error semantics.
+        do {
+            try message.requireOnlyKeys(["jsonrpc", "id", "method", "params"])
+            guard message["jsonrpc"] as? String == "2.0" else { return false }
+            try requireInitializedForCurrentSurface()
+            try params.requireOnlyKeys(["name", "arguments", "_meta"])
+            _ = try object(params["arguments"] ?? [:], label: "tool arguments")
+        } catch { return false }
+        observeRequestIdentity(name: name, metadata: params["_meta"])
+        let execute: @Sendable (JSONObject) throws -> JSONObject
+        let original = params["arguments"] as? JSONObject ?? [:]
+        var workID: String?
+        do {
+            workID = try workActivity.beginCall(name: name, arguments: original)
+            var prepared = original
+            prepared.removeValue(forKey: "work_id")
+            if name == "file_search" {
+                let workspace = try beginSearch()
+                execute = { [self] arguments in try executeSearch(arguments, workspace: workspace) }
+            } else if name == "command_run" {
+                let finish = try beginCommandRun(prepared, workID: workID)
+                execute = { _ in finish() }
+            } else {
+                try beginBrevo()
+                execute = { [self] arguments in try executeBrevoTool(name: name, arguments: arguments) }
+            }
+        }
+        catch {
+            // Preserve Issues history even when admission fails before a worker
+            // exists. This records only the same bounded metadata as other calls.
+            _ = try? observedTool(name: name, arguments: original, workID: workID) {
+                throw error
+            }
+            try write(rpcSuccess(id: message["id"] ?? NSNull(), result: toolResult(
+                ["error": safeMessage(error)], message: safeMessage(error), isError: true)), to: output)
+            return true
+        }
+        responses.group.enter()
+        let admittedWorkID = workID
+        // One admitted worker per local long tool, one for the whole Brevo
+        // family. No unbounded queue, automatic retry or idle polling.
+        // Immutable frame bytes cross the queue, not a shared Any dictionary.
+        DispatchQueue.global(qos: .utility).async { [self] in
+            defer { responses.group.leave() }
+            autoreleasepool {
+                let response: JSONObject?
+                do {
+                    let request = try LocalJSON.decodeObject(data)
+                    let params = try object(request["params"], label: "tool params")
+                    let arguments = try object(params["arguments"] ?? [:], label: "tool arguments")
+                    var prepared = arguments
+                    prepared.removeValue(forKey: "work_id")
+                    let payload: JSONObject
+                    do {
+                        let result = try observedTool(name: name, arguments: arguments, workID: admittedWorkID) {
+                            try execute(prepared)
+                        }
+                        payload = toolResult(result,
+                            message: ToolResultSummary.text(name: name, result: result, arguments: arguments))
+                    } catch {
+                        payload = toolResult(["error": safeMessage(error)], message: safeMessage(error), isError: true)
+                    }
+                    response = rpcSuccess(id: request["id"] ?? NSNull(), result: payload)
+                } catch {
+                    workActivity.finishCall(admittedWorkID, name: name, result: [:], failed: true)
+                    responses.recordWriteFailure()
+                    response = nil
+                }
+                // Publish completion with admission locked. A client that reads
+                // the response and immediately sends its next request must not
+                // race the previous worker's lease cleanup. The lock order is
+                // the same operation -> output order used by ordinary tools.
+                operationLock.lock()
+                defer { operationLock.unlock() }
+                if name == "file_search" { searchInProgress = false }
+                else if name == "command_run" { commandRunInProgress = false }
+                else { brevoInProgress = false }
+                if let response {
+                    do { try write(response, to: output) }
+                    catch { responses.recordWriteFailure() }
+                }
+            }
+        }
+        return true
+    }
+
+    private func requireInitialized() throws {
+        guard initializeResponded, initialized else {
+            throw LocalMCPError.invalidRequest("MCP session is not initialized.")
+        }
+    }
+
+    /// The outbound tunnel may reconnect a process-affine stdio target while the remote
+    /// connector keeps its already-negotiated session and resumes with tools/list or tools/call.
+    /// Accept that stateless compatibility path only for the explicitly selected web-tunnel
+    /// surface. Direct desktop stdio remains strict and requires the normal MCP handshake.
+    private func requireInitializedForCurrentSurface() throws {
+        if connectorSurface == .webTunnel { return }
+        try requireInitialized()
+    }
+
+    private func object(_ value: Any?, label: String) throws -> JSONObject {
+        guard let object = value as? JSONObject else {
+            throw LocalMCPError.invalidRequest("JSON object required for \(label).")
+        }
+        return object
+    }
+
+    private func stringAllowingEmpty(
+        _ object: JSONObject,
+        key: String,
+        maximumBytes: Int = LocalWorkspaceService.maximumFileBytes
+    ) throws -> String {
+        guard let value = object[key] as? String,
+            value.utf8.count <= maximumBytes
+        else { throw LocalMCPError.invalidRequest("Bounded string required for \(key).") }
+        return value
+    }
+
+    private func rpcSuccess(id: Any, result: JSONObject) -> JSONObject {
+        ["jsonrpc": "2.0", "id": id, "result": result]
+    }
+
+    private func rpcError(id: Any, code: Int, message: String) -> JSONObject {
+        [
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": ["code": code, "message": message],
+        ]
+    }
+
+    private func toolResult(
+        _ structured: JSONObject,
+        message: String,
+        isError: Bool = false
+    ) -> JSONObject {
+        [
+            "content": [["type": "text", "text": message]],
+            "structuredContent": structured,
+            "isError": isError,
+        ]
+    }
+
+    private func safeMessage(_ error: Error) -> String {
+        if let error = error as? LocalMCPError { return error.description }
+        return "Direct local operation failed."
+    }
+}
+
+extension LocalMCPServer {
+    // All nested members are Swift value types constructed below, never mutable
+    // Foundation reference containers. The private immutable snapshot is shared;
+    // callers receive copy-on-write value snapshots through toolSpecs.
+    private struct CatalogSnapshot: @unchecked Sendable {
+        let specs: [JSONObject]
+        let digest: String
+
+        init() {
+            let specs = LocalMCPServer.makeToolSpecs().map { original -> JSONObject in
+                guard let name = original["name"] as? String,
+                      !["work_task", "bridge_activity", "bridge_activity_view"].contains(name) else { return original }
+                var spec = original
+                var schema = spec["inputSchema"] as! JSONObject
+                var properties = schema["properties"] as! JSONObject
+                properties["work_id"] = ["type": "string", "format": "uuid", "maxLength": 36,
+                    "description": "Parent work_task ID; grouping only, not authority."] as JSONObject
+                schema["properties"] = properties
+                spec["inputSchema"] = schema
+                return spec
+            }
+            guard let encoded = try? LocalJSON.encode(specs) else {
+                preconditionFailure("The built-in MCP catalog must be valid JSON.")
+            }
+            self.specs = specs
+            digest = LocalHash.sha256(encoded)
+        }
+    }
+
+    private static let builtInCatalog = CatalogSnapshot()
+
+    private static func stringSchema(maximumLength: Int) -> JSONObject {
+        ["type": "string", "maxLength": maximumLength]
+    }
+
+    private static func integerSchema(minimum: Int, maximum: Int) -> JSONObject {
+        ["type": "integer", "minimum": minimum, "maximum": maximum]
+    }
+
+    private static func booleanSchema() -> JSONObject { ["type": "boolean"] }
+
+    private static func arraySchema(maximumItems: Int) -> JSONObject {
+        [
+            "type": "array",
+            "maxItems": maximumItems,
+            "items": ["type": "string", "maxLength": 16_384],
+        ]
+    }
+
+    private static func spec(
+        _ name: String,
+        _ title: String,
+        _ description: String,
+        properties: JSONObject,
+        required: [String],
+        readOnly: Bool,
+        destructiveHint: Bool? = nil,
+        idempotentHint: Bool? = nil
+    ) -> JSONObject {
+        [
+            "name": name,
+            "title": title,
+            "description": description,
+            "inputSchema": [
+                "type": "object",
+                "additionalProperties": false,
+                "properties": properties,
+                "required": required,
+            ],
+            "annotations": [
+                "readOnlyHint": readOnly,
+                "destructiveHint": destructiveHint ?? !readOnly,
+                "idempotentHint": idempotentHint ?? readOnly,
+                "openWorldHint": false,
+            ],
+        ]
+    }
+
+    public static var toolSpecs: [JSONObject] {
+        builtInCatalog.specs
+    }
+
+    static var catalogSHA256: String { builtInCatalog.digest }
+
+    public static var discoveryGuide: String {
+        "Reviewing a tool is not permission to execute it; never replay commands from earlier tasks. Reuse already-loaded schemas; host discovers missing ones. tool_catalog: 13 starters; query/category<=5; names return exact schemas; limit=current catalog count for full index; it cannot load host tools. developer_inspect is read-only; developer_task adds no model/authority. Operator loop: define acceptance, inspect, act, verify tests/diff/errors, repair from evidence, finish when accepted. Multi-step: developer_task starts/returns its parent; otherwise begin work_task and carry work_id. Never nest parents; grouping/chat_label is not identity or permission. waiting_user pauses; set active to continue. Finish only after jobs stop; silence is not completion. Long/paused work checkpoint: IDs/cursors, transactions, verified results, next step; revalidate handles after restart. Evidence names actions, tests/diff/errors, log refs, truncation and unknowns. command_run has timeout_milliseconds; command_start has none and returns task_id. process_output returns status/cursors. Batch paths/jobs; inspect each result. Reconcile uncertain writes before retry. Respect host approvals and Work-mode gates."
+    }
+
+    private static func makeToolSpecs() -> [JSONObject] {
+        let workspaceID = stringSchema(maximumLength: 36)
+        let path = stringSchema(maximumLength: 4_096)
+        let content = stringSchema(maximumLength: LocalWorkspaceService.maximumFileBytes)
+        let sha = stringSchema(maximumLength: 64)
+        let taskID = stringSchema(maximumLength: 36)
+        var executable = stringSchema(maximumLength: 64)
+        executable["description"] = "Supported command ID such as sh, python3, swift or git; not an absolute path such as /bin/sh. Pass argv separately in arguments. If unsure, consult command_list once for available IDs and reuse the result."
+        return [
+            spec("work_task", "Track a parent task",
+                "Group a multi-step task; labels grant no access or authenticated identity. begin requires title; returns work_id. update accepts status active/waiting_user and optional title/chat_label. Resume waiting_user with update status active before related calls. finish accepts completed/failed after jobs stop (default completed). update/finish may repeat workspace_id only if it matches the original scope. list returns up to 32 tasks, optionally filtered by registered workspace_id.",
+                properties: ["action": ["type": "string", "enum": ["begin", "update", "finish", "list"]],
+                             "work_id": ["type": "string", "format": "uuid", "maxLength": 36],
+                             "title": stringSchema(maximumLength: 160), "chat_label": stringSchema(maximumLength: 160),
+                             "workspace_id": workspaceID,
+                             "status": ["type": "string", "enum": ["active", "waiting_user", "completed", "failed"]]],
+                required: ["action"], readOnly: false, destructiveHint: false, idempotentHint: false),
+            spec(
+                "bridge_capabilities", "Bridge capabilities",
+                "Report the direct local runtime identity and boundaries.", properties: [:],
+                required: [], readOnly: true),
+            spec(
+                "workspace_overview", "Workspace overview",
+                "List registered workspaces. Relative paths or canonical absolute paths inside the selected root are accepted. Broad-access entries also disclose their root; credential paths remain blocked.",
+                properties: [:], required: [], readOnly: true),
+            spec(
+                "workspace_list", "Workspace list", "Deprecated compatibility alias; use workspace_overview for the same registered workspace list. Kept callable for existing chats.",
+                properties: [:], required: [], readOnly: true),
+            spec(
+                "workspace_reload", "Reload workspaces",
+                "Re-read the workspace allowlist without restarting; rejected while a process or undo transaction is retained. Restore pending transactions first.",
+                properties: [:], required: [], readOnly: false),
+            spec(
+                "directory_list", "List directory",
+                "List one workspace directory with deterministic cursor pagination.",
+                properties: [
+                    "workspace_id": workspaceID, "path": path, "recursive": booleanSchema(),
+                    "maximum_entries": integerSchema(minimum: 1, maximum: 10_000),
+                    "cursor": integerSchema(
+                        minimum: 0, maximum: LocalWorkspaceService.maximumTreeEntries),
+                ], required: ["workspace_id"], readOnly: true),
+            spec(
+                "file_stat", "File metadata",
+                "Read non-following metadata and a file digest inside a registered workspace.",
+                properties: ["workspace_id": workspaceID, "path": path],
+                required: ["workspace_id", "path"], readOnly: true),
+            spec(
+                "file_stat_many", "Batch file metadata",
+                "Inspect 1...32 paths in order, with per-item errors. SHA-256 is opt-in to avoid reading contents for metadata-only work. Not an atomic snapshot.",
+                properties: ["workspace_id": workspaceID,
+                    "paths": ["type": "array", "minItems": 1, "maxItems": 32, "items": path],
+                    "include_sha256": booleanSchema()],
+                required: ["workspace_id", "paths"], readOnly: true),
+            spec(
+                "file_read_many", "Batch read files",
+                "Read initial chunks of 1...32 files within a shared byte budget. Check each result, complete, EOF and next_offset; continue partial files using file_read. UTF-8 chunks may finish a scalar by up to 3 bytes; total budget is never exceeded. Not an atomic snapshot.",
+                properties: ["workspace_id": workspaceID,
+                    "paths": ["type": "array", "minItems": 1, "maxItems": 32, "items": path],
+                    "encoding": ["type": "string", "enum": ["utf8", "base64"]],
+                    "maximum_bytes_per_file": integerSchema(minimum: 1, maximum: 262_144),
+                    "maximum_total_bytes": integerSchema(minimum: 4, maximum: 1_048_576)],
+                required: ["workspace_id", "paths"], readOnly: true),
+            spec(
+                "file_read", "Read file",
+                "Read a bounded UTF-8 or base64 byte chunk with an explicit next offset and EOF marker.",
+                properties: [
+                    "workspace_id": workspaceID, "path": path,
+                    "encoding": ["type": "string", "enum": ["utf8", "base64"]],
+                    "maximum_bytes": integerSchema(
+                        minimum: 1, maximum: LocalWorkspaceService.maximumFileBytes),
+                    "offset": integerSchema(minimum: 0, maximum: Int.max),
+                ], required: ["workspace_id", "path"], readOnly: true),
+            spec(
+                "file_search", "Search files",
+                "Search names or bounded UTF-8 content with cursor pagination. Skips build/cache/vendor trees and reports unsearched dataless content. Cooperative time/read budgets return explicit partial results; narrow the path when a budget stops traversal. No mmap; known dataless placeholders are not opened. An OS-blocked syscall is not forcibly interruptible.",
+                properties: [
+                    "workspace_id": workspaceID, "path": path,
+                    "query": stringSchema(maximumLength: 4_096), "case_sensitive": booleanSchema(),
+                    "maximum_results": integerSchema(minimum: 1, maximum: 1_000),
+                    "maximum_file_bytes": integerSchema(
+                        minimum: 1, maximum: LocalWorkspaceService.maximumFileBytes),
+                    "mode": ["type": "string", "enum": ["content", "name"]],
+                    "cursor": integerSchema(minimum: 0, maximum: Int.max),
+                    "include_ignored": booleanSchema(),
+                    "maximum_duration_milliseconds": integerSchema(minimum: 1, maximum: 10_000),
+                    "maximum_total_read_bytes": integerSchema(minimum: 1, maximum: 64 * 1_024 * 1_024),
+                ], required: ["workspace_id", "query"], readOnly: true),
+            spec(
+                "file_write", "Write file",
+                "Create or atomically replace one workspace file and return a rollback transaction.",
+                properties: [
+                    "workspace_id": workspaceID, "path": path, "content": content,
+                    "encoding": ["type": "string", "enum": ["utf8", "base64"]],
+                    "expected_sha256": sha,
+                ], required: ["workspace_id", "path", "content"], readOnly: false),
+            spec(
+                "file_patch", "Patch file",
+                "Replace literal text against an expected file digest, optionally all occurrences via replace_all. For several unique edits in one file use file_apply_edits. Returns a rollback transaction.",
+                properties: [
+                    "workspace_id": workspaceID, "path": path, "old_text": content,
+                    "new_text": content, "replace_all": booleanSchema(), "expected_sha256": sha,
+                ], required: ["workspace_id", "path", "old_text", "new_text", "expected_sha256"],
+                readOnly: false),
+            spec(
+                "file_append", "Append file",
+                "Append UTF-8 or base64 bytes after verifying the current digest and return a rollback transaction.",
+                properties: [
+                    "workspace_id": workspaceID, "path": path, "content": content,
+                    "encoding": ["type": "string", "enum": ["utf8", "base64"]],
+                    "expected_sha256": sha,
+                ], required: ["workspace_id", "path", "content", "expected_sha256"],
+                readOnly: false),
+            spec(
+                "directory_create", "Create directory",
+                "Create one workspace directory and return a rollback transaction.",
+                properties: ["workspace_id": workspaceID, "path": path],
+                required: ["workspace_id", "path"], readOnly: false),
+            spec(
+                "path_copy", "Copy path",
+                "Copy one bounded file or directory tree within a registered workspace.",
+                properties: [
+                    "workspace_id": workspaceID, "source_path": path, "destination_path": path,
+                ], required: ["workspace_id", "source_path", "destination_path"], readOnly: false),
+            spec(
+                "path_move", "Move path",
+                "Move one bounded file or directory tree within a registered workspace.",
+                properties: [
+                    "workspace_id": workspaceID, "source_path": path, "destination_path": path,
+                ], required: ["workspace_id", "source_path", "destination_path"], readOnly: false),
+            spec(
+                "path_remove", "Remove path recoverably",
+                "Move one bounded workspace path into private same-workspace recovery and return a rollback transaction.",
+                properties: ["workspace_id": workspaceID, "path": path],
+                required: ["workspace_id", "path"], readOnly: false),
+            spec(
+                "transaction_restore", "Restore transaction",
+                "Restore one in-process file or path transaction after verifying current state.",
+                properties: ["transaction_id": stringSchema(maximumLength: 36)],
+                required: ["transaction_id"], readOnly: false, destructiveHint: false),
+            spec(
+                "transaction_list", "List retained undo",
+                "List up to 100 retained file-tool transactions as metadata only, with exact paths and retained-byte counts, without reading file contents. Follow next_cursor until complete; cursors expire on workspace reload or owner restart and pages are not a fixed snapshot. Returns instance_id for explicit acceptance. Missing undo is not proof an uncertain action succeeded.",
+                properties: ["cursor": stringSchema(maximumLength: 64),
+                             "maximum_transactions": integerSchema(minimum: 1, maximum: 100)],
+                required: [], readOnly: true),
+            spec(
+                "transaction_accept", "Keep changes and release selected undo",
+                "Irreversibly release only 1-128 named in-memory undo transactions when the user wants to keep the changes. Requires instance_id from this owner. All IDs are checked before any release; no accept-all, no file changes, no disk recovery deletion. Removal receipts include preserved recovery paths for manual recovery. Does not validate current files or prove task success; do not retry after uncertain delivery or accept merely to make a quota test pass.",
+                properties: ["instance_id": stringSchema(maximumLength: 36),
+                             "transaction_ids": ["type": "array", "minItems": 1,
+                                                 "maxItems": 128, "uniqueItems": true,
+                                                 "items": stringSchema(maximumLength: 36)]],
+                required: ["instance_id", "transaction_ids"], readOnly: false, destructiveHint: true),
+            spec(
+                "command_run", "Run command",
+                "Run one short supported executable or headless shell command and return its final output with loopback-only networking and a hard timeout. Its wait does not block other MCP requests. Only one command_run may be pending; use command_start for builds, tests or concurrent jobs.",
+                properties: [
+                    "workspace_id": workspaceID, "executable": executable,
+                    "arguments": arraySchema(maximumItems: 128), "cwd": path,
+                    "timeout_milliseconds": integerSchema(minimum: 100, maximum: 3_600_000),
+                    "maximum_output_bytes": integerSchema(minimum: 1, maximum: 16_777_216),
+                ], required: ["workspace_id", "executable", "arguments"], readOnly: false),
+            spec(
+                "command_start", "Start command",
+                "Start builds, tests, long-running commands, or a persistent headless shell with a pollable handle and no Terminal window. No timeout_milliseconds: start once and retain task_id. process_output includes status and cursors; use process_status only when logs are not needed. process_cancel stops the job.",
+                properties: [
+                    "workspace_id": workspaceID, "executable": executable,
+                    "arguments": arraySchema(maximumItems: 128), "cwd": path,
+                    "maximum_output_bytes": integerSchema(minimum: 1, maximum: 16_777_216),
+                ], required: ["workspace_id", "executable", "arguments"], readOnly: false),
+            spec(
+                "process_status", "Process status",
+                "Read status without consuming logs. If logs are also needed, process_output already includes status. After final drain/cancellation, metadata-only status remains for up to 5 minutes and 128 completions; status_only has no output/input/cancel handle. Restart invalidates it.",
+                properties: ["task_id": taskID], required: ["task_id"], readOnly: true),
+            spec(
+                "process_output", "Process output",
+                "Read status plus bounded incremental stdout/stderr and next cursors for one job. Includes running, exit_code, drop/truncation and session_retained; avoid a separate status call when sufficient. Fully draining completed output releases the handle unless its original command_run response is pending; check session_retained. Do not replay an uncertain consumed read blindly.",
+                properties: [
+                    "task_id": taskID, "stdout_cursor": integerSchema(minimum: 0, maximum: Int.max),
+                    "stderr_cursor": integerSchema(minimum: 0, maximum: Int.max),
+                    "maximum_bytes_per_stream": integerSchema(minimum: 1, maximum: 1_048_576),
+                ], required: ["task_id"], readOnly: true, idempotentHint: false),
+            spec(
+                "process_list", "Process list",
+                "List processes and persistent shell sessions owned by this MCP instance.",
+                properties: [:], required: [], readOnly: true),
+            spec(
+                "process_input", "Process input",
+                "Non-blockingly write bounded UTF-8 or base64 input; retry only the reported remaining suffix after a partial write.",
+                properties: [
+                    "task_id": taskID, "content": stringSchema(maximumLength: 65_536),
+                    "encoding": ["type": "string", "enum": ["utf8", "base64"]],
+                    "close_stdin": booleanSchema(),
+                ], required: ["task_id", "content"], readOnly: false),
+            spec(
+                "process_cancel", "Cancel process",
+                "Terminate one process group started by this MCP instance.",
+                properties: ["task_id": taskID], required: ["task_id"], readOnly: false),
+        ] + ExpandedToolCatalog.specs() + ActivityWidget.toolSpecs
+    }
+}

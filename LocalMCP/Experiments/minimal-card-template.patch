@@ -1,0 +1,16 @@
+diff --git a/LocalMCP/Sources/MacBridgeLocalCore/ActivityWidget.swift b/LocalMCP/Sources/MacBridgeLocalCore/ActivityWidget.swift
+--- a/LocalMCP/Sources/MacBridgeLocalCore/ActivityWidget.swift
++++ b/LocalMCP/Sources/MacBridgeLocalCore/ActivityWidget.swift
+@@ -26,7 +26,11 @@ enum ActivityWidget {
+             meta["openai/widgetPrefersBorder"] = true
+             meta["openai/widgetCSP"] = ["connect_domains": [], "resource_domains": []]
+         }
+-        return ["uri": template.uri, "mimeType": template.mimeType, "text": html, "_meta": meta]
++        // Temporary render-isolation probe. Keep URI, MIME and metadata unchanged
++        // so the normal-Chat retry tests only whether the HTML body is rejected.
++        return ["uri": template.uri, "mimeType": template.mimeType,
++                "text": "<!doctype html><html lang=\"vi\"><head><meta charset=\"utf-8\"><title>MacBridge</title></head><body><h1>MacBridge</h1><p>Kiểm tra hiển thị thẻ. Chưa xác nhận dữ liệu hoạt động.</p></body></html>",
++                "_meta": meta]
+     }
+     static var toolSpecs: [JSONObject] {
+         func spec(_ name: String, _ description: String, render: Bool) -> JSONObject {
