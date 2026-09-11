@@ -3,7 +3,8 @@
 These three new tools extend the existing MB core; they do not replace Codex's
 computer-use runtime or turn a normal Chat into Codex. There is no extra model,
 new plugin registration, privileged helper or automatic permission grant.
-The source catalog has 70 tools. Deployment, host discovery, actual calls and
+The source catalog has 72 tools (including the separate opt-in media transfer).
+Deployment, host discovery, actual calls and
 native OS behavior must each be verified separately.
 
 Enabled grants must be loaded from an owner policy file directly inside

@@ -1,4 +1,4 @@
-# Working with MacBridge's 70-tool candidate source catalog
+# Working with MacBridge's 72-tool candidate source catalog
 
 The opt-in Finder/document, scoped-network and application-Accessibility tools
 are described in [Desktop access](DESKTOP-ACCESS.md). They are off for existing
@@ -7,6 +7,13 @@ configurations. A source candidate is not an installed or host-enabled feature.
 The twelve Brevo tools, typed actions, safety gates and reviewed public API
 limitations are documented in [Brevo capabilities](BREVO-CAPABILITIES.md).
 Source catalog presence is not proof of deployment or normal-Chat callability.
+
+For approved local creatives, [media transfer](MEDIA-TRANSFER.md) adds
+`media_inspect` (local preparation/status) and `media_share` (opt-in temporary
+staging/revocation). It uses the existing Meta Ads connector's URL route, not its
+interactive LOCAL_FILE picker. No storage is enabled by default; staging is not
+proof of Meta upload. Keep the stable request ID, verify Meta's actual receipt,
+and revoke the staged object without replaying uncertain writes.
 
 Start with the user's actual task. Allow host tool discovery, schema loading,
 workspace selection and read-only preparation before execution. A function not
@@ -30,15 +37,15 @@ For an unfamiliar choice, `tool_catalog` supports:
 - `query`: bounded deterministic English/Vietnamese keyword matching, at most
   5 suggestions by default. Suggestions are not proof that a tool fits every
   constraint; verify its exact schema before use.
-- `category`: `workspace`, `files`, `search`, `edit`, `process`, `git`, or `undo`.
-- `limit`: 1–70; filters intersect, and `matched_count`/`truncated` expose omissions.
+- `category`: `workspace`, `files`, `search`, `edit`, `process`, `git`, `undo`, or `external`.
+- `limit`: 1–72; filters intersect, and `matched_count`/`truncated` expose omissions.
 - `names`: exact schemas for selected names, preserving the previous shortcut.
 - `detail: "schemas"`: explicitly requests full schemas; without filters this
-  still returns all 70, including the compatibility alias.
+  still returns all 72, including the compatibility alias.
 
 An empty call returns a **13-tool starter index**, not all schemas or all tools.
 Its `truncated: true` and category counts explicitly show there is more.
-Use `limit: 70` for the 69-entry canonical index, or search the whole catalog
+Use `limit: 72` for the 71-entry canonical index, or search the whole catalog
 with query/category. Specialist tools are not removed or hidden from `tools/list`.
 Index descriptions can be truncated and are labelled accordingly.
 `workspace_list` stays callable for existing clients but is deprecated; prefer

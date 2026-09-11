@@ -19,6 +19,12 @@ enum ToolResultSummary {
         if failed {
             // A failed or ambiguous call is not evidence that the requested edit happened.
             detail = "Call failed; inspect error and any available receipt"
+        } else if name == "media_inspect" || name == "media_share" {
+            if r["share_state"] as? String == "revoked" { detail = "Staged object absent after revocation; downloaded copies are unaffected" }
+            else if r["link_available"] as? Bool == true { detail = "Creative staged with an expiring link; not uploaded to Meta" }
+            else if r["link_expired"] as? Bool == true { detail = "Transfer link expired; storage deletion is separate" }
+            else { detail = "Media inspection returned; no new public link" }
+            if let bytes = nonnegative(r["byte_count"]) { detail += "; \(bytes) bytes" }
         } else if name == "computer_control", r["status"] as? String == "permission_required" {
             detail = "Accessibility permission is missing; no app action performed"
         } else if name == "computer_control" {

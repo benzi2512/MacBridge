@@ -80,6 +80,9 @@ public final class LocalMCPServer: @unchecked Sendable {
     // One admitted Brevo operation across the whole family, including direct
     // callTool callers. Protected by operationLock, never held across HTTP.
     private var brevoInProgress = false
+    private var mediaInProgress = false
+    private let mediaConfigurationURL: URL
+    private let mediaTransportForTesting: MediaShareTransport.Perform?
     // Immutable test instrumentation; public/runtime initialization always uses
     // nil. There is no CLI, config, environment or MCP path that installs it.
     private let searchStartForTesting: (@Sendable () -> Void)?
@@ -114,7 +117,11 @@ public final class LocalMCPServer: @unchecked Sendable {
          searchStartForTesting: (@Sendable () -> Void)?,
          brevoTransportForTesting: BrevoOperations.Transport? = nil,
          desktopPresenterForTesting: DesktopOpen.Presenter? = nil,
-         computerBackendForTesting: (any ComputerBackend)? = nil) throws {
+         computerBackendForTesting: (any ComputerBackend)? = nil,
+         mediaConfigurationURLForTesting: URL? = nil,
+         mediaTransportForTesting: MediaShareTransport.Perform? = nil) throws {
+        self.mediaConfigurationURL = mediaConfigurationURLForTesting ?? MediaShareConfiguration.defaultURL
+        self.mediaTransportForTesting = mediaTransportForTesting
         self.searchStartForTesting = searchStartForTesting
         self.brevoTransportForTesting = brevoTransportForTesting
         self.desktopPresenterForTesting = desktopPresenterForTesting
@@ -450,6 +457,11 @@ public final class LocalMCPServer: @unchecked Sendable {
             defer { endBrevo() }
             return try executeBrevoTool(name: name, arguments: arguments)
         }
+        if Self.isMediaTool(name) {
+            let workspace = try beginMedia(name, arguments)
+            defer { operationLock.lock(); mediaInProgress = false; operationLock.unlock() }
+            return try executeMedia(name, arguments, workspace: workspace)
+        }
         operationLock.lock()
         defer { operationLock.unlock() }
         let result = try executeTool(name: name, arguments: arguments)
@@ -459,6 +471,26 @@ public final class LocalMCPServer: @unchecked Sendable {
 
     private static func isBrevoTool(_ name: String) -> Bool {
         name == "brevo_read" || name == "brevo_campaign" || BrevoToolCatalog.groups[name] != nil
+    }
+
+    private static func isMediaTool(_ name: String) -> Bool { name == "media_inspect" || name == "media_share" }
+
+    private func beginMedia(_ name: String, _ arguments: JSONObject) throws -> RegisteredLocalWorkspace? {
+        operationLock.lock()
+        defer { operationLock.unlock() }
+        guard !mediaInProgress else {
+            throw LocalMCPError.limitExceeded("a media operation is already active; no additional request was started or queued")
+        }
+        let workspace: RegisteredLocalWorkspace?
+        if name == "media_inspect", arguments["action"] as? String == "capabilities" { workspace = nil }
+        else { workspace = try workspaceService.registry.workspace(id: arguments.requiredString("workspace_id", maximumBytes: 36)) }
+        mediaInProgress = true
+        return workspace
+    }
+
+    private func executeMedia(_ name: String, _ arguments: JSONObject, workspace: RegisteredLocalWorkspace?) throws -> JSONObject {
+        try MediaShareOperations.execute(name, arguments, workspace: workspace,
+            configurationURL: mediaConfigurationURL, transport: mediaTransportForTesting)
     }
 
     private func beginBrevo() throws {
@@ -647,7 +679,7 @@ public final class LocalMCPServer: @unchecked Sendable {
             snapshot["transactions"] = workspaceService.observerTransactions()
             snapshot["transaction_count"] = workspaceService.retainedTransactionCount
             snapshot["observer_file_preview"] = true
-            snapshot["busy"] = brevoInProgress
+            snapshot["busy"] = brevoInProgress || mediaInProgress
             snapshot["snapshot_stale"] = false
             snapshot["snapshot_ms"] = Int64(Date().timeIntervalSince1970 * 1000)
             observerLock.lock()
@@ -765,6 +797,9 @@ public final class LocalMCPServer: @unchecked Sendable {
                 "maximum_concurrent_command_runs": 1,
                 "active_brevo_calls": brevoInProgress ? 1 : 0,
                 "maximum_concurrent_brevo_calls": 1,
+                "active_media_calls": mediaInProgress ? 1 : 0,
+                "maximum_concurrent_media_calls": 1,
+                "media_sharing": "owner_opt_in_private_r2_expiring_get_url_no_meta_api_or_public_listener",
                 "workspace_reload_preserves_pending_undo": "refuse_until_restored_or_explicitly_accepted",
                 "transaction_list_available": true,
                 "transaction_accept_available": true,
@@ -788,6 +823,9 @@ public final class LocalMCPServer: @unchecked Sendable {
             return workspaceService.workspaceOverview()
         case "workspace_reload":
             try arguments.requireOnlyKeys([])
+            guard !mediaInProgress else {
+                throw LocalMCPError.conflict("a media operation is active; workspace configuration was not reloaded")
+            }
             guard !commandRunInProgress else {
                 throw LocalMCPError.conflict("a command_run response is pending; workspace configuration was not reloaded")
             }
@@ -1152,7 +1190,7 @@ public final class LocalMCPServer: @unchecked Sendable {
         guard message["method"] as? String == "tools/call",
               let params = message["params"] as? JSONObject,
               let name = params["name"] as? String,
-              name == "file_search" || name == "command_run" || Self.isBrevoTool(name) else { return false }
+              name == "file_search" || name == "command_run" || Self.isBrevoTool(name) || Self.isMediaTool(name) else { return false }
         // Validate protocol/session state on the input thread, in frame order.
         // Invalid envelopes retain handle()'s existing JSON-RPC error semantics.
         do {
@@ -1176,6 +1214,9 @@ public final class LocalMCPServer: @unchecked Sendable {
             } else if name == "command_run" {
                 let finish = try beginCommandRun(prepared, workID: workID)
                 execute = { _ in finish() }
+            } else if Self.isMediaTool(name) {
+                let workspace = try beginMedia(name, prepared)
+                execute = { [self] arguments in try executeMedia(name, arguments, workspace: workspace) }
             } else {
                 try beginBrevo()
                 execute = { [self] arguments in try executeBrevoTool(name: name, arguments: arguments) }
@@ -1212,7 +1253,8 @@ public final class LocalMCPServer: @unchecked Sendable {
                             try execute(prepared)
                         }
                         payload = toolResult(result,
-                            message: resultSummary(name: name, result: result, arguments: arguments))
+                            message: resultSummary(name: name, result: result, arguments: arguments),
+                            isError: result["isError"] as? Bool == true)
                     } catch {
                         payload = toolResult(["error": safeMessage(error)], message: safeMessage(error), isError: true)
                     }
@@ -1230,6 +1272,7 @@ public final class LocalMCPServer: @unchecked Sendable {
                 defer { operationLock.unlock() }
                 if name == "file_search" { searchInProgress = false }
                 else if name == "command_run" { commandRunInProgress = false }
+                else if Self.isMediaTool(name) { mediaInProgress = false }
                 else { brevoInProgress = false }
                 if let response {
                     do { try write(response, to: output) }
@@ -1430,6 +1473,19 @@ extension LocalMCPServer {
                 "workspace_reload", "Reload workspaces",
                 "Re-read the workspace allowlist without restarting; rejected while a process or undo transaction is retained. Restore pending transactions first.",
                 properties: [:], required: [], readOnly: false),
+            spec("media_inspect", "Inspect a creative transfer",
+                "capabilities reads no credentials or network. prepare requires workspace_id/path and hashes one locally present JPEG/PNG/GIF/MP4/MOV, maximum 256 MiB, without sharing it. status requires workspace_id/request_id and reconciles only an existing private R2 receipt. No Meta API, picker, ad creation or URL renewal. Use prepare before asking to share a selected file; a local path cannot be passed to Meta Ads LOCAL_FILE upload.",
+                properties: ["action": ["type": "string", "enum": ["capabilities", "prepare", "status"]],
+                    "workspace_id": workspaceID, "path": path, "request_id": taskID],
+                required: ["action"], readOnly: true, openWorldHint: true),
+            spec("media_share", "Stage or revoke one approved creative",
+                "Opt-in private R2 staging, disabled without owner-only storage/root configuration. publish requires workspace_id, request_id (stable UUID), path, expected_sha256 from prepare and confirm_public_link=true after the user's approval to share that exact file. expires_in_seconds defaults 900, range 60..3600. Returns a GET-only bearer media_url; anyone with it can download until expiry/revocation. No automatic PUT retry or link renewal. Pass URL to the existing Meta Ads URL upload only when authorized; verify its actual hash/video ID and readiness, then revoke with workspace_id/request_id. Expiry alone does not delete storage or downloaded copies. Unknown outcomes require status, not a new request ID. No caller endpoints, credentials, Meta writes, listeners or shell.",
+                properties: ["action": ["type": "string", "enum": ["publish", "revoke"]],
+                    "workspace_id": workspaceID, "path": path, "request_id": taskID,
+                    "expected_sha256": sha, "confirm_public_link": booleanSchema(),
+                    "expires_in_seconds": integerSchema(minimum: 60, maximum: 3_600)],
+                required: ["action", "workspace_id", "request_id"], readOnly: false,
+                destructiveHint: true, idempotentHint: true, openWorldHint: true),
             spec("desktop_open", "Open in Finder or a fixed viewer",
                 "Pop up a local folder in Finder (action=folder), reveal a local item without executing it (reveal), open a supported document in fixed Preview/TextEdit (file), or activate finder/preview/textedit (application). Requires the owner's allow_desktop_open workspace setting. Use instead of shell open/osascript, which remain blocked. No URLs, custom handlers, arbitrary app paths or permission changes. request_accepted means macOS accepted it, not that the window was visually verified.",
                 properties: ["workspace_id": workspaceID, "path": path,

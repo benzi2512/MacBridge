@@ -27,6 +27,8 @@ enum ToolDiscovery {
         "directory_list": "list directory folder contents liet ke thu muc",
         "desktop_open": "open folder Finder pop show reveal file Preview TextEdit mo thu muc hien len man hinh application",
         "computer_control": "computer app UI accessibility snapshot press click button type text dieu khien ung dung bam nut",
+        "media_inspect": "creative image video prepare inspect hash transfer upload meta ads media anh quang cao",
+        "media_share": "creative image video temporary URL upload meta ads R2 publish revoke link tam chia se thu hoi",
         "directory_summary": "directory totals count size thong ke thu muc",
         "directory_find": "find filename basename glob tim ten file pattern",
         "file_stat": "one file metadata hash thong tin mot file",
@@ -86,7 +88,7 @@ enum ToolDiscovery {
     ]
 
     static func category(for name: String) -> String {
-        if name.hasPrefix("brevo_") { return "external" }
+        if name.hasPrefix("brevo_") || name.hasPrefix("media_") { return "external" }
         if name.hasPrefix("git_") { return "git" }
         if name.hasPrefix("transaction_") { return "undo" }
         if name.hasPrefix("process_") || name.hasPrefix("command_") || name == "network_command" { return "process" }

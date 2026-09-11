@@ -13,6 +13,8 @@ struct ActivityPresentation {
         "developer_inspect": ("Inspecting developer context", "Developer context returned", "doc.text.magnifyingglass"),
         "developer_task": ("Running a developer task", "Developer task returned", "hammer"),
         "bridge_capabilities": ("Checking MacBridge", "Checked MacBridge", "info.circle"),
+        "media_inspect": ("Checking creative transfer", "Creative transfer checked", "photo"),
+        "media_share": ("Transferring approved creative", "Creative transfer receipt", "arrow.up.doc"),
         "workspace_overview": ("Listing workspaces", "Listed workspaces", "folder"),
         "workspace_list": ("Listing workspaces", "Listed workspaces", "folder"),
             "workspace_reload": ("Reloading workspaces", "Reloaded workspaces", "arrow.clockwise"),

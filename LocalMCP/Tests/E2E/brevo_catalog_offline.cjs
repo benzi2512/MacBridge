@@ -2,7 +2,8 @@
 // Sandboxed child may write only outside the user's home; fixtures are disposable.
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const crypto = require('node:crypto'), {spawn} = require('node:child_process');
-const readline = require('node:readline'), assert = require('node:assert/strict');
+const assert = require('node:assert/strict');
+const {RPCSession} = require('./rpc_session.cjs');
 const [binary, expectedHash, output] = process.argv.slice(2);
 assert(binary?.startsWith('/') && output?.startsWith('/'));
 assert(/^[0-9a-f]{64}$/.test(expectedHash));
@@ -17,30 +18,16 @@ fs.writeFileSync(config, JSON.stringify({version: 1, workspaces: [{
 }]}), {mode: 0o600});
 const protectedHome = os.homedir();
 assert(path.isAbsolute(protectedHome), 'Private account home must be absolute');
-const profile = `(version 1)(allow default)(deny network*)(deny file-read* (subpath ${JSON.stringify(protectedHome)}))(deny file-write* (subpath ${JSON.stringify(protectedHome)}))`;
+// The exact hash-checked executable may itself reside in the owner's home.
+// Permit that one file, never the containing checkout or other home content.
+const profile = `(version 1)(allow default)(deny network*)(deny file-read* (subpath ${JSON.stringify(protectedHome)}))
+(allow file-read-metadata)(allow file-read* (literal ${JSON.stringify(binary)}))(deny file-write*)
+(allow file-write* (subpath ${JSON.stringify(fixture)}) (literal "/dev/null"))`;
 const child = spawn('/usr/bin/sandbox-exec', ['-p', profile, binary, '--config', config, '--surface', 'web-tunnel'], {
-  cwd: work, env: {PATH: '/usr/bin:/bin', TMPDIR: fixture}, stdio: ['pipe', 'pipe', 'pipe']
+  cwd: work, env: {PATH: '/usr/bin:/bin', TMPDIR: fixture, CFFIXED_USER_HOME: fixture}, stdio: ['pipe', 'pipe', 'pipe']
 });
-const pending = new Map(), evidence = [];
-let sequence = 0, errors = '';
-child.stderr.on('data', d => { errors += d.toString(); assert(errors.length < 65536); });
-const lines = readline.createInterface({input: child.stdout});
-lines.on('line', line => {
-  assert(Buffer.byteLength(line) < 2 * 1024 * 1024);
-  const message = JSON.parse(line), waiter = pending.get(message.id);
-  if (!waiter) { evidence.push({notification: message}); return; }
-  pending.delete(message.id); clearTimeout(waiter.timer);
-  evidence.push({request: waiter.request, response: message});
-  if (message.error) waiter.reject(new Error(JSON.stringify(message.error))); else waiter.resolve(message.result);
-});
-function rpc(method, params = {}) {
-  const id = ++sequence, request = {jsonrpc: '2.0', id, method, params};
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { pending.delete(id); reject(new Error('RPC timeout: ' + method)); }, 10000);
-    pending.set(id, {resolve, reject, timer, request});
-    child.stdin.write(JSON.stringify(request) + '\n');
-  });
-}
+const session = new RPCSession(child), evidence = session.evidence;
+const rpc = (method, params = {}) => session.request(method, params);
 async function tool(name, args = {}) {
   const result = await rpc('tools/call', {name, arguments: args});
   assert.equal(result.isError, false, JSON.stringify(result));
@@ -63,14 +50,15 @@ const probes = [
   ['brevo_campaign', {action: 'schedule', campaign_id: 77, scheduled_at: '2099-01-01T12:00:00Z'}],
 ];
 (async () => {
+  let report;
   try {
     const init = await rpc('initialize', {protocolVersion: '2025-06-18', capabilities: {}, clientInfo: {name: 'brevo-offline-acceptance', version: '1'}});
     assert.equal(init.protocolVersion, '2025-06-18');
-    child.stdin.write(JSON.stringify({jsonrpc: '2.0', method: 'notifications/initialized'}) + '\n');
+    session.notify('notifications/initialized');
     const catalog = (await rpc('tools/list')).tools;
-    assert.equal(catalog.length, 70);
+    assert.equal(catalog.length, 72);
     const names = catalog.map(t => t.name), brevo = names.filter(n => n.startsWith('brevo_'));
-    assert.equal(new Set(names).size, 70); assert.equal(brevo.length, 12);
+    assert.equal(new Set(names).size, 72); assert.equal(brevo.length, 12);
     for (const name of brevo) {
       const spec = catalog.find(t => t.name === name);
       assert.equal(spec.inputSchema.additionalProperties, false);
@@ -93,7 +81,7 @@ const probes = [
     assert.equal(rejected.isError, true);
     assert(JSON.stringify(rejected).includes('confirm_write'));
     const identity = await tool('bridge_capabilities');
-    assert.equal(identity.catalog_count, 70);
+    assert.equal(identity.catalog_count, 72);
     assert.equal(identity.network_default, 'loopback_only');
     assert.equal(identity.mcp_executable_sha256, expectedHash);
     assert.equal(identity.desktop_open_enabled, false);
@@ -108,19 +96,26 @@ const probes = [
       assert.equal(result.isError, true, 'New desktop capabilities must be default off');
     }
     assert(!JSON.stringify(evidence).includes('xkeysib-'));
-    fs.writeFileSync(output, JSON.stringify({status: 'PASS', identity, brevo_tools: brevo,
-      dry_run_probes: probes.length, exact_schema_queries: brevo.length, rpc_calls: sequence,
-      network_denied_by_os: true, home_reads_denied_by_os: true, production_runtime_touched: false,
-      production_acceptance: false, normal_chat_acceptance: false, evidence}, null, 2), {mode: 0o600, flag: 'wx'});
-    console.log(JSON.stringify({status: 'PASS', binary_sha256: expectedHash, catalog_count: 70,
-      catalog_sha256: identity.catalog_sha256, build_id: identity.build_id, instance_id: identity.instance_id,
-      dry_run_probes: probes.length, rpc_calls: sequence, output}));
+    const ended = await session.stop();
+    assert.equal(ended.code, 0, 'Exact core must exit cleanly after EOF');
+    report = {status: 'PASS', identity, brevo_tools: brevo,
+      dry_run_probes: probes.length, exact_schema_queries: brevo.length, rpc_calls: session.sequence,
+      network_denied_by_os: true, production_home_contents_denied_by_os: true, production_runtime_touched: false,
+      exact_executable_read_exception: true, filesystem_metadata_allowed: true, core_exit_code: ended.code,
+      production_acceptance: false, normal_chat_acceptance: false, evidence};
   } finally {
-    child.stdin.end();
-    const ended = new Promise(resolve => child.once('exit', resolve));
-    const timer = setTimeout(() => child.kill('SIGTERM'), 2000);
-    await ended; clearTimeout(timer); lines.close();
-    assert(fixture.startsWith('/private/tmp/mb-brevo-rpc-'));
-    fs.rmSync(fixture, {recursive: true, force: true}); // Only this test's newly created fixture.
+    try { await session.stop(); }
+    finally {
+      assert(fixture.startsWith('/private/tmp/mb-brevo-rpc-'));
+      fs.rmSync(fixture, {recursive: true, force: true}); // Only this test's newly created fixture.
+    }
   }
-})().catch(error => { console.error(error.message, errors); process.exitCode = 1; });
+  // Do not publish a PASS before clean child shutdown and fixture cleanup.
+  assert(report);
+  fs.writeFileSync(output, JSON.stringify(report, null, 2), {mode: 0o600, flag: 'wx'});
+  console.log(JSON.stringify({status: 'PASS', binary_sha256: expectedHash, catalog_count: 72,
+    catalog_sha256: report.identity.catalog_sha256, build_id: report.identity.build_id,
+    dry_run_probes: probes.length, rpc_calls: session.sequence, output}));
+})().catch(error => { console.error(JSON.stringify({status: 'FAIL', code: error.code || error.name,
+  child_exit_code: child.exitCode, child_signal: child.signalCode,
+  rpc_calls: session.sequence, stderr_bytes: session.stderrBytes})); process.exitCode = 1; });

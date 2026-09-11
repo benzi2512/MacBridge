@@ -1,9 +1,14 @@
 # MacBridge Direct Local MCP
 
-The current source catalog contains 70 tools, including twelve grouped Brevo
+The current source catalog contains 72 tools, including twelve grouped Brevo
 tools. See [Brevo capabilities and acceptance](BREVO-CAPABILITIES.md) for the
 fixed-account API coverage, typed actions, gates and known API limits. This
 describes source functionality; verify installed build and host discovery.
+
+The two opt-in media tools stage an explicitly approved local creative for the
+existing Meta Ads connector's URL route. They do not access Meta credentials or
+create ads. See [media transfer candidate and deployment gates](MEDIA-TRANSFER.md).
+No storage or sharing is enabled by installing source alone.
 
 The candidate also adds three opt-in tools for Finder/document opening, scoped
 shell networking and selected-app Accessibility. They are off in existing
@@ -131,7 +136,7 @@ readiness. The first-run UI is described in the [release guide](../Release/FIRST
 
 ## Operational limits
 
-- The source catalog contains 70 tools, including twelve Brevo tools, `developer_inspect`, `developer_task`, `work_task`, `transaction_list`,
+- The source catalog contains 72 tools, including twelve Brevo tools, `developer_inspect`, `developer_task`, `work_task`, `transaction_list`,
   `transaction_accept`, `bridge_activity_view` and `bridge_activity`. See current deployment (private deployment notes excluded) for
   the installed artifact and its acceptance limits. A Chat client can cache an
   older schema or load tools on demand. Use the host's available tool discovery
@@ -139,11 +144,11 @@ readiness. The first-run UI is described in the [release guide](../Release/FIRST
   same as not discoverable. Capability counts alone do not prove callability.
   `initialize.instructions` describes direct use and selective discovery without
   repeating all names; `bridge_capabilities.tool_names` exposes the live index.
-  `tool_catalog` defaults to 13 starter tools (explicitly truncated); `limit=70`
-  gives the full 69-entry canonical index. All 70 tools remain in `tools/list`. Bounded
+  `tool_catalog` defaults to 13 starter tools (explicitly truncated); `limit=72`
+  gives the full 71-entry canonical index. All 72 tools remain in `tools/list`. Bounded
   `query`/`category` filters return up to 5 suggestions by default. `names`
   preserves exact-schema lookup, and explicit `detail: "schemas"` still returns
-  the complete 70-tool catalog. `workspace_list` remains a deprecated callable
+  the complete 72-tool catalog. `workspace_list` remains a deprecated callable
   alias for compatibility. All schemas derive from `tools/list`; none of these
   metadata lookups force host loading or override approvals. See TOOL-GUIDE.md.
   `file_read_many` reads up to 32 initial file chunks with a shared 1 MiB raw-byte

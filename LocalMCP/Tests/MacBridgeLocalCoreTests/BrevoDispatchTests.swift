@@ -22,10 +22,10 @@ final class BrevoDispatchTests: XCTestCase {
             let ping = try io.receive(id: 2)
             XCTAssertNotNil(ping["result"])
             let catalog = try XCTUnwrap(try io.receive(id: 3)["result"] as? JSONObject)
-            XCTAssertEqual((catalog["tools"] as? [JSONObject])?.count, 70)
-            XCTAssertEqual(Set((catalog["tools"] as? [JSONObject] ?? []).compactMap { $0["name"] as? String }).count, 70)
+            XCTAssertEqual((catalog["tools"] as? [JSONObject])?.count, 72)
+            XCTAssertEqual(Set((catalog["tools"] as? [JSONObject] ?? []).compactMap { $0["name"] as? String }).count, 72)
             let capability = try structured(io.receive(id: 4))
-            XCTAssertEqual(capability["catalog_count"] as? Int, 70)
+            XCTAssertEqual(capability["catalog_count"] as? Int, 72)
             XCTAssertEqual(capability["catalog_sha256"] as? String, catalog["catalogEpoch"] as? String)
             XCTAssertEqual(capability["active_brevo_calls"] as? Int, 1)
             let milliseconds = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000

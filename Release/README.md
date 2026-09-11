@@ -122,3 +122,30 @@ python3 -B -m unittest -v test_privacy_gate test_package_dmg
 
 Native disk-image creation explicitly keeps source-volume ownership unchanged
 (`-srcowners any`); it never changes ownership settings on the source disk.
+
+## Fail-closed protocol acceptance
+
+`LocalMCP/Tests/E2E/brevo_catalog_offline.cjs` verifies the exact core digest and
+performs fixture-only JSON-RPC, including credential-free Brevo previews. Its
+test-only `rpc_session.cjs` registers child completion before the first request,
+bounds raw stdout/stderr and request/shutdown waits, validates frames, and refuses
+early exit, nonzero exit, malformed/truncated output or pending replies at EOF.
+Vendor stderr is counted, not echoed. PASS is written only after a clean shutdown
+and successful fixture cleanup; exit code zero without that receipt is not proof.
+
+The child sandbox denies networking and production-home contents. The one pinned
+executable is an explicit read exception if built under the home directory;
+filesystem metadata is allowed for path traversal. Writes are confined to the
+fresh test fixture and `/dev/null`. No production credential, owner socket,
+provider call or installed runtime is used. These checks do not prove normal
+Chat callability, real email delivery or cloud media ingestion.
+
+The protocol client's failure cases are tested without launching apps or making
+network requests:
+
+```sh
+node --test LocalMCP/Tests/E2E/test_rpc_session.cjs
+```
+
+Keep generated acceptance receipts outside source and require their exact binary
+identity, successful call count and clean core exit before scoring a release.

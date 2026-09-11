@@ -7,7 +7,7 @@ same owner's activity rather than operating a second execution engine.
 
 ## Current source
 
-This source contains 70 MCP tools, including 12 Brevo tools, a compact discovery
+This source contains 72 MCP tools, including 12 Brevo tools, a compact discovery
 index, high-level developer workflows, parent activity, process control, guarded
 file changes and bounded undo. See [LocalMCP](LocalMCP/README.md),
 [tool discovery](LocalMCP/TOOL-GUIDE.md), [Brevo](LocalMCP/BREVO-CAPABILITIES.md),
@@ -19,6 +19,13 @@ These capabilities are **off by default** and do not grant themselves access.
 See [desktop access and its limits](LocalMCP/DESKTOP-ACCESS.md). The native
 observer uses system glass, a compact monochrome widget and retained task
 selection; it never changes a client's tool permissions.
+
+The two media tools prepare a selected local creative and can stage it behind an
+expiring link only after separate owner storage configuration and sharing approval.
+No storage account, credentials or default upload destination are shipped. Meta
+Ads URL ingestion still needs a separate live acceptance test; preparing or
+staging a file is not proof that Meta accepted it. See [media transfer and its
+limits](LocalMCP/MEDIA-TRANSFER.md).
 
 The implementation is Swift 6, targets macOS 13 or later and declares no external
 Swift package dependencies. It uses macOS system frameworks and the installed

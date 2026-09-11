@@ -73,12 +73,12 @@ async function tool(name, args = {}) {
   const started = Date.now();
   try {
     const catalog = await rpc('tools/list');
-    assert.equal(catalog.tools.length, 70, 'combined desktop candidate catalog');
+    assert.equal(catalog.tools.length, 72, 'combined desktop candidate catalog');
     // The detail patch must preserve the reviewed desktop candidate's catalog.
     assert.equal(catalog.catalogEpoch, '4e4e372a88d4e9ab7517991852f02aa9604a993a12f0bd440eef022a4cbc855e');
     const caps = await tool('bridge_capabilities');
     assert.equal(caps.data.mcp_executable_sha256, expectedHash);
-    assert(caps.text.includes('70 catalog tools'));
+    assert(caps.text.includes('72 catalog tools'));
     assert.equal(caps.data.desktop_open_enabled, false);
     assert.equal(caps.data.computer_grants_configured, 0);
     const read = await tool('file_read_lines', {workspace_id: workspaceID, path: 'sum.py', start_line: 1, maximum_lines: 2});
@@ -139,7 +139,7 @@ async function tool(name, args = {}) {
     assert.equal((await tool('process_list')).data.processes.length, 0);
     assert.equal((await tool('transaction_list')).data.retained_transaction_count, 0);
     const result = {status: 'PASS', scope: 'isolated exact-binary MCP receipt test; NOT normal Chat rendering',
-      binary_sha256: expectedHash, catalog_sha256: catalog.catalogEpoch, tool_count: 70,
+      binary_sha256: expectedHash, catalog_sha256: catalog.catalogEpoch, tool_count: 72,
       elapsed_milliseconds: Date.now() - started, live_snapshots: observedRunning,
       produced_stdout_bytes: produced, observed_elapsed_seconds: elapsed,
       fixture_checks: 120000, file_restored: true, jobs_remaining: 0, undo_remaining: 0, receipts};
