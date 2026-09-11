@@ -43,6 +43,7 @@ struct ContextActivity: Identifiable {
     var currentAction: ActivityItem? { visibleChildren.first }
 
     func matches(query: String, filter: ActivityPresentation.Filter) -> Bool {
+        if filter == .ungrouped { return false }
         if filter == .running && !active { return false }
         if filter == .issues && issueCount == 0 { return false }
         let text = [title, rootPath, workspaceName, status].joined(separator: " ")

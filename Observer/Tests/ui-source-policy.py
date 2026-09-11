@@ -13,6 +13,7 @@ LIFECYCLE = (SOURCES / "AppLifecycle.swift").read_text()
 APP = (SOURCES / "ObserverApp.swift").read_text()
 MOTION = (SOURCES / "FloatingMotion.swift").read_text()
 APPEARANCE = (SOURCES / "ObserverAppearance.swift").read_text()
+DOCKING = (SOURCES / "FloatingDocking.swift").read_text()
 
 
 def require(condition, message):
@@ -40,7 +41,7 @@ check("canonical-icns", (ROOT / "Assets" / "Brand" / "MacBridge.icns").is_file()
 
 for name, value in {
     "edgeIdleWidth": "30", "edgeIdleHeight": "58", "edgeRailWidth": "36", "edgeRailHeight": "196",
-    "edgeLogoSize": "22", "edgeTargetSize": "28", "edgeRailSpacing": "7",
+    "edgeLogoSize": "22", "edgeTargetSize": "32", "edgeRailSpacing": "3",
     "hoverDelay": "0.10", "hoverExitGrace": "0.45", "openDuration": "0.64",
     "panelDuration": "0.72", "closeDuration": "0.64", "reducedMotionDuration": "0.10",
 }.items():
@@ -92,7 +93,15 @@ check("resting-material-is-inactive", ".opacity(resting ? 0 : glassOpacity)" in 
 check("window-background-has-no-gradient", "LinearGradient" not in APPEARANCE
       and "view.blendingMode = .behindWindow" in APPEARANCE)
 
-compact_source = DESIGN + SURFACES + LIFECYCLE + APPEARANCE + MOTION
+check("local-logo-drag", "override func mouseDragged" in DOCKING and "FloatingLogoDrag" in DOCKING)
+check("bottom-edge-docking", "case right, bottom" in DOCKING and "DockedOrganicEdgeShape" in SURFACES)
+check("drag-does-not-grant-input-access", all(value not in DOCKING for value in [
+    "CGEvent(", "CGEventTap", "addGlobalMonitorForEvents", "CGRequestPostEventAccess", "AXIsProcessTrustedWithOptions"]))
+check("bounded-dock-preferences", "updated.count - 16" in DESIGN and "ui.floatingTabDockAnchors" in DESIGN)
+check("first-click-floating-host", "FloatingFirstClickHostingView(rootView:" in SURFACES
+      and "override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }" in DOCKING)
+check("full-rect-action-targets", ".contentShape(Rectangle())" in SURFACES and "includeControls(in:" in DESIGN)
+compact_source = DESIGN + SURFACES + LIFECYCLE + APPEARANCE + MOTION + DOCKING
 for forbidden in ["repeatForever", "Timer.scheduledTimer", "CVDisplayLink", "CADisplayLink",
                   "DispatchSource.makeTimerSource", "URLSession", "NWConnection", "Process()"]:
     check("absent-" + forbidden.replace(".", "-"), forbidden not in compact_source)

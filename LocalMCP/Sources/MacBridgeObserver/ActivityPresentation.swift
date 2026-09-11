@@ -70,7 +70,9 @@ struct ActivityPresentation {
         ]
     static var knownTools: Set<String> { Set(actions.keys) }
 
-    enum Filter: String, CaseIterable { case all = "All", running = "Active", issues = "Issues" }
+    enum Filter: String, CaseIterable {
+        case all = "All", running = "Active", issues = "Issues", ungrouped = "Ungrouped"
+    }
 
     /// Only retained, already-observed metadata is searched. No extra MCP calls,
     /// file content, output collection or persistent index is introduced.

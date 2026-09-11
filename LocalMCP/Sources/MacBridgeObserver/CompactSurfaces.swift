@@ -18,7 +18,7 @@ struct GlassSurface<S: Shape>: ViewModifier {
     func body(content: Content) -> some View {
         if reduceTransparency || appReduceTransparency {
             content.background(shape.fill(Color(nsColor: .windowBackgroundColor)))
-                .overlay(shape.stroke(Color.primary.opacity(contrast == .increased ? 0.5 : 0.18), lineWidth: 1))
+                .overlay(shape.stroke(Color.primary.opacity(contrast == .increased ? 0.5 : 0.18), lineWidth: 1).allowsHitTesting(false))
                 .clipShape(shape)
         } else {
             content.background {
@@ -58,6 +58,9 @@ final class FloatingTabController: ObservableObject {
     @Published private(set) var pointerInside = false
     @Published private(set) var windowLayer: FloatingLayer = .idle
     @Published private(set) var readingOrder = CompactReadingOrder()
+    @Published private(set) var draggingAnchor: FloatingDockAnchor?
+    private var logoDrag: FloatingLogoDrag?
+    private var screenBeforeDrag: NSScreen?
 
     let model: ObserverModel
     let preferences: ObserverPreferences
@@ -84,6 +87,8 @@ final class FloatingTabController: ObservableObject {
     var pendingTransitionCount: Int { (hoverOpenTask == nil ? 0 : 1) + (hoverCloseTask == nil ? 0 : 1) + (previewTask == nil ? 0 : 1) + (shrinkTask == nil ? 0 : 1) }
     var hasCreatedPanel: Bool { edgePanel != nil }
     var currentSummary: CompactSummary { model.compactSummary }
+    var dockAnchor: FloatingDockAnchor { draggingAnchor ?? preferences.dockAnchor(for: displayID) }
+    var isDraggingLogo: Bool { logoDrag?.isDragging == true }
     var currentScreen: NSScreen? {
         if let anchoredScreen, let screen = NSScreen.screens.first(where: { $0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber == anchoredScreen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber }) {
             return screen
@@ -104,7 +109,9 @@ final class FloatingTabController: ObservableObject {
         self.presentsWindow = presentsWindow
         self.openDashboardAction = openDashboard
         self.openSettingsAction = openSettings
-        self.anchoredScreen = NSScreen.main ?? NSScreen.screens.first
+        self.anchoredScreen = NSScreen.screens.first(where: {
+            ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.stringValue == preferences.preferredDisplayID
+        }) ?? NSScreen.main ?? NSScreen.screens.first
         self.readingOwner = model.owner
         model.$owner.compactMap { $0 }.sink { [weak self] owner in
             guard let self, self.readingOwner != owner else { return }
@@ -140,6 +147,7 @@ final class FloatingTabController: ObservableObject {
     }
 
     func stop() {
+        cancelLogoDrag()
         hoverOpenTask?.cancel(); hoverOpenTask = nil
         hoverCloseTask?.cancel(); hoverCloseTask = nil
         cancelPreview()
@@ -148,6 +156,7 @@ final class FloatingTabController: ObservableObject {
     }
 
     func pointerChanged(_ inside: Bool) {
+        guard logoDrag == nil else { return }
         guard pointerInside != inside else { return }
         pointerInside = inside
         if inside {
@@ -194,6 +203,7 @@ final class FloatingTabController: ObservableObject {
     }
 
     func preview(_ target: FloatingLayer, inside: Bool) {
+        guard logoDrag == nil else { return }
         guard inside else {
             if previewLayer == target { cancelPreview() }
             return
@@ -242,9 +252,9 @@ final class FloatingTabController: ObservableObject {
     func hideWidget() {
         stop()
         preferences.hideFloatingTab()
-        machine = FloatingInteractionStateMachine()
-        windowLayer = .idle
-        pointerInside = false
+        if machine != FloatingInteractionStateMachine() { machine = FloatingInteractionStateMachine() }
+        if windowLayer != .idle { windowLayer = .idle }
+        if pointerInside { pointerInside = false }
         readingOrder = CompactReadingOrder()
     }
 
@@ -258,6 +268,7 @@ final class FloatingTabController: ObservableObject {
     }
 
     func closeDeepest() {
+        if logoDrag != nil { cancelLogoDrag(); return }
         cancelPreview()
         var next = machine
         next.closeDeepest()
@@ -265,7 +276,54 @@ final class FloatingTabController: ObservableObject {
     }
 
     func setVerticalAnchor(_ value: CGFloat) {
-        preferences.setNormalizedY(value, for: displayID)
+        preferences.setDockAnchor(.init(edge: dockAnchor.edge, position: Double(value)), for: displayID)
+        reposition(animated: false)
+    }
+
+    func logoPressBegan(at point: CGPoint) {
+        guard point.x.isFinite, point.y.isFinite else { return }
+        hoverOpenTask?.cancel(); hoverOpenTask = nil
+        hoverCloseTask?.cancel(); hoverCloseTask = nil
+        cancelPreview()
+        logoDrag = FloatingLogoDrag(start: point)
+        screenBeforeDrag = anchoredScreen
+    }
+
+    func logoDragged(to point: CGPoint) {
+        guard var drag = logoDrag else { return }
+        let moved = drag.move(to: point)
+        logoDrag = drag
+        guard moved else { return }
+        let previousEdge = dockAnchor.edge
+        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(point) }) ?? currentScreen else { return }
+        anchoredScreen = screen
+        shrinkTask?.cancel(); shrinkTask = nil
+        if machine != FloatingInteractionStateMachine() { machine = FloatingInteractionStateMachine() }
+        if windowLayer != .idle { windowLayer = .idle }
+        if pointerInside { pointerInside = false }
+        let next = FloatingDockLayout.anchor(at: point, visibleFrame: screen.visibleFrame, previousEdge: previousEdge)
+        if draggingAnchor != next { draggingAnchor = next }
+        reposition(animated: false)
+    }
+
+    func logoPressEnded(at point: CGPoint) {
+        guard logoDrag != nil else { return }
+        logoDragged(to: point)
+        let moved = isDraggingLogo
+        if let anchor = draggingAnchor { preferences.setDockAnchor(anchor, for: displayID) }
+        logoDrag = nil
+        draggingAnchor = nil
+        screenBeforeDrag = nil
+        reposition(animated: false)
+        if !moved { openDashboard() }
+    }
+
+    func cancelLogoDrag() {
+        guard logoDrag != nil else { return }
+        anchoredScreen = screenBeforeDrag
+        logoDrag = nil
+        screenBeforeDrag = nil
+        draggingAnchor = nil
         reposition(animated: false)
     }
 
@@ -278,10 +336,10 @@ final class FloatingTabController: ObservableObject {
         shrinkTask?.cancel(); shrinkTask = nil
         let closing = next.layer == .idle && windowLayer != .idle
         let visibleFrame = currentScreen?.visibleFrame ?? .infinite
-        let currentWindowSize = EdgeLayout.size(for: windowLayer, visibleFrame: visibleFrame,
-                                                taskCount: readingOrder.ids.count)
-        let nextWindowSize = EdgeLayout.size(for: next.layer, visibleFrame: visibleFrame,
-                                             taskCount: readingOrder.ids.count)
+        let currentWindowSize = FloatingDockLayout.size(for: windowLayer, visibleFrame: visibleFrame,
+                                                taskCount: readingOrder.ids.count, edge: dockAnchor.edge)
+        let nextWindowSize = FloatingDockLayout.size(for: next.layer, visibleFrame: visibleFrame,
+                                             taskCount: readingOrder.ids.count, edge: dockAnchor.edge)
         // Compare full canvas dimensions so no leaving panel gets clipped.
         let shrinkingPanelCanvas = windowLayer.hasPanel &&
             (nextWindowSize.width < currentWindowSize.width || nextWindowSize.height < currentWindowSize.height)
@@ -326,9 +384,8 @@ final class FloatingTabController: ObservableObject {
     private func reposition(animated: Bool) {
         guard presentsWindow, preferences.showFloatingTab else { return }
         guard let screen = currentScreen else { return }
-        let frame = EdgeLayout.frame(visibleFrame: screen.visibleFrame, layer: windowLayer,
-                                     normalizedFromTop: preferences.normalizedY(for: displayID),
-                                     taskCount: readingOrder.ids.count)
+        let frame = FloatingDockLayout.frame(visibleFrame: screen.visibleFrame, layer: windowLayer,
+                                             anchor: dockAnchor, taskCount: readingOrder.ids.count)
         // Window geometry must be atomic: animating the hosting window and its
         // SwiftUI layout together moves tracking regions under a stationary mouse.
         if panel.frame != frame { panel.setFrame(frame, display: true) }
@@ -347,7 +404,7 @@ final class FloatingTabController: ObservableObject {
         panel.becomesKeyOnlyIfNeeded = true
         panel.animationBehavior = .none
         panel.escapeAction = { [weak self] in self?.closeDeepest() }
-        let hosting = NSHostingView(rootView: FloatingTabView(controller: self))
+        let hosting = FloatingFirstClickHostingView(rootView: FloatingTabView(controller: self))
         // AppKit owns the canvas. Do not let GeometryReader's 10pt ideal size
         // feed a second, competing resize back into the borderless window.
         hosting.sizingOptions = []
@@ -403,27 +460,28 @@ struct FloatingTabView: View {
     private var displayedTasks: [CompactTaskPresentation] { controller.readingOrder.rows(summary.tasks) }
     var body: some View {
         GeometryReader { geometry in
-            let logoY = geometry.size.height / 2 - (controller.windowLayer == .idle ? 0 : EdgeLayout.railLogoOffset)
+            let bottom = controller.dockAnchor.edge == .bottom
+            let logo = FloatingDockLayout.logo(in: geometry.size, layer: controller.windowLayer, edge: controller.dockAnchor.edge)
             ZStack(alignment: .topLeading) {
                 edgeHandle
-                    .position(x: geometry.size.width - MBMetrics.edgeRailWidth / 2,
-                              y: logoY + EdgeLayout.railLogoOffset)
-                logoButton.position(x: geometry.size.width - EdgeLayout.logoInset, y: logoY)
+                    .position(x: bottom ? logo.x + EdgeLayout.railLogoOffset : geometry.size.width - MBMetrics.edgeRailWidth / 2,
+                              y: bottom ? geometry.size.height - MBMetrics.edgeRailWidth / 2 : logo.y + EdgeLayout.railLogoOffset)
+                logoButton.position(logo)
                 ZStack(alignment: .trailing) {
                     if controller.layer.hasPanel {
                         compactPanel
-                            .transition(reducedMotion ? .opacity : .opacity.combined(with: .offset(x: 12)))
+                            .transition(reducedMotion ? .opacity : .opacity.combined(with: .offset(x: bottom ? 0 : 12, y: bottom ? 12 : 0)))
                     }
                 }
                 .animation(FloatingMotion.panel(reduced: reducedMotion), value: controller.layer)
                 .frame(width: canvasPanelSize.width, height: canvasPanelSize.height, alignment: .trailing)
-                .position(x: max(canvasPanelSize.width / 2, geometry.size.width - MBMetrics.edgeRailWidth - canvasPanelSize.width / 2),
-                          y: geometry.size.height / 2)
+                .position(x: bottom ? geometry.size.width / 2 : max(canvasPanelSize.width / 2, geometry.size.width - MBMetrics.edgeRailWidth - canvasPanelSize.width / 2),
+                          y: bottom ? geometry.size.height - MBMetrics.edgeRailWidth - MBMetrics.panelGap - canvasPanelSize.height / 2 : geometry.size.height / 2)
             }
             .frame(width: geometry.size.width, height: geometry.size.height)
-            .contentShape(FloatingHitRegion(logoY: logoY,
+            .contentShape(FloatingHitRegion(logoY: logo.y,
                 expansion: reducedMotion ? (controller.windowLayer.isExpanded ? 1 : 0) : expansion,
-                panelSize: canvasPanelSize))
+                panelSize: canvasPanelSize, dockEdge: controller.dockAnchor.edge, logoX: logo.x))
             .onHover(perform: controller.pointerChanged)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
@@ -479,14 +537,14 @@ struct FloatingTabView: View {
             if reducedMotion {
                 ZStack {
                     handleContent
-                        .glassSurface(AnchoredOrganicEdgeShape(expansion: controller.layer.isExpanded ? 1 : 0),
+                        .glassSurface(DockedOrganicEdgeShape(edge: controller.dockAnchor.edge, expansion: controller.layer.isExpanded ? 1 : 0),
                                       borderOpacity: 0.16, resting: !controller.layer.isExpanded)
                         .id(controller.layer.isExpanded)
                         .transition(.opacity)
                 }
                 .animation(.easeOut(duration: MBMetrics.reducedMotionDuration), value: controller.layer.isExpanded)
             } else {
-                handleContent.glassSurface(AnchoredOrganicEdgeShape(expansion: expansion), borderOpacity: 0.16,
+                handleContent.glassSurface(DockedOrganicEdgeShape(edge: controller.dockAnchor.edge, expansion: expansion), borderOpacity: 0.16,
                                           resting: !controller.layer.isExpanded)
             }
         }
@@ -500,33 +558,36 @@ struct FloatingTabView: View {
                 .allowsHitTesting(controller.layer.isExpanded)
                 .accessibilityHidden(!controller.layer.isExpanded)
         }
-        .frame(width: MBMetrics.edgeRailWidth, height: MBMetrics.edgeRailHeight)
+        .frame(width: controller.dockAnchor.edge == .bottom ? MBMetrics.edgeRailHeight : MBMetrics.edgeRailWidth,
+               height: controller.dockAnchor.edge == .bottom ? MBMetrics.edgeRailWidth : MBMetrics.edgeRailHeight)
     }
 
     private var logoButton: some View {
-        Button {
-            controller.openDashboard()
-        } label: {
-            CompactBrandBadge(summary: summary, showCount: preferences.showTaskCount)
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel("Open MacBridge Dashboard")
-        .help(summary.runningBadgeHelp)
+        FloatingLogoControl(summary: summary, showCount: preferences.showTaskCount,
+                            edge: controller.dockAnchor.edge, controller: controller)
+            .frame(width: controller.dockAnchor.edge == .bottom ? 38 : MBMetrics.edgeTargetSize,
+                   height: controller.dockAnchor.edge == .bottom ? MBMetrics.edgeTargetSize : MBMetrics.edgeBrandHeight)
+            .help("Click to open. Drag to move along the right or bottom edge. \(summary.runningBadgeHelp)")
     }
 
     private var railContent: some View {
-        VStack(spacing: MBMetrics.edgeRailSpacing) {
+        let bottom = controller.dockAnchor.edge == .bottom
+        let layout = bottom ? AnyLayout(HStackLayout(spacing: MBMetrics.edgeRailSpacing))
+            : AnyLayout(VStackLayout(spacing: MBMetrics.edgeRailSpacing))
+        return layout {
             Color.clear.frame(width: MBMetrics.edgeTargetSize, height: MBMetrics.edgeTargetSize).allowsHitTesting(false)
             ForEach(Array(RailAction.allCases.enumerated()), id: \.element) { index, action in
                 Button { perform(action) } label: {
                     Image(systemName: action.icon)
                         .font(.system(size: action == .hide ? 10 : 15, weight: .regular))
                         .frame(width: MBMetrics.edgeTargetSize, height: MBMetrics.edgeTargetSize)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(RailButtonStyle(selected: selected(action)))
                 .accessibilityLabel(action.label)
                 .opacity(controller.layer.isExpanded ? 1 : 0)
-                .offset(y: reducedMotion || controller.layer.isExpanded ? 0 : -6)
+                .offset(x: !bottom || reducedMotion || controller.layer.isExpanded ? 0 : -6,
+                        y: bottom || reducedMotion || controller.layer.isExpanded ? 0 : -6)
                 .animation(FloatingMotion.contents(index: index, appearing: controller.layer.isExpanded,
                                                   reduced: reducedMotion), value: controller.layer.isExpanded)
                 .onHover { inside in
@@ -535,7 +596,8 @@ struct FloatingTabView: View {
             }
         }
         .foregroundStyle(MBPalette.textPrimary.opacity(0.88))
-        .offset(x: MBMetrics.edgeRailWidth / 2 - EdgeLayout.logoInset)
+        .offset(x: bottom ? FloatingDockLayout.railContentOffset : MBMetrics.edgeRailWidth / 2 - EdgeLayout.logoInset,
+                y: bottom ? MBMetrics.edgeRailWidth / 2 - EdgeLayout.logoInset : FloatingDockLayout.railContentOffset)
     }
 
     private func selected(_ action: RailAction) -> Bool {
@@ -564,10 +626,10 @@ struct FloatingTabView: View {
             }
             Spacer()
             Button(action: controller.togglePin) {
-                Image(systemName: controller.machine.locked ? "pin.fill" : "pin").frame(width: 28, height: 28)
+                Image(systemName: controller.machine.locked ? "pin.fill" : "pin").frame(width: 28, height: 28).contentShape(Rectangle())
             }.buttonStyle(.plain).foregroundStyle(controller.machine.locked ? MBPalette.brandBlue : MBPalette.textSecondary)
                 .accessibilityLabel(controller.machine.locked ? "Unpin panel" : "Pin panel")
-            Button(action: controller.closeDeepest) { Image(systemName: "xmark").frame(width: 28, height: 28) }
+            Button(action: controller.closeDeepest) { Image(systemName: "xmark").frame(width: 28, height: 28).contentShape(Rectangle()) }
                 .buttonStyle(.plain).foregroundStyle(MBPalette.textSecondary).accessibilityLabel("Close panel")
         }
     }
@@ -626,10 +688,10 @@ struct FloatingTabView: View {
         let work = model.allActivityFeed.groups.first { $0.id == id }
         return VStack(alignment: .leading, spacing: 14) {
             HStack {
-                Button { controller.show(.recentTasks) } label: { Image(systemName: "chevron.left").frame(width: 28, height: 28) }
+                Button { controller.show(.recentTasks) } label: { Image(systemName: "chevron.left").frame(width: 28, height: 28).contentShape(Rectangle()) }
                     .buttonStyle(.plain).accessibilityLabel("Back to recent tasks")
                 Spacer()
-                Button(action: controller.closeDeepest) { Image(systemName: "xmark").frame(width: 28, height: 28) }
+                Button(action: controller.closeDeepest) { Image(systemName: "xmark").frame(width: 28, height: 28).contentShape(Rectangle()) }
                     .buttonStyle(.plain).accessibilityLabel("Close panel")
             }.foregroundStyle(MBPalette.textSecondary)
             if let task {
@@ -677,12 +739,13 @@ struct FloatingTabView: View {
     }
 
     private var settingsPanel: some View {
-        CompactSettingsView(preferences: preferences, displayID: controller.displayID,
-                            normalizedY: preferences.normalizedY(for: controller.displayID),
-                            onAnchorChanged: controller.setVerticalAnchor,
-                            onOpenFullSettings: controller.openSettings,
-                            onClose: controller.closeDeepest)
-            .padding(16)
+        ScrollView {
+            CompactSettingsView(preferences: preferences, displayID: controller.displayID,
+                                onAnchorChanged: controller.setVerticalAnchor,
+                                onOpenFullSettings: controller.openSettings,
+                                onClose: controller.closeDeepest)
+                .padding(16)
+        }
     }
 }
 
@@ -691,10 +754,12 @@ struct FloatingTabView: View {
 struct CompactBrandBadge: View {
     let summary: CompactSummary
     let showCount: Bool
+    var horizontal = false
 
     var body: some View {
-        VStack(spacing: 2) {
-            MacBridgeMark(size: MBMetrics.edgeLogoSize, style: .monochrome)
+        let layout = horizontal ? AnyLayout(HStackLayout(spacing: 2)) : AnyLayout(VStackLayout(spacing: 2))
+        return layout {
+            MacBridgeMark(size: horizontal ? 18 : MBMetrics.edgeLogoSize, style: .monochrome)
             if showCount {
                 Text(summary.runningBadgeText)
                     .font(.system(size: 8.5, weight: .semibold, design: .rounded))
@@ -706,7 +771,8 @@ struct CompactBrandBadge: View {
             }
         }
         .foregroundStyle(.primary)
-        .frame(width: MBMetrics.edgeTargetSize, height: MBMetrics.edgeBrandHeight)
+        .frame(width: horizontal ? 38 : MBMetrics.edgeBrandWidth,
+               height: horizontal ? MBMetrics.edgeTargetSize : MBMetrics.edgeBrandHeight)
         .animation(nil, value: summary.runningBadgeText)
     }
 }
@@ -745,6 +811,7 @@ struct CompactTaskRow: View {
             Text(task.statusText).font(.system(size: 10, weight: .medium)).foregroundStyle(task.status.color).lineLimit(1)
         }
         .padding(.horizontal, 4).frame(height: 48)
+        .contentShape(Rectangle())
         .help("\(task.title)\n\(task.projectName)\n\(task.shortActivity)")
         .overlay(alignment: .bottom) {
             if showsDivider { Rectangle().fill(MBPalette.textSecondary.opacity(0.14)).frame(height: 1) }
@@ -758,7 +825,6 @@ struct CompactTaskRow: View {
 struct CompactSettingsView: View {
     @ObservedObject var preferences: ObserverPreferences
     let displayID: String
-    @State var normalizedY: CGFloat
     var onAnchorChanged: (CGFloat) -> Void
     var onOpenFullSettings: (() -> Void)?
     var onClose: (() -> Void)?
@@ -769,7 +835,7 @@ struct CompactSettingsView: View {
                 Text("Appearance & behavior").font(.system(size: 15, weight: .semibold))
                 Spacer()
                 if let onClose {
-                    Button(action: onClose) { Image(systemName: "xmark").frame(width: 28, height: 28) }
+                    Button(action: onClose) { Image(systemName: "xmark").frame(width: 28, height: 28).contentShape(Rectangle()) }
                         .buttonStyle(.plain).accessibilityLabel("Close settings")
                 }
             }
@@ -800,10 +866,18 @@ struct CompactSettingsView: View {
             Toggle("Show in full-screen Spaces", isOn: $preferences.showInFullscreen)
             VStack(alignment: .leading, spacing: 6) {
                 Text("Floating Tab position").font(.system(size: 11, weight: .medium)).foregroundStyle(MBPalette.textSecondary)
-                Slider(value: Binding(get: { Double(normalizedY) }, set: {
-                    normalizedY = CGFloat($0); onAnchorChanged(normalizedY)
-                }), in: 0.14...0.86)
-                Text("Display \(displayID) · attached to right edge")
+                Text("Drag the logo up/down or onto the bottom edge. Click to open Dashboard.")
+                    .font(.system(size: 11)).foregroundStyle(MBPalette.textSecondary).fixedSize(horizontal: false, vertical: true)
+                Picker("Screen edge", selection: Binding(get: { preferences.dockAnchor(for: displayID).edge }, set: {
+                    preferences.setDockAnchor(.init(edge: $0, position: 0.5), for: displayID)
+                })) {
+                    ForEach(FloatingDockEdge.allCases, id: \.self) { Text($0.label).tag($0) }
+                }.pickerStyle(.segmented)
+                Slider(value: Binding(get: { preferences.dockAnchor(for: displayID).position }, set: {
+                    onAnchorChanged(CGFloat($0))
+                }), in: 0...1)
+                    .accessibilityLabel("Position along \(preferences.dockAnchor(for: displayID).edge.rawValue) edge")
+                Text("Display \(displayID) · attached to \(preferences.dockAnchor(for: displayID).edge.rawValue) edge")
                     .font(.system(size: 10)).foregroundStyle(MBPalette.textTertiary)
             }
             if let onOpenFullSettings {

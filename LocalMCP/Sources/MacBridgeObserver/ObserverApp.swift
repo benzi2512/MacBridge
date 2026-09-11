@@ -743,11 +743,7 @@ struct ObserverView: View {
                             }
                             Button("Find") { searchFocused = true }.keyboardShortcut("f")
                         }.padding(8).background(ObserverReadingSurface())
-                        Picker("Activity filter", selection: $activityFilter) {
-                            ForEach(ActivityPresentation.Filter.allCases, id: \.self) { filter in
-                                Text("\(filter.rawValue) (\(feed.displayCount(query: activityQuery, filter: filter)))").tag(filter)
-                            }
-                        }.pickerStyle(.segmented).accessibilityLabel("Activity filter")
+                        ActivityFilterBar(feed: feed, query: activityQuery, selection: $activityFilter)
                         List(selection: $model.selection) {
                             if !order.groupIDs.isEmpty {
                                 Section("Tasks · \(order.groupIDs.count)") {

@@ -185,7 +185,9 @@ struct ActivityFeed {
     }
 
     func matching(query: String = "", filter: ActivityPresentation.Filter = .all) -> [ActivityItem] {
-        items.filter { $0.matches(query: query, filter: filter) }
+        // Membership is known only after the parent/context joins, not from
+        // one raw receipt's work_id (its parent may no longer be retained).
+        (filter == .ungrouped ? ungroupedItems : items).filter { $0.matches(query: query, filter: filter) }
     }
     var runningCount: Int { items.filter { $0.presentation.running }.count }
     func matchingGroups(query: String = "", filter: ActivityPresentation.Filter = .all) -> [WorkActivity] {
@@ -202,6 +204,10 @@ struct ActivityFeed {
             + matchingUngrouped(query: query, filter: filter).count
     }
     func emptyMessage(filter: ActivityPresentation.Filter, query: String) -> String {
+        if filter == .ungrouped {
+            return query.isEmpty ? "No ungrouped activity in the retained history for this workspace."
+                : "No ungrouped activity matches this search in the selected workspace."
+        }
         if !query.isEmpty { return "No activity matches this search in the selected workspace. Clear the search or select All observed activity." }
         if filter == .running {
             if !jobsCurrent { return "Current process state is unavailable. View All for the last known activity; do not assume the jobs stopped." }

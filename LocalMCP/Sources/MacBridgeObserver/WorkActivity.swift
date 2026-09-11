@@ -69,6 +69,7 @@ struct WorkActivity: Identifiable {
         visibleChildren.first(where: { $0.presentation.running }) ?? visibleChildren.first
     }
     func matches(query: String, filter: ActivityPresentation.Filter) -> Bool {
+        if filter == .ungrouped { return false }
         if filter == .running && !active { return false }
         if filter == .issues && !issue && !children.contains(where: { $0.issue }) { return false }
         let words = query.prefix(256).split(whereSeparator: { $0.isWhitespace })

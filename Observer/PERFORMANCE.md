@@ -33,6 +33,11 @@ Compact idle surfaces have no continuous display-link, pointer-polling loop or
 repeating decorative animation. File previews refresh only while visible and
 enabled. These are source-level policies, not a measured battery-life guarantee.
 
+Logo dragging uses only the widget's own AppKit mouse events. It does not install
+a global event monitor or poll the pointer. Intermediate positions are transient;
+only the drop persists a bounded per-display anchor. The hosted logo updates only
+when its badge, orientation or appearance changes, not for each movement sample.
+
 ## Tests and benchmark
 
 `ObserverFeedCacheTests` checks workspace isolation, selection, health transitions,

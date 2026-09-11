@@ -106,7 +106,8 @@ final class ObserverSettingsPosition: ObservableObject {
 
     func setNormalizedY(_ value: CGFloat) {
         refreshDisplay()
-        preferences.setNormalizedY(value, for: displayID)
+        preferences.setDockAnchor(.init(edge: preferences.dockAnchor(for: displayID).edge,
+                                       position: Double(value)), for: displayID)
     }
 }
 
@@ -122,7 +123,6 @@ struct FullObserverSettingsView: View {
             Divider()
             ScrollView {
                 CompactSettingsView(preferences: preferences, displayID: position.displayID,
-                    normalizedY: preferences.normalizedY(for: position.displayID),
                     onAnchorChanged: position.setNormalizedY)
                     .id(position.displayID)
             }
@@ -135,5 +135,6 @@ struct FullObserverSettingsView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)) { _ in
             position.refreshDisplay()
         }
+        .onReceive(preferences.objectWillChange) { _ in position.refreshDisplay() }
     }
 }

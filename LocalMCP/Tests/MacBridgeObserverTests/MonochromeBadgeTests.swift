@@ -134,7 +134,7 @@ final class MonochromeBadgeTests: XCTestCase {
             for shown in [true, false] {
                 let host = NSHostingView(rootView: CompactBrandBadge(summary: summary, showCount: shown))
                 host.layoutSubtreeIfNeeded()
-                XCTAssertEqual(host.fittingSize.width, MBMetrics.edgeTargetSize, accuracy: 0.1)
+                XCTAssertEqual(host.fittingSize.width, MBMetrics.edgeBrandWidth, accuracy: 0.1)
                 XCTAssertEqual(host.fittingSize.height, MBMetrics.edgeBrandHeight, accuracy: 0.1)
                 XCTAssertLessThan(host.fittingSize.width, MBMetrics.edgeIdleWidth)
                 XCTAssertLessThan(host.fittingSize.height, MBMetrics.edgeIdleHeight)
@@ -152,7 +152,7 @@ final class MonochromeBadgeTests: XCTestCase {
         renderer.scale = 3
         let bitmap = NSBitmapImageRep(cgImage: try XCTUnwrap(renderer.cgImage))
         let canvas = CGRect(x: 0, y: 0, width: MBMetrics.edgeRailWidth, height: MBMetrics.edgeRailHeight)
-        let origin = CGPoint(x: canvas.maxX - EdgeLayout.logoInset - MBMetrics.edgeTargetSize / 2,
+        let origin = CGPoint(x: canvas.maxX - EdgeLayout.logoInset - MBMetrics.edgeBrandWidth / 2,
                              y: canvas.midY - EdgeLayout.railLogoOffset - MBMetrics.edgeBrandHeight / 2)
         for progress: CGFloat in [0, 0.25, 0.5, 0.75, 1] {
             let silhouette = AnchoredOrganicEdgeShape(expansion: progress).path(in: canvas)

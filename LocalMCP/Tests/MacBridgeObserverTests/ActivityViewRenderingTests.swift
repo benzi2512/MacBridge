@@ -7,7 +7,7 @@ import XCTest
 // no screen capture permission. Optional PNGs go only to the explicit test path.
 final class ActivityViewRenderingTests: XCTestCase {
     @MainActor
-    func testAllAndRunningRenderWithoutStartingAnOwner() throws {
+    func testAllActiveAndUngroupedRenderWithoutStartingAnOwner() throws {
         _ = NSApplication.shared
         let source = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
@@ -45,7 +45,7 @@ final class ActivityViewRenderingTests: XCTestCase {
         ])
         model.selection = "work:fixture-work"
         defer { model.stopPolling() }
-        for filter in [ActivityPresentation.Filter.all, .running] {
+        for filter in [ActivityPresentation.Filter.all, .running, .ungrouped] {
           for scheme in [ColorScheme.light, .dark] {
           for (width, details, sidebar) in [(680, false, false), (680, true, false), (1320, true, true)] {
             let view = ObserverView(model: model, initialFilter: filter, showsDetails: details,
@@ -71,7 +71,11 @@ final class ActivityViewRenderingTests: XCTestCase {
             XCTAssertEqual(model.directory, "")
             XCTAssertEqual(model.activityFeed.runningCount, 1)
             XCTAssertEqual(model.activityFeed.matchingGroups(filter: .running).count, 1)
-            XCTAssertEqual(model.activityFeed.matchingContexts(filter: filter).count, 2)
+            XCTAssertEqual(model.activityFeed.matchingContexts(filter: filter).count, filter == .ungrouped ? 0 : 2)
+            if filter == .ungrouped {
+                XCTAssertEqual(model.activityFeed.displayCount(filter: filter), 1)
+                XCTAssertTrue(model.activityFeed.matchingGroups(filter: filter).isEmpty)
+            }
             XCTAssertNil(model.selectedJob)
             if let directory = ProcessInfo.processInfo.environment["MB_OBSERVER_RENDER_DIR"] {
                 let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))

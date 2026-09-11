@@ -38,7 +38,20 @@ final class CodeNotchMotionTests: XCTestCase {
             XCTAssertLessThanOrEqual(path.boundingRect.maxX, canvas.maxX + 0.001)
             XCTAssertLessThanOrEqual(path.boundingRect.maxY, canvas.maxY)
             let hit = FloatingHitRegion(logoY: logo.y, expansion: t, panelSize: .zero).path(in: canvas)
-            XCTAssertEqual(hit.boundingRect, path.boundingRect, "Pointer region must follow the same spring")
+            var expected = path.boundingRect.union(CGRect(x: logo.x - 16, y: logo.y - 19,
+                                                          width: 32, height: 38).intersection(canvas))
+            if t > 0 {
+                for slot in 1...4 {
+                    expected = expected.union(CGRect(x: logo.x - 16, y: logo.y + CGFloat(slot) * 35 - 16,
+                                                     width: 32, height: 32).intersection(canvas))
+                }
+            }
+            for (actual, expected) in zip([hit.boundingRect.minX, hit.boundingRect.minY, hit.boundingRect.maxX, hit.boundingRect.maxY],
+                                         [expected.minX, expected.minY, expected.maxX, expected.maxY]) {
+                XCTAssertEqual(actual, expected, accuracy: 0.0001, "Spring silhouette plus fixed button boxes, never the full transparent canvas")
+            }
+            XCTAssertTrue(EdgeLayout.isContained(hit.boundingRect, in: canvas, tolerance: 0.001),
+                          "Allow only CoreGraphics subpixel rounding at the screen edge")
         }
         let overshoot = AnchoredOrganicEdgeShape(expansion: 1.02).path(in: rail).boundingRect
         XCTAssertGreaterThan(overshoot.height, MBMetrics.edgeRailHeight, "Do not clip the spring into an eased hard stop")

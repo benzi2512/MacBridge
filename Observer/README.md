@@ -1,7 +1,7 @@
 # MacBridge menu-bar and activity UI
 
 This native AppKit/SwiftUI companion observes one opt-in headless MCP owner. It
-provides a variable-width menu-bar item, a right-edge compact task tab and the
+provides a variable-width menu-bar item, a right/bottom-edge compact task tab and the
 full Activity/Details dashboard. It does not start MCP, a tunnel, an AI model,
 XPC, a daemon or a terminal window. Closing its windows does not stop the owner.
 Building it does not change the installed normal-Chat runtime.
@@ -21,8 +21,35 @@ hashes; packaging does not download or regenerate artwork.
 
 ## Compact surfaces
 
+The Dashboard's Activity filter has All, Active, Issues and **Ungrouped** tabs.
+Ungrouped shows only retained actions/processes outside both declared tasks and
+display-only context groups, including receipts whose declared parent was
+evicted. Its count follows the selected workspace and search. Saved file changes
+are not mixed into this tab. Existing selected-row reading order stays held while
+new activity arrives; this adds no grouping inference, owner call or permission.
+On narrow panes the filter label yields space to the four options.
+
+- Drag the logo directly to reposition the widget. Moving along the right edge
+  changes its height; moving toward the bottom docks a horizontal rail above the
+  macOS Dock. Icons and text remain upright and cards open upward. A short click
+  still opens Dashboard. A 6pt drag threshold is latched until release, so a drag
+  that returns to its starting point cannot accidentally open Dashboard.
+  Hover/preview transitions pause during dragging; Esc cancels an unsaved drag.
+  Only the drop writes a bounded per-display anchor. Display replacement falls
+  back to the last saved edge/relative position. Settings retains edge and
+  position controls for keyboard/accessibility users. No global mouse monitor,
+  input permission or additional timer is required.
+  Bottom idle is 58×30pt; its expanded painted rail is 196×36pt. The compact
+  horizontal logo/count stays within the first target, clear of Refresh.
+- Rail actions use full 32pt rectangular hit targets while symbols remain 15pt
+  and the painted rail stays 36pt wide. The logo and Refresh targets meet without
+  overlap; other actions retain a 3pt gap. Transparent window corners stay out of
+  the hover region. The nonactivating floating host and logo accept the first
+  mouse click without requiring a focus-only click. Panel close/back/pin buttons
+  and recent-task rows also include the blank space inside their bounds.
 - Launch initializes the menu-bar item and right-edge tab without opening or
-  focusing the dashboard. `--dashboard` is the explicit developer/test opt-in.
+  focusing the dashboard, or restores a saved bottom anchor. `--dashboard` is the
+  explicit developer/test opt-in.
 - The idle edge tab is a static 30×58 organic handle on the main display at a
   saved per-display vertical position. Its transparent 22pt monochrome mark
   has a running-count badge underneath, visible without hovering: `0`–`99`,

@@ -7,9 +7,10 @@ enum MBMetrics {
     static let edgeRailWidth: CGFloat = 36
     static let edgeRailHeight: CGFloat = 196
     static let edgeLogoSize: CGFloat = 22
+    static let edgeBrandWidth: CGFloat = 28
     static let edgeBrandHeight: CGFloat = 38
-    static let edgeTargetSize: CGFloat = 28
-    static let edgeRailSpacing: CGFloat = 7
+    static let edgeTargetSize: CGFloat = 32
+    static let edgeRailSpacing: CGFloat = 3
     static let panelGap: CGFloat = 0
     static let panelWidth: CGFloat = 320
     static let taskDetailWidth: CGFloat = 360
@@ -363,6 +364,8 @@ struct FloatingHitRegion: Shape {
     let logoY: CGFloat
     var expansion: CGFloat
     let panelSize: CGSize
+    var dockEdge: FloatingDockEdge = .right
+    var logoX: CGFloat = 0
 
     var animatableData: CGFloat {
         get { expansion }
@@ -370,6 +373,27 @@ struct FloatingHitRegion: Shape {
     }
 
     func path(in rect: CGRect) -> Path {
+        if dockEdge == .bottom {
+            // Build the complete region before transposing. Transposing only
+            // the silhouette reverses its winding, so appended rectangles can
+            // subtract clickable holes instead of extending the hit region.
+            return FloatingHitRegion(logoY: logoX, expansion: expansion,
+                panelSize: CGSize(width: panelSize.height, height: panelSize.width))
+                .path(in: CGRect(x: rect.minY, y: rect.minX, width: rect.height, height: rect.width))
+                .applying(CGAffineTransform(a: 0, b: 1, c: 1, d: 0, tx: 0, ty: 0))
+        }
+        let logo = CGPoint(x: rect.maxX - EdgeLayout.logoInset, y: logoY)
+        func includeControls(in path: inout Path) {
+            let brandSize = CGSize(width: MBMetrics.edgeTargetSize, height: MBMetrics.edgeBrandHeight)
+            path.addRect(CGRect(x: logo.x - brandSize.width / 2, y: logo.y - brandSize.height / 2,
+                                width: brandSize.width, height: brandSize.height).intersection(rect))
+            if expansion > 0 {
+                for index in 0..<4 {
+                    let center = FloatingDockLayout.actionCenter(index: index, logo: logo, edge: .right)
+                    path.addRect(CGRect(x: center.x - 16, y: center.y - 16, width: 32, height: 32).intersection(rect))
+                }
+            }
+        }
         let rail = CGRect(x: rect.maxX - MBMetrics.edgeRailWidth,
                           y: rect.minY + logoY + EdgeLayout.railLogoOffset - MBMetrics.edgeRailHeight / 2,
                           width: MBMetrics.edgeRailWidth, height: MBMetrics.edgeRailHeight)
@@ -380,6 +404,7 @@ struct FloatingHitRegion: Shape {
                                width: panelSize.width, height: panelSize.height)
             path.addRoundedRect(in: panel, cornerSize: CGSize(width: MBMetrics.panelRadius, height: MBMetrics.panelRadius))
         }
+        includeControls(in: &path)
         return path
     }
 }
@@ -408,6 +433,8 @@ final class ObserverPreferences: ObservableObject {
         static let hoverPreviews = "ui.hoverPreviews"
         static let pinOnClick = "ui.pinOnClick"
         static let verticalAnchors = "ui.floatingTabNormalizedYByDisplay"
+        static let dockAnchors = "ui.floatingTabDockAnchors"
+        static let preferredDisplay = "ui.floatingTabDisplay"
     }
 
     private let defaults: UserDefaults
@@ -435,6 +462,8 @@ final class ObserverPreferences: ObservableObject {
         set { appearance = newValue ? .system : .dark }
     }
     @Published private(set) var verticalAnchors: [String: Double]
+    @Published private(set) var dockAnchors: [String: FloatingDockAnchor]
+    private(set) var preferredDisplayID: String?
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -462,10 +491,38 @@ final class ObserverPreferences: ObservableObject {
         hoverPreviews = value(Key.hoverPreviews, default: true)
         pinOnClick = value(Key.pinOnClick, default: true)
         verticalAnchors = defaults.dictionary(forKey: Key.verticalAnchors) as? [String: Double] ?? [:]
+        let decoded = defaults.data(forKey: Key.dockAnchors)
+            .flatMap { try? JSONDecoder().decode([String: FloatingDockAnchor].self, from: $0) } ?? [:]
+        dockAnchors = Dictionary(uniqueKeysWithValues: decoded.keys.sorted().prefix(16).map { ($0, decoded[$0]!.sanitized) })
+        preferredDisplayID = defaults.string(forKey: Key.preferredDisplay)
     }
 
     func normalizedY(for displayID: String) -> CGFloat {
-        CGFloat(min(0.86, max(0.14, verticalAnchors[displayID] ?? 0.40)))
+        if let anchor = dockAnchors[displayID], anchor.edge == .right { return CGFloat(anchor.sanitized.position) }
+        return CGFloat(min(0.86, max(0.14, verticalAnchors[displayID] ?? 0.40)))
+    }
+
+    func dockAnchor(for displayID: String) -> FloatingDockAnchor {
+        if let anchor = dockAnchors[displayID] { return anchor.sanitized }
+        if verticalAnchors[displayID] != nil { return .init(edge: .right, position: Double(normalizedY(for: displayID))) }
+        // If a display disappears or receives a new macOS number, keep the last
+        // edge/relative position on the available display instead of losing it.
+        if let previous = preferredDisplayID, let anchor = dockAnchors[previous] { return anchor.sanitized }
+        return .init(edge: .right, position: Double(normalizedY(for: displayID)))
+    }
+
+    func setDockAnchor(_ anchor: FloatingDockAnchor, for displayID: String) {
+        var updated = dockAnchors
+        updated[displayID] = anchor.sanitized
+        for key in updated.keys.sorted().filter({ $0 != displayID }).prefix(max(0, updated.count - 16)) {
+            updated.removeValue(forKey: key)
+        }
+        preferredDisplayID = displayID
+        defaults.set(displayID, forKey: Key.preferredDisplay)
+        if updated != dockAnchors {
+            dockAnchors = updated
+            defaults.set(try? JSONEncoder().encode(updated), forKey: Key.dockAnchors)
+        }
     }
 
     static let glassOpacityRange: ClosedRange<Double> = 0.35...1.0
@@ -477,6 +534,9 @@ final class ObserverPreferences: ObservableObject {
     }
 
     func setNormalizedY(_ value: CGFloat, for displayID: String) {
+        if dockAnchors.removeValue(forKey: displayID) != nil {
+            defaults.set(try? JSONEncoder().encode(dockAnchors), forKey: Key.dockAnchors)
+        }
         verticalAnchors[displayID] = Double(min(0.86, max(0.14, value)))
         if verticalAnchors.count > 16 {
             for key in verticalAnchors.keys.sorted().prefix(verticalAnchors.count - 16) {

@@ -223,7 +223,20 @@ final class DesignSpecificationTests: XCTestCase {
                 .path(in: CGRect(x: canvas.maxX - MBMetrics.edgeRailWidth,
                                  y: canvas.midY - MBMetrics.edgeRailHeight / 2,
                                  width: MBMetrics.edgeRailWidth, height: MBMetrics.edgeRailHeight))
-            XCTAssertEqual(region.boundingRect, painted.boundingRect, "Hit geometry follows the visible morph at \(progress)")
+            var boxes = [CGRect(x: logoX - 16, y: logoY - 19, width: 32, height: 38).intersection(canvas)]
+            if progress > 0 {
+                boxes += (1...4).map { CGRect(x: logoX - 16, y: logoY + CGFloat($0) * 35 - 16,
+                                             width: 32, height: 32).intersection(canvas) }
+            }
+            // Buttons intentionally include blank space outside the painted
+            // curve; no other invisible area should keep the widget open.
+            for x in stride(from: CGFloat(0.5), to: canvas.maxX, by: 3) {
+                for y in stride(from: CGFloat(0.5), to: canvas.maxY, by: 3) {
+                    let point = CGPoint(x: x, y: y)
+                    XCTAssertEqual(region.contains(point), painted.contains(point) || boxes.contains { $0.contains(point) },
+                                   "Only the silhouette and real button boxes are active at \(progress): \(point)")
+                }
+            }
         }
     }
 

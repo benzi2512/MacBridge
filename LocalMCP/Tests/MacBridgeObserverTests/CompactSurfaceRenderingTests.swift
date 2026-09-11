@@ -53,7 +53,7 @@ final class CompactSurfaceRenderingTests: XCTestCase {
             openDashboard: { _ in }, openSettings: {})
         defer { controller.stop() }
 
-        let cases: [(String, FloatingLayer, ColorScheme)] = [
+        let rightCases: [(String, FloatingLayer, ColorScheme)] = [
             ("idle-dark", .idle, .dark),
             ("rail-dark", .rail, .dark),
             ("recent-light", .recentTasks, .light),
@@ -63,9 +63,18 @@ final class CompactSurfaceRenderingTests: XCTestCase {
             ("settings-dark", .settings, .dark),
             ("recent-64-dark", .recentTasks, .dark),
         ]
+        let cases = rightCases.map { ($0.0, $0.1, $0.2, FloatingDockEdge.right) } + [
+            ("bottom-idle-dark", .idle, .dark, .bottom),
+            ("bottom-rail-dark", .rail, .dark, .bottom),
+            ("bottom-recent-light", .recentTasks, .light, .bottom),
+            ("bottom-settings-dark", .settings, .dark, .bottom),
+            ("bottom-detail-dark", .taskDetail("work:work-1"), .dark, .bottom),
+            ("bottom-recent-64-dark", .recentTasks, .dark, .bottom),
+        ]
         let visible = CGRect(x: 0, y: 0, width: 1_512, height: 982)
-        for (name, layer, scheme) in cases {
-            if name == "recent-64-dark" {
+        for (name, layer, scheme, edge) in cases {
+            preferences.setDockAnchor(.init(edge: edge, position: 0.5), for: controller.displayID)
+            if name.contains("recent-64-dark") {
                 let manyTasks = (0..<64).map { index -> [String: Any] in
                     var item = workItems[0]
                     item["work_id"] = "scroll-\(index)"
@@ -85,8 +94,8 @@ final class CompactSurfaceRenderingTests: XCTestCase {
             // finish retaining any wider outgoing canvas before constructing it.
             try await Task.sleep(nanoseconds: UInt64((MBMetrics.panelDuration + 0.05) * 1_000_000_000))
             XCTAssertEqual(controller.windowLayer, layer)
-            let size = EdgeLayout.size(for: layer, visibleFrame: visible,
-                                       taskCount: model.compactSummary.tasks.count)
+            let size = FloatingDockLayout.size(for: layer, visibleFrame: visible,
+                                       taskCount: model.compactSummary.tasks.count, edge: edge)
             let view = FloatingTabView(controller: controller)
                 .environment(\.mbBrandImage, brand)
                 .environment(\.colorScheme, scheme)
@@ -114,9 +123,9 @@ final class CompactSurfaceRenderingTests: XCTestCase {
             host.cacheDisplay(in: host.bounds, to: bitmap)
             XCTAssertGreaterThanOrEqual(bitmap.pixelsWide, Int(size.width))
             XCTAssertGreaterThanOrEqual(bitmap.pixelsHigh, Int(size.height))
-            if name == "recent-64-dark" {
+            if name.contains("recent-64-dark") {
                 XCTAssertEqual(controller.readingOrder.ids.count, 64)
-                XCTAssertEqual(size.height, EdgeLayout.recentTasksHeight(taskCount: 6),
+                XCTAssertEqual(size.height, FloatingDockLayout.size(for: .recentTasks, visibleFrame: visible, taskCount: 6, edge: edge).height,
                                "The scrollable list must not create a 64-row-tall window")
             }
             let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
@@ -134,6 +143,7 @@ final class CompactSurfaceRenderingTests: XCTestCase {
             }
         }
 
+        preferences.setDockAnchor(.init(edge: .right, position: 0.5), for: controller.displayID)
         model.updateSnapshot([
             "snapshot_stale": false,
             "workspaces": [["workspace_id": "app", "display_name": "MacBridge"]],
