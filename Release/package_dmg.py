@@ -27,6 +27,7 @@ APP_FILES = {
     "Contents/MacOS/macbridge-mcp", "Contents/MacOS/macbridge-observer",
     "Contents/Info.plist", "Contents/Resources/MacBridge.png",
     "Contents/Resources/MacBridge.icns", "Contents/_CodeSignature/CodeResources",
+    "Contents/Resources/ThirdPartyNotices.txt",
 }
 
 
@@ -141,6 +142,7 @@ def build_payload(binary_directory, output, core_hash, ui_hash, markers):
         key = "Contents/Resources/" + ("MacBridge.png" if name.endswith(".png") else name)
         inputs[key] = pinned_input(SOURCE / "Assets/Brand" / name, digest)
     inputs["Contents/Info.plist"] = regular_read(SOURCE / "Observer/Info.plist")
+    inputs["Contents/Resources/ThirdPartyNotices.txt"] = regular_read(SOURCE / "Observer/CODENOTCH-LICENSE.txt")
     plist = plistlib.loads(inputs["Contents/Info.plist"])
     if (plist.get("CFBundleIdentifier"), plist.get("CFBundleExecutable"), plist.get("CFBundleShortVersionString")) != (
             "local.macbridge.observer", "macbridge-observer", "0.3.0"):

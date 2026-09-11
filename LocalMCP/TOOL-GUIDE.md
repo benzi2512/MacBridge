@@ -1,4 +1,8 @@
-# Working with MacBridge's 67-tool source catalog
+# Working with MacBridge's 70-tool candidate source catalog
+
+The opt-in Finder/document, scoped-network and application-Accessibility tools
+are described in [Desktop access](DESKTOP-ACCESS.md). They are off for existing
+configurations. A source candidate is not an installed or host-enabled feature.
 
 The twelve Brevo tools, typed actions, safety gates and reviewed public API
 limitations are documented in [Brevo capabilities](BREVO-CAPABILITIES.md).
@@ -27,14 +31,14 @@ For an unfamiliar choice, `tool_catalog` supports:
   5 suggestions by default. Suggestions are not proof that a tool fits every
   constraint; verify its exact schema before use.
 - `category`: `workspace`, `files`, `search`, `edit`, `process`, `git`, or `undo`.
-- `limit`: 1–55; filters intersect, and `matched_count`/`truncated` expose omissions.
+- `limit`: 1–70; filters intersect, and `matched_count`/`truncated` expose omissions.
 - `names`: exact schemas for selected names, preserving the previous shortcut.
 - `detail: "schemas"`: explicitly requests full schemas; without filters this
-  still returns all 55, including the compatibility alias.
+  still returns all 70, including the compatibility alias.
 
 An empty call returns a **13-tool starter index**, not all schemas or all tools.
 Its `truncated: true` and category counts explicitly show there is more.
-Use `limit: 55` for the 54-entry canonical index, or search the whole catalog
+Use `limit: 70` for the 69-entry canonical index, or search the whole catalog
 with query/category. Specialist tools are not removed or hidden from `tools/list`.
 Index descriptions can be truncated and are labelled accordingly.
 `workspace_list` stays callable for existing clients but is deprecated; prefer
@@ -118,6 +122,9 @@ configured workspace. This mechanism does not collect model reasoning.
 | Path operations | `directory_create`, `path_copy`, `path_move`, `path_remove` |
 | Short commands | `command_list`, `command_run` |
 | Long/interacting jobs | `command_start`, `process_status`, `process_wait`, `process_status_many`, `process_input`, `process_output`, `process_output_tail`, `process_output_many`, `process_list`, `process_cancel` |
+| Pop up a folder/document or fixed app (opt-in) | `desktop_open` |
+| Project shell with an existing expiring network grant (opt-in) | `network_command` |
+| Selected app UI when APIs are insufficient (opt-in, Accessibility) | `computer_control` |
 | Typed read-only Git | `git_status`, `git_diff`, `git_log`, `git_show`, `git_branches`, `git_worktrees`, `git_blame`, `git_file_list` |
 
 The two developer surfaces are the short path when a normal Chat needs a familiar

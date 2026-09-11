@@ -40,7 +40,7 @@ final class CompactLiveHoverTests: XCTestCase {
         let settings = CGPoint(x: logo.x, y: logo.y + 3 * railStep)
         for _ in 0..<3 {
             move(outside)
-            try await Task.sleep(nanoseconds: 300_000_000)
+            try await Task.sleep(nanoseconds: UInt64((MBMetrics.hoverExitGrace + MBMetrics.closeDuration + 0.12) * 1_000_000_000))
             XCTAssertEqual(controller.layer, .idle)
             move(logo)
             try await Task.sleep(nanoseconds: 400_000_000)
@@ -62,7 +62,7 @@ final class CompactLiveHoverTests: XCTestCase {
             controller.closeDeepest()
         }
         move(outside)
-        try await Task.sleep(nanoseconds: 350_000_000)
+        try await Task.sleep(nanoseconds: UInt64((MBMetrics.hoverExitGrace + MBMetrics.closeDuration + 0.12) * 1_000_000_000))
         XCTAssertEqual(controller.layer, .idle)
         XCTAssertEqual(controller.pendingTransitionCount, 0)
         XCTAssertEqual(controller.model.directory, "")

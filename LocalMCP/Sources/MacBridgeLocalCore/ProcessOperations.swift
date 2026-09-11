@@ -37,6 +37,7 @@ private struct AllowedExecutable {
 
 private struct ProcessSnapshot {
     let taskID: String
+    let networkGrant: LocalNetworkGrant?
     let running: Bool
     let exitCode: Int32?
     let terminationReason: String?
@@ -117,9 +118,13 @@ private func prepareRuntimeForRemoval(_ url: URL) {
 
 private final class RunningCommand: @unchecked Sendable {
     let taskID: String
+    // Sanitized display-only context. Never retain raw argv or script text here.
+    let activityContext: String?
     let process: Process
     let runtimeURL: URL
     let maximumOutputBytes: Int
+    let networkProxy: NetworkCommandProxy?
+    let networkGrant: LocalNetworkGrant?
     let startedMilliseconds = Int64(Date().timeIntervalSince1970 * 1_000)
 
     private let lock = NSCondition()
@@ -148,14 +153,20 @@ private final class RunningCommand: @unchecked Sendable {
 
     init(
         taskID: String,
+        activityContext: String?,
         process: Process,
         runtimeURL: URL,
-        maximumOutputBytes: Int
+        maximumOutputBytes: Int,
+        networkProxy: NetworkCommandProxy? = nil,
+        networkGrant: LocalNetworkGrant? = nil
     ) {
         self.taskID = taskID
+        self.activityContext = activityContext
         self.process = process
         self.runtimeURL = runtimeURL
         self.maximumOutputBytes = maximumOutputBytes
+        self.networkProxy = networkProxy
+        self.networkGrant = networkGrant
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
@@ -192,6 +203,7 @@ private final class RunningCommand: @unchecked Sendable {
         }
         process.terminationHandler = { [weak self] process in
             guard let self else { return }
+            self.networkProxy?.stop()
             let processGroup = process.processIdentifier
             if processGroup > 0 {
                 _ = kill(-processGroup, SIGKILL)
@@ -246,6 +258,7 @@ private final class RunningCommand: @unchecked Sendable {
     }
 
     func cancel() -> ProcessSnapshot {
+        networkProxy?.stop()
         lock.lock()
         guard running else {
             let completed = snapshotWhileLocked()
@@ -261,6 +274,15 @@ private final class RunningCommand: @unchecked Sendable {
             forceKillProcessGroup()
         }
         return wait(timeoutMilliseconds: 1_000)
+    }
+
+    func expireNetworkGrant() {
+        networkProxy?.stop()
+        lock.lock()
+        if running, !childExited { cancelled = true }
+        lock.unlock()
+        // No graceful one-second network window after an authorization expires.
+        forceKillProcessGroup()
     }
 
     func waitForCompletion(timeoutMilliseconds: Int) -> Bool {
@@ -330,6 +352,7 @@ private final class RunningCommand: @unchecked Sendable {
     private func snapshotWhileLocked() -> ProcessSnapshot {
         return ProcessSnapshot(
             taskID: taskID,
+            networkGrant: networkGrant,
             running: running,
             exitCode: exitCode,
             terminationReason: terminationReason,
@@ -449,7 +472,7 @@ public final class LocalProcessService: @unchecked Sendable {
     // A synchronous response still owns its output even if another request
     // reads or cancels the job while that response is being prepared.
     private var synchronousResponsePins: Set<String> = []
-    private var completedStatuses: [String: (expires: TimeInterval, metadata: JSONObject)] = [:]
+    private var completedStatuses: [String: (expires: TimeInterval, metadata: JSONObject, activityContext: String?)] = [:]
     private var completedOrder: [String] = []
     private let completedStatusLimit: Int
     private let completedStatusTTL: TimeInterval
@@ -569,6 +592,16 @@ public final class LocalProcessService: @unchecked Sendable {
         return snapshotJSON(command.snapshot(), includeOutput: false)
     }
 
+    func startNetworkCommand(workspaceID: String, grantID: String, executableID: String,
+                             arguments: [String], maximumOutputBytes: Int) throws -> JSONObject {
+        let workspace = try workspaceService.registry.workspace(id: workspaceID)
+        let grant = try LocalNetworkGrant.resolve(id: grantID, workspace: workspace, service: workspaceService)
+        let command = try startCommandInternal(workspaceID: workspaceID,
+            executableID: executableID, arguments: arguments, cwd: grant.cwd,
+            maximumOutputBytes: maximumOutputBytes, networkGrant: grant)
+        return snapshotJSON(command.snapshot(), includeOutput: false)
+    }
+
     public func processStatus(taskID rawID: String) throws -> JSONObject {
         guard let uuid = UUID(uuidString: rawID) else {
             throw LocalMCPError.invalidRequest("task_id must be a UUID")
@@ -599,6 +632,17 @@ public final class LocalProcessService: @unchecked Sendable {
         result["observation_timed_out"] = result["running"] as? Bool == true
         result["output_consumed"] = false
         return result
+    }
+
+    // Shares the job's existing 32-live / 128-completed, five-minute lifecycle.
+    // Lookup neither consumes output nor creates a new background cache/timer.
+    func activityContext(taskID: String) -> String? {
+        guard let uuid = UUID(uuidString: taskID) else { return nil }
+        let id = uuid.uuidString.lowercased()
+        lock.lock()
+        defer { lock.unlock() }
+        pruneCompletedStatusesWhileLocked()
+        return processes[id]?.activityContext ?? completedStatuses[id]?.activityContext
     }
 
     public func outputTail(taskID: String, maximumBytes: Int) throws -> JSONObject {
@@ -740,8 +784,13 @@ public final class LocalProcessService: @unchecked Sendable {
         cwd: String,
         maximumOutputBytes: Int,
         pinSynchronousResponse: Bool = false,
-        readOnlyGit: Bool = false
+        readOnlyGit: Bool = false,
+        networkGrant: LocalNetworkGrant? = nil
     ) throws -> RunningCommand {
+        guard !readOnlyGit || networkGrant == nil else {
+            throw LocalMCPError.invalidRequest("read-only Git cannot use a network grant")
+        }
+        let grantDeadline = try networkGrant.map { DispatchTime.now() + (try $0.remainingSeconds()) }
         guard arguments.count <= 128,
             arguments.allSatisfy({ $0.utf8.count <= 16_384 && !$0.contains("\0") })
         else { throw LocalMCPError.invalidRequest("command arguments exceed bounds") }
@@ -822,11 +871,15 @@ public final class LocalProcessService: @unchecked Sendable {
             attributes: [.posixPermissions: 0o700]
         )
         let profileURL = runtime.appendingPathComponent("command.sb")
+        let networkProxy = try networkGrant.map { try NetworkCommandProxy(grant: $0) }
+        var proxyTransferred = false
+        defer { if !proxyTransferred { networkProxy?.stop() } }
         let profile = try sandboxProfile(
             workspace: commandScope,
             runtime: runtime,
             executable: executable.invocationPath,
-            readOnlyGit: readOnlyGit
+            readOnlyGit: readOnlyGit,
+            networkProxyPort: networkProxy?.port
         )
         try writeNewRuntimeProfile(Data(profile.utf8), to: profileURL)
 
@@ -866,6 +919,7 @@ public final class LocalProcessService: @unchecked Sendable {
             "GIT_TERMINAL_PROMPT": "0",
         ]
         if readOnlyGit { environment["GIT_NO_LAZY_FETCH"] = "1" }
+        if let networkProxy { environment.merge(networkProxy.environment) { _, grant in grant } }
         if executableID == "swift" {
             environment.merge(
                 [
@@ -885,10 +939,18 @@ public final class LocalProcessService: @unchecked Sendable {
         process.environment = environment
         let running = RunningCommand(
             taskID: taskID,
+            activityContext: ActivityDetail.context(ActivityDetail.metadata(name: "command_start", arguments: [
+                "executable": executableID, "arguments": arguments, "cwd": cwd,
+            ])),
             process: process,
             runtimeURL: runtime,
-            maximumOutputBytes: maximumOutputBytes
+            maximumOutputBytes: maximumOutputBytes,
+            networkProxy: networkProxy,
+            networkGrant: networkGrant
         )
+        if let grantDeadline, DispatchTime.now() >= grantDeadline {
+            throw LocalMCPError.operationFailed("network grant expired before process launch")
+        }
         do {
             try running.start()
         } catch {
@@ -901,6 +963,14 @@ public final class LocalProcessService: @unchecked Sendable {
         lock.unlock()
         slotReserved = false
         runtimeOwned = false
+        proxyTransferred = true
+        if let grantDeadline {
+            // One deadline per opted-in job; no polling, persistence or timer
+            // when ordinary loopback-only commands are used.
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: grantDeadline) { [weak running] in
+                if let running, running.snapshot().running { running.expireNetworkGrant() }
+            }
+        }
         return running
     }
 
@@ -955,8 +1025,9 @@ public final class LocalProcessService: @unchecked Sendable {
                 var metadata = snapshotJSON(snapshot, includeOutput: false)
                 metadata["session_retained"] = false
                 metadata["status_only"] = true
-                // Retain no output, arguments, stdin, file paths, pipes or process objects.
-                completedStatuses[command.taskID] = (monotonicNow() + completedStatusTTL, metadata)
+                // Retain no output, raw arguments, stdin, pipes or process objects.
+                // Only the already-bounded, sanitized command/folder display label survives.
+                completedStatuses[command.taskID] = (monotonicNow() + completedStatusTTL, metadata, command.activityContext)
                 completedOrder.append(command.taskID)
                 while completedOrder.count > completedStatusLimit {
                     completedStatuses.removeValue(forKey: completedOrder.removeFirst())
@@ -1087,7 +1158,8 @@ public final class LocalProcessService: @unchecked Sendable {
         workspace: URL,
         runtime: URL,
         executable: String,
-        readOnlyGit: Bool = false
+        readOnlyGit: Bool = false,
+        networkProxyPort: UInt16? = nil
     ) throws -> String {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let values = [workspace.path, runtime.path, executable, home.path]
@@ -1169,7 +1241,7 @@ public final class LocalProcessService: @unchecked Sendable {
                 (subpath "/bin"))
             (deny process-exec
                 (literal "/bin/launchctl")
-                (literal "/usr/bin/curl")
+                \(networkProxyPort == nil ? "(literal \"/usr/bin/curl\")" : "")
                 (literal "/usr/bin/nc")
                 (literal "/usr/bin/open")
                 (literal "/usr/bin/osascript")
@@ -1179,7 +1251,7 @@ public final class LocalProcessService: @unchecked Sendable {
                 (literal "/usr/bin/sudo"))
             """
         let workspaceWrites = readOnlyGit ? "" : "(allow file-write* (subpath \(stage)))"
-        let networkRules = readOnlyGit ? "(deny network*)" : """
+        let networkRules = readOnlyGit ? "(deny network*)" : networkProxyPort.map { LocalNetworkGrant.sandboxRule(proxyPort: $0) } ?? """
             (allow network-inbound (local ip "localhost:*"))
             (allow network-outbound (remote ip "localhost:*"))
             """
@@ -1252,12 +1324,18 @@ public final class LocalProcessService: @unchecked Sendable {
             "stdout_dropped_bytes": snapshot.stdoutBaseOffset,
             "stderr_dropped_bytes": snapshot.stderrBaseOffset,
             "terminal_window_opened": false,
-            "network": "loopback_only",
+            "network": snapshot.networkGrant == nil ? "loopback_only" : "pinned_destination_via_job_local_proxy",
             "backend_called": true,
             "process_started": true,
             "execution_backend": "direct_process",
             "xpc_dispatched": false,
         ]
+        if let grant = snapshot.networkGrant {
+            value["network_grant_id"] = grant.id
+            value["network_scope"] = "one_owner_pinned_ipv4_tcp_port_not_hostname_filtering"
+            value["network_expires_at"] = ISO8601DateFormatter().string(from: grant.expiresAt)
+            value["direct_network"] = "job_proxy_loopback_port_only"
+        }
         if let code = snapshot.exitCode { value["exit_code"] = Int(code) }
         if let reason = snapshot.terminationReason { value["termination_reason"] = reason }
         if let ended = snapshot.endedMilliseconds { value["ended_milliseconds"] = ended }

@@ -51,6 +51,15 @@ class DMGPreparationTests(unittest.TestCase):
             pinned_input(self.binary / "macbridge-mcp", "0" * 64)
         self.assertFalse((self.root / "new.noindex").exists())
 
+    def testThirdPartyLicenseIsIncludedAndManifestBound(self):
+        from package_dmg import SOURCE
+        payload, manifest, _ = self.payload()
+        name = "MacBridge.app/Contents/Resources/ThirdPartyNotices.txt"
+        expected = (SOURCE / "Observer/CODENOTCH-LICENSE.txt").read_bytes()
+        self.assertEqual((payload / name).read_bytes(), expected)
+        self.assertEqual(manifest[name]["sha256"], hashlib.sha256(expected).hexdigest())
+        self.assertIn(b"MIT License", expected)
+
     def testLeafAndAncestorAliasesRejected(self):
         leaf = self.root / "alias"
         leaf.symlink_to(self.binary / "macbridge-mcp")

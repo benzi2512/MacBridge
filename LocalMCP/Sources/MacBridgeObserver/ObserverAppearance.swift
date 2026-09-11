@@ -3,7 +3,12 @@ import SwiftUI
 
 private struct MBReduceTransparencyKey: EnvironmentKey { static let defaultValue = false }
 private struct MBGlassOpacityKey: EnvironmentKey { static let defaultValue = 1.0 }
+private struct MBReduceMotionKey: EnvironmentKey { static let defaultValue = false }
 extension EnvironmentValues {
+    var mbReduceMotion: Bool {
+        get { self[MBReduceMotionKey.self] }
+        set { self[MBReduceMotionKey.self] = newValue }
+    }
     var mbReduceTransparency: Bool {
         get { self[MBReduceTransparencyKey.self] }
         set { self[MBReduceTransparencyKey.self] = newValue }
@@ -14,45 +19,16 @@ extension EnvironmentValues {
     }
 }
 
-/// Explicit source-over color, separate from the system's adaptive glass tint.
-/// Alpha stays below one in both appearances; Reduce Transparency is a distinct
-/// opaque path. Sharing this treatment keeps fallback and native glass coherent.
-struct GlassColorTreatment {
-    let scheme: ColorScheme
-    let elevated: Bool
-    let strength: Double
-
-    init(scheme: ColorScheme, elevated: Bool, strength: Double = 1) {
-        self.scheme = scheme
-        self.elevated = elevated
-        self.strength = min(1, max(0, strength))
-    }
-
-    var topOpacity: Double { (scheme == .dark ? (elevated ? 0.28 : 0.20) : 0.10) * strength }
-    var bottomOpacity: Double { (scheme == .dark ? (elevated ? 0.40 : 0.30) : 0.06) * strength }
-    var topColor: Color { scheme == .dark ? MBPalette.surfaceElevated : .white }
-    var bottomColor: Color { scheme == .dark ? MBPalette.deepNavy : .white }
-    var gradient: LinearGradient {
-        LinearGradient(colors: [topColor.opacity(topOpacity), bottomColor.opacity(bottomOpacity)],
-                       startPoint: .topLeading, endPoint: .bottomTrailing)
-    }
-}
-
 struct ObserverWindowSurface: View {
-    @Environment(\.colorScheme) private var scheme
     @Environment(\.mbReduceTransparency) private var appReduced
     @Environment(\.accessibilityReduceTransparency) private var systemReduced
     var body: some View {
         if appReduced || systemReduced {
-            scheme == .dark ? MBPalette.deepNavy : Color(nsColor: .windowBackgroundColor)
+            Color(nsColor: .windowBackgroundColor)
         } else {
-            ZStack {
-                DesktopBackdrop()
-                LinearGradient(colors: scheme == .dark
-                    ? [MBPalette.surface.opacity(0.48), MBPalette.deepNavy.opacity(0.70)]
-                    : [Color.white.opacity(0.12), MBPalette.brandBlue.opacity(0.04)],
-                    startPoint: .topLeading, endPoint: .bottomTrailing)
-            }
+            // WindowServer provides the desktop-backed material. No fixed
+            // navy wash, tint, or screenshot layer overrides system appearance.
+            DesktopBackdrop()
         }
     }
 }
@@ -72,9 +48,12 @@ private struct DesktopBackdrop: NSViewRepresentable {
 
 struct ObserverReadingSurface: View {
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.mbReduceTransparency) private var appReduced
+    @Environment(\.accessibilityReduceTransparency) private var systemReduced
     var body: some View {
-        RoundedRectangle(cornerRadius: 10).fill(scheme == .dark
-            ? MBPalette.deepNavy.opacity(0.68) : Color(nsColor: .textBackgroundColor).opacity(0.82))
+        RoundedRectangle(cornerRadius: 10, style: .continuous)
+            .fill(Color(nsColor: .textBackgroundColor)
+                .opacity(appReduced || systemReduced ? 1 : scheme == .dark ? 0.25 : 0.50))
     }
 }
 
@@ -85,6 +64,7 @@ struct ObserverAppearanceModifier: ViewModifier {
         content
             .preferredColorScheme(preferences.appearance.colorScheme)
             .environment(\.mbReduceTransparency, systemReduceTransparency || preferences.reduceTransparency)
+            .environment(\.mbReduceMotion, preferences.reduceMacBridgeMotion)
     }
 }
 
@@ -96,10 +76,13 @@ struct CompactActionButtonStyle: ButtonStyle {
         let label: ButtonStyleConfiguration.Label
         let pressed: Bool
         @State private var hovered = false
+        @Environment(\.accessibilityReduceMotion) private var systemReduced
+        @Environment(\.mbReduceMotion) private var appReduced
         var body: some View {
-            label.background(MBPalette.brandBlue.opacity(pressed ? 0.22 : hovered ? 0.10 : 0),
+            label.background(Color.primary.opacity(pressed ? 0.14 : hovered ? 0.07 : 0),
                              in: RoundedRectangle(cornerRadius: 8))
                 .onHover { hovered = $0 }
+                .animation(FloatingMotion.crossfade(reduced: systemReduced || appReduced), value: hovered)
         }
     }
 }
@@ -133,7 +116,7 @@ struct FullObserverSettingsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(spacing: 12) {
-                MacBridgeMark(size: 28)
+                MacBridgeMark(size: 28, style: .monochrome)
                 Text("MacBridge Settings").font(.system(size: 17, weight: .semibold))
             }
             Divider()

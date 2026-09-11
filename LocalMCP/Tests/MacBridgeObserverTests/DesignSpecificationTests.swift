@@ -114,29 +114,30 @@ final class DesignSpecificationTests: XCTestCase {
     }
 
     @MainActor
-    func testGlassWashRetainsMostBackdropInsteadOfPaintingAnOpaquePanel() throws {
-        // This proves only the explicit tint layer, NOT native compositor appearance.
-        // A navy arithmetic composite must not force an opaque cover over real glass.
-        for elevated in [false, true] {
-            let treatment = GlassColorTreatment(scheme: .dark, elevated: elevated)
-            for (color, alpha) in [(treatment.topColor, treatment.topOpacity),
-                                   (treatment.bottomColor, treatment.bottomOpacity)] {
-                XCTAssertGreaterThan(alpha, 0)
-                XCTAssertLessThanOrEqual(alpha, 0.40, "The system glass must remain visually dominant")
-                let rgb = try XCTUnwrap(NSColor(color).usingColorSpace(.sRGB))
-                XCTAssertGreaterThan(rgb.blueComponent, rgb.greenComponent)
-                XCTAssertGreaterThan(rgb.greenComponent, rgb.redComponent)
-                XCTAssertGreaterThanOrEqual(1 - alpha, 0.60, "Most backdrop contribution is retained")
-            }
-            let light = GlassColorTreatment(scheme: .light, elevated: elevated)
-            XCTAssertGreaterThan(light.topOpacity, 0)
-            XCTAssertGreaterThan(light.bottomOpacity, 0)
-            XCTAssertLessThanOrEqual(light.topOpacity, 0.10)
-            XCTAssertLessThanOrEqual(light.bottomOpacity, 0.10)
-
-            let clearer = GlassColorTreatment(scheme: .dark, elevated: elevated, strength: 0.35)
-            XCTAssertEqual(clearer.topOpacity, treatment.topOpacity * 0.35, accuracy: 0.0001)
-            XCTAssertEqual(clearer.bottomOpacity, treatment.bottomOpacity * 0.35, accuracy: 0.0001)
+    func testReducedTransparencyReadingSurfaceIsNeutralAndOpaque() throws {
+        // Only the accessibility fallback is raster-tested here. Native glass
+        // still requires compositor acceptance, not an offscreen bitmap claim.
+        _ = NSApplication.shared
+        for scheme: ColorScheme in [.light, .dark] {
+            let host = NSHostingView(rootView: ObserverReadingSurface()
+                .environment(\.colorScheme, scheme)
+                .environment(\.mbReduceTransparency, true)
+                .frame(width: 120, height: 80))
+            host.frame = CGRect(x: 0, y: 0, width: 120, height: 80)
+            let window = NSWindow(contentRect: host.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+            window.appearance = NSAppearance(named: scheme == .dark ? .darkAqua : .aqua)
+            window.isOpaque = false
+            window.backgroundColor = .clear
+            window.contentView = host
+            defer { window.orderOut(nil) }
+            host.layoutSubtreeIfNeeded()
+            let bitmap = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
+            host.cacheDisplay(in: host.bounds, to: bitmap)
+            let rgb = try XCTUnwrap(bitmap.colorAt(x: bitmap.pixelsWide / 2, y: bitmap.pixelsHigh / 2)?.usingColorSpace(.sRGB))
+            XCTAssertGreaterThan(rgb.alphaComponent, 0.99)
+            XCTAssertEqual(rgb.redComponent, rgb.greenComponent, accuracy: 0.015)
+            XCTAssertEqual(rgb.greenComponent, rgb.blueComponent, accuracy: 0.015)
+            XCTAssertFalse(window.isVisible)
         }
     }
 
@@ -181,7 +182,7 @@ final class DesignSpecificationTests: XCTestCase {
         controller.show(.idle)
         XCTAssertEqual(controller.windowLayer, .rail, "Keep canvas while closing silhouette")
         controller.show(.recentTasks)
-        try await Task.sleep(nanoseconds: 280_000_000)
+        try await Task.sleep(nanoseconds: UInt64((MBMetrics.closeDuration + 0.08) * 1_000_000_000))
         XCTAssertEqual(controller.windowLayer, .recentTasks)
         controller.togglePin()
         XCTAssertFalse(controller.machine.locked)
@@ -190,7 +191,7 @@ final class DesignSpecificationTests: XCTestCase {
         try await Task.sleep(nanoseconds: 150_000_000)
         XCTAssertEqual(controller.layer, .recentTasks)
         controller.show(.idle)
-        try await Task.sleep(nanoseconds: 280_000_000)
+        try await Task.sleep(nanoseconds: UInt64((MBMetrics.closeDuration + 0.08) * 1_000_000_000))
         XCTAssertEqual(controller.windowLayer, .idle)
     }
 
@@ -240,16 +241,16 @@ final class DesignSpecificationTests: XCTestCase {
         XCTAssertEqual(controller.layer, .rail)
         XCTAssertEqual(controller.windowLayer, .recentTasks, "Do not clip the closing panel by shrinking its window immediately")
         controller.show(.settings)
-        try await Task.sleep(nanoseconds: 260_000_000)
+        try await Task.sleep(nanoseconds: UInt64((MBMetrics.panelDuration + 0.08) * 1_000_000_000))
         XCTAssertEqual(controller.windowLayer, .settings, "A stale close must not shrink the reopened panel")
         controller.show(.taskDetail("selected"))
         controller.show(.recentTasks)
         XCTAssertEqual(controller.windowLayer, .taskDetail("selected"), "Keep outgoing panel bounds during a smaller-panel transition")
         controller.show(.settings)
-        try await Task.sleep(nanoseconds: 260_000_000)
+        try await Task.sleep(nanoseconds: UInt64((MBMetrics.panelDuration + 0.08) * 1_000_000_000))
         XCTAssertEqual(controller.windowLayer, .settings, "Latest target owns the eventual canvas after reversal")
         controller.closeDeepest()
-        try await Task.sleep(nanoseconds: 260_000_000)
+        try await Task.sleep(nanoseconds: UInt64((MBMetrics.panelDuration + 0.08) * 1_000_000_000))
         XCTAssertEqual(controller.windowLayer, .rail)
         XCTAssertEqual(controller.pendingTransitionCount, 0)
     }

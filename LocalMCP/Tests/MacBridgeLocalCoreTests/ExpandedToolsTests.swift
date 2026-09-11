@@ -14,7 +14,7 @@ final class ExpandedToolsTests: XCTestCase {
         let f = try Fixture(); defer { f.remove() }
         let s = try server(f), specs = LocalMCPServer.toolSpecs
         let names = specs.compactMap { $0["name"] as? String }
-        XCTAssertEqual(names.count, 67); XCTAssertEqual(Set(names).count, 67)
+        XCTAssertEqual(names.count, 70); XCTAssertEqual(Set(names).count, 70)
         let compact = try s.callTool(name: "tool_catalog", arguments: [:])
         XCTAssertEqual(compact["returned_count"] as? Int, 13)
         XCTAssertEqual(compact["truncated"] as? Bool, true)

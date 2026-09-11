@@ -25,6 +25,8 @@ enum ToolDiscovery {
         "workspace_inspect": "project markers inspect workspace nhan dien project",
         "workspace_reload": "reload workspace configuration nap lai cau hinh",
         "directory_list": "list directory folder contents liet ke thu muc",
+        "desktop_open": "open folder Finder pop show reveal file Preview TextEdit mo thu muc hien len man hinh application",
+        "computer_control": "computer app UI accessibility snapshot press click button type text dieu khien ung dung bam nut",
         "directory_summary": "directory totals count size thong ke thu muc",
         "directory_find": "find filename basename glob tim ten file pattern",
         "file_stat": "one file metadata hash thong tin mot file",
@@ -51,6 +53,7 @@ enum ToolDiscovery {
         "command_list": "available executable commands lenh ho tro",
         "command_run": "short synchronous command lenh ngan dong bo",
         "command_start": "build test chay nen background long job",
+        "network_command": "shell internet approved destination network grant mang duoc duyet",
         "process_status": "job status trang thai job khong doc log",
         "process_status_many": "many job status trang thai nhieu job",
         "process_output": "status output incremental logs doc log va trang thai cursor drain",
@@ -86,7 +89,7 @@ enum ToolDiscovery {
         if name.hasPrefix("brevo_") { return "external" }
         if name.hasPrefix("git_") { return "git" }
         if name.hasPrefix("transaction_") { return "undo" }
-        if name.hasPrefix("process_") || name.hasPrefix("command_") { return "process" }
+        if name.hasPrefix("process_") || name.hasPrefix("command_") || name == "network_command" { return "process" }
         if searchTools.contains(name) { return "search" }
         if editTools.contains(name) { return "edit" }
         if name.hasPrefix("workspace_") || name.hasPrefix("bridge_") || name == "tool_catalog" || name == "work_task" || name == "developer_task" || name == "developer_inspect" { return "workspace" }

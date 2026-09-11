@@ -64,7 +64,7 @@ final class HoverCanvasRegressionTests: XCTestCase {
             XCTAssertEqual(controller.windowLayer, .settings)
             XCTAssertEqual(controller.pendingTransitionCount, 1)
 
-            try await Task.sleep(nanoseconds: 280_000_000)
+            try await Task.sleep(nanoseconds: UInt64((MBMetrics.panelDuration + 0.08) * 1_000_000_000))
             XCTAssertEqual(controller.windowLayer, .recentTasks)
             XCTAssertEqual(controller.pendingTransitionCount, 0)
             XCTAssertFalse(controller.hasCreatedPanel)
@@ -87,7 +87,7 @@ final class HoverCanvasRegressionTests: XCTestCase {
             XCTAssertEqual(controller.windowLayer, .settings)
             XCTAssertEqual(controller.pendingTransitionCount, 0)
 
-            try await Task.sleep(nanoseconds: 280_000_000)
+            try await Task.sleep(nanoseconds: UInt64((MBMetrics.panelDuration + 0.08) * 1_000_000_000))
             XCTAssertEqual(controller.layer, .settings)
             XCTAssertEqual(controller.windowLayer, .settings)
             XCTAssertEqual(controller.pendingTransitionCount, 0)
@@ -141,7 +141,7 @@ final class HoverCanvasRegressionTests: XCTestCase {
         XCTAssertEqual(controller.pendingTransitionCount, 0)
         XCTAssertTrue(controller.readingOrder.ids.isEmpty, "Hidden widget must release its reading snapshot")
 
-        try await Task.sleep(nanoseconds: 280_000_000)
+        try await Task.sleep(nanoseconds: UInt64((MBMetrics.panelDuration + 0.08) * 1_000_000_000))
         XCTAssertEqual(controller.layer, .idle, "An old hover callback must not reopen the hidden widget")
         XCTAssertEqual(controller.pendingTransitionCount, 0)
         XCTAssertFalse(controller.hasCreatedPanel)

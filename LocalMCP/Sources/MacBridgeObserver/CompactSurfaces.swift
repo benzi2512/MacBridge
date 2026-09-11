@@ -6,60 +6,49 @@ struct GlassSurface<S: Shape>: ViewModifier {
     let shape: S
     let elevated: Bool
     let borderOpacity: Double
+    var resting = false
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.mbReduceTransparency) private var appReduceTransparency
     @Environment(\.mbGlassOpacity) private var requestedGlassOpacity
     @Environment(\.colorSchemeContrast) private var contrast
 
-    @Environment(\.colorScheme) private var scheme
-
     private var glassOpacity: Double { min(1, max(0.35, requestedGlassOpacity)) }
-    private var rimScale: Double { contrast == .increased ? 1 : 0.45 + glassOpacity * 0.55 }
 
     @ViewBuilder
     func body(content: Content) -> some View {
         if reduceTransparency || appReduceTransparency {
-            content.background(shape.fill(scheme == .dark ? MBPalette.deepNavy : Color(nsColor: .windowBackgroundColor)))
+            content.background(shape.fill(Color(nsColor: .windowBackgroundColor)))
                 .overlay(shape.stroke(Color.primary.opacity(contrast == .increased ? 0.5 : 0.18), lineWidth: 1))
                 .clipShape(shape)
-        } else if #available(macOS 26.0, *) {
-            // System tint is adaptive, so it cannot own the brand's tonal floor.
-            // Keep native glass underneath a translucent wash and all labels above
-            // both layers. The wash never becomes opaque or dims the foreground.
-            content.background {
-                ZStack {
-                    Color.clear.glassEffect(.regular.tint(scheme == .dark
-                        ? MBPalette.brandBlue.opacity(0.12 * glassOpacity)
-                        : MBPalette.brandBlue.opacity(0.04 * glassOpacity)), in: shape)
-                        .opacity(glassOpacity)
-                    shape.fill(GlassColorTreatment(scheme: scheme, elevated: elevated,
-                                                   strength: glassOpacity).gradient)
-                }.allowsHitTesting(false)
-            }
-                .overlay(shape.stroke(LinearGradient(colors: [
-                    scheme == .dark ? MBPalette.cyanHighlight.opacity(0.50 * rimScale) : Color.white.opacity(0.8 * rimScale),
-                    MBPalette.cyanHighlight.opacity((contrast == .increased ? 0.7 : 0.18) * rimScale),
-                    MBPalette.brandBlue.opacity(0.38 * rimScale)
-                ], startPoint: .topLeading, endPoint: .bottomTrailing), lineWidth: contrast == .increased ? 1.5 : 0.75))
-                .shadow(color: MBPalette.deepNavy.opacity((elevated ? 0.24 : 0.12) * glassOpacity),
-                        radius: elevated ? 14 : 5, y: 4)
         } else {
             content.background {
-                shape.fill(GlassColorTreatment(scheme: scheme, elevated: elevated,
-                                               strength: glassOpacity).gradient)
-                    .background(shape.fill(.ultraThinMaterial).opacity(glassOpacity))
-                    .allowsHitTesting(false)
+                ZStack {
+                    if #available(macOS 26.0, *) {
+                        // Clear/Tinted and light/dark belong to macOS, not to
+                        // a colored overlay. Both layers retain shape identity.
+                        Color.clear.glassEffect(.regular, in: shape)
+                            .opacity(resting ? 0 : glassOpacity)
+                    } else {
+                        shape.fill(.regularMaterial).opacity(resting ? 0 : glassOpacity)
+                    }
+                    // A small idle surface does not need backdrop sampling.
+                    // Keep MB's saved opacity and adaptive monochrome branding.
+                    shape.fill(Color(nsColor: .windowBackgroundColor))
+                        .opacity(resting ? glassOpacity : 0)
+                }.allowsHitTesting(false)
             }
-                .overlay(shape.stroke(MBPalette.cyanHighlight.opacity(min(borderOpacity, 0.16) * rimScale), lineWidth: 0.5))
-                .clipShape(shape)
-                .shadow(color: .black.opacity(0.12 * glassOpacity), radius: elevated ? 14 : 8, y: 3)
+            .overlay(shape.stroke(Color.primary.opacity(contrast == .increased ? 0.42 : min(borderOpacity, 0.08)),
+                                  lineWidth: contrast == .increased ? 1 : 0.5).allowsHitTesting(false))
+            .shadow(color: .black.opacity((elevated ? 0.16 : 0.06) * glassOpacity),
+                    radius: elevated ? 12 : 3, y: elevated ? 3 : 1)
         }
     }
 }
 
 extension View {
-    func glassSurface<S: Shape>(_ shape: S, elevated: Bool = false, borderOpacity: Double = 0.20) -> some View {
-        modifier(GlassSurface(shape: shape, elevated: elevated, borderOpacity: borderOpacity))
+    func glassSurface<S: Shape>(_ shape: S, elevated: Bool = false, borderOpacity: Double = 0.20,
+                               resting: Bool = false) -> some View {
+        modifier(GlassSurface(shape: shape, elevated: elevated, borderOpacity: borderOpacity, resting: resting))
     }
 }
 
@@ -176,7 +165,7 @@ final class FloatingTabController: ObservableObject {
         } else {
             cancelPreview()
             hoverOpenTask?.cancel(); hoverOpenTask = nil
-            guard !machine.locked else { return }
+            guard layer != .idle, !machine.locked else { return }
             hoverCloseTask?.cancel()
             hoverCloseTask = Task { @MainActor [weak self] in
                 try? await Task.sleep(nanoseconds: UInt64(MBMetrics.hoverExitGrace * 1_000_000_000))
@@ -358,7 +347,11 @@ final class FloatingTabController: ObservableObject {
         panel.becomesKeyOnlyIfNeeded = true
         panel.animationBehavior = .none
         panel.escapeAction = { [weak self] in self?.closeDeepest() }
-        panel.contentView = NSHostingView(rootView: FloatingTabView(controller: self))
+        let hosting = NSHostingView(rootView: FloatingTabView(controller: self))
+        // AppKit owns the canvas. Do not let GeometryReader's 10pt ideal size
+        // feed a second, competing resize back into the borderless window.
+        hosting.sizingOptions = []
+        panel.contentView = hosting
         panel.setAccessibilityLabel("MacBridge floating task tab")
         return panel
     }
@@ -418,12 +411,11 @@ struct FloatingTabView: View {
                 logoButton.position(x: geometry.size.width - EdgeLayout.logoInset, y: logoY)
                 ZStack(alignment: .trailing) {
                     if controller.layer.hasPanel {
-                        compactPanel.id(controller.layer)
+                        compactPanel
                             .transition(reducedMotion ? .opacity : .opacity.combined(with: .offset(x: 12)))
                     }
                 }
-                .animation(.timingCurve(0.22, 1, 0.36, 1,
-                    duration: FloatingMotion.panelDuration(reduced: reducedMotion)), value: controller.layer)
+                .animation(FloatingMotion.panel(reduced: reducedMotion), value: controller.layer)
                 .frame(width: canvasPanelSize.width, height: canvasPanelSize.height, alignment: .trailing)
                 .position(x: max(canvasPanelSize.width / 2, geometry.size.width - MBMetrics.edgeRailWidth - canvasPanelSize.width / 2),
                           y: geometry.size.height / 2)
@@ -442,11 +434,11 @@ struct FloatingTabView: View {
         .environment(\.appearsActive, true)
         .environment(\.mbReduceTransparency, systemReduceTransparency || preferences.reduceTransparency)
         .environment(\.mbGlassOpacity, preferences.glassOpacity)
+        .environment(\.mbReduceMotion, preferences.reduceMacBridgeMotion)
         .onAppear { expansion = controller.layer.isExpanded ? 1 : 0 }
         .onChange(of: controller.layer.isExpanded) { expanded in
             let reduced = systemReduceMotion || preferences.reduceMacBridgeMotion
-            withAnimation(reduced ? nil : .timingCurve(0.22, 1, 0.36, 1,
-                duration: FloatingMotion.duration(expanded: expanded, reduced: reduced))) {
+            withAnimation(FloatingMotion.unfold(reduced: reduced)) {
                 expansion = expanded ? 1 : 0
             }
         }
@@ -463,6 +455,9 @@ struct FloatingTabView: View {
             case .idle, .rail: EmptyView()
             }
         }
+        // The card's shell glides; commands and labels must not stretch or
+        // interpolate into another task while its dimensions are changing.
+        .transaction { $0.animation = nil }
         .frame(width: panelSize.width, height: panelSize.height)
         .foregroundStyle(MBPalette.textPrimary)
         .glassSurface(RoundedRectangle(cornerRadius: MBMetrics.panelRadius, style: .continuous),
@@ -484,13 +479,15 @@ struct FloatingTabView: View {
             if reducedMotion {
                 ZStack {
                     handleContent
-                        .glassSurface(AnchoredOrganicEdgeShape(expansion: controller.layer.isExpanded ? 1 : 0), borderOpacity: 0.16)
+                        .glassSurface(AnchoredOrganicEdgeShape(expansion: controller.layer.isExpanded ? 1 : 0),
+                                      borderOpacity: 0.16, resting: !controller.layer.isExpanded)
                         .id(controller.layer.isExpanded)
                         .transition(.opacity)
                 }
                 .animation(.easeOut(duration: MBMetrics.reducedMotionDuration), value: controller.layer.isExpanded)
             } else {
-                handleContent.glassSurface(AnchoredOrganicEdgeShape(expansion: expansion), borderOpacity: 0.16)
+                handleContent.glassSurface(AnchoredOrganicEdgeShape(expansion: expansion), borderOpacity: 0.16,
+                                          resting: !controller.layer.isExpanded)
             }
         }
         .accessibilityIdentifier("floating-edge-handle")
@@ -499,9 +496,7 @@ struct FloatingTabView: View {
     private var handleContent: some View {
         ZStack {
             Color.clear
-            railContent.opacity(controller.layer.isExpanded ? 1 : 0)
-                .animation(.easeOut(duration: systemReduceMotion || preferences.reduceMacBridgeMotion
-                    ? MBMetrics.reducedMotionDuration : MBMetrics.openDuration), value: controller.layer.isExpanded)
+            railContent
                 .allowsHitTesting(controller.layer.isExpanded)
                 .accessibilityHidden(!controller.layer.isExpanded)
         }
@@ -522,7 +517,7 @@ struct FloatingTabView: View {
     private var railContent: some View {
         VStack(spacing: MBMetrics.edgeRailSpacing) {
             Color.clear.frame(width: MBMetrics.edgeTargetSize, height: MBMetrics.edgeTargetSize).allowsHitTesting(false)
-            ForEach(RailAction.allCases, id: \.self) { action in
+            ForEach(Array(RailAction.allCases.enumerated()), id: \.element) { index, action in
                 Button { perform(action) } label: {
                     Image(systemName: action.icon)
                         .font(.system(size: action == .hide ? 10 : 15, weight: .regular))
@@ -530,6 +525,10 @@ struct FloatingTabView: View {
                 }
                 .buttonStyle(RailButtonStyle(selected: selected(action)))
                 .accessibilityLabel(action.label)
+                .opacity(controller.layer.isExpanded ? 1 : 0)
+                .offset(y: reducedMotion || controller.layer.isExpanded ? 0 : -6)
+                .animation(FloatingMotion.contents(index: index, appearing: controller.layer.isExpanded,
+                                                  reduced: reducedMotion), value: controller.layer.isExpanded)
                 .onHover { inside in
                     if action == .recentTasks { controller.preview(.recentTasks, inside: inside) }
                 }
@@ -712,24 +711,13 @@ struct CompactBrandBadge: View {
     }
 }
 
-enum FloatingMotion {
-    static func duration(expanded: Bool, reduced: Bool) -> TimeInterval {
-        reduced ? MBMetrics.reducedMotionDuration : expanded ? MBMetrics.openDuration : MBMetrics.closeDuration
-    }
-    static func panelDuration(reduced: Bool) -> TimeInterval {
-        reduced ? MBMetrics.reducedMotionDuration : MBMetrics.panelDuration
-    }
-}
-
 private struct RailButtonStyle: ButtonStyle {
     let selected: Bool
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .foregroundStyle(selected ? MBPalette.textPrimary : MBPalette.textSecondary)
-            .background((selected ? MBPalette.brandBlue.opacity(0.22) : MBPalette.surfaceHover.opacity(configuration.isPressed ? 0.38 : 0)),
+            .background(Color.primary.opacity(configuration.isPressed ? 0.16 : selected ? 0.10 : 0),
                         in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(selected ? MBPalette.cyanHighlight.opacity(0.48) : .clear, lineWidth: 1))
     }
 }
 

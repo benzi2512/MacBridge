@@ -1,9 +1,14 @@
 # MacBridge Direct Local MCP
 
-The current source catalog contains 67 tools, including twelve grouped Brevo
+The current source catalog contains 70 tools, including twelve grouped Brevo
 tools. See [Brevo capabilities and acceptance](BREVO-CAPABILITIES.md) for the
 fixed-account API coverage, typed actions, gates and known API limits. This
 describes source functionality; verify installed build and host discovery.
+
+The candidate also adds three opt-in tools for Finder/document opening, scoped
+shell networking and selected-app Accessibility. They are off in existing
+configurations. See [Desktop access and permission boundaries](DESKTOP-ACCESS.md)
+before enabling them; native and normal-Chat acceptance are separate gates.
 
 This package builds one headless executable, `macbridge-mcp`. ChatGPT or Codex
 launches it over local stdio. Ordinary Chat uses the same executable behind a
@@ -126,7 +131,7 @@ readiness. The first-run UI is described in the [release guide](../Release/FIRST
 
 ## Operational limits
 
-- The source catalog contains 67 tools, including twelve Brevo tools, `developer_inspect`, `developer_task`, `work_task`, `transaction_list`,
+- The source catalog contains 70 tools, including twelve Brevo tools, `developer_inspect`, `developer_task`, `work_task`, `transaction_list`,
   `transaction_accept`, `bridge_activity_view` and `bridge_activity`. See current deployment (private deployment notes excluded) for
   the installed artifact and its acceptance limits. A Chat client can cache an
   older schema or load tools on demand. Use the host's available tool discovery
@@ -134,11 +139,11 @@ readiness. The first-run UI is described in the [release guide](../Release/FIRST
   same as not discoverable. Capability counts alone do not prove callability.
   `initialize.instructions` describes direct use and selective discovery without
   repeating all names; `bridge_capabilities.tool_names` exposes the live index.
-  `tool_catalog` defaults to 13 starter tools (explicitly truncated); `limit=67`
-  gives the full 66-entry canonical index. All 67 tools remain in `tools/list`. Bounded
+  `tool_catalog` defaults to 13 starter tools (explicitly truncated); `limit=70`
+  gives the full 69-entry canonical index. All 70 tools remain in `tools/list`. Bounded
   `query`/`category` filters return up to 5 suggestions by default. `names`
   preserves exact-schema lookup, and explicit `detail: "schemas"` still returns
-  the complete 67-tool catalog. `workspace_list` remains a deprecated callable
+  the complete 70-tool catalog. `workspace_list` remains a deprecated callable
   alias for compatibility. All schemas derive from `tools/list`; none of these
   metadata lookups force host loading or override approvals. See TOOL-GUIDE.md.
   `file_read_many` reads up to 32 initial file chunks with a shared 1 MiB raw-byte
@@ -223,7 +228,9 @@ readiness. The first-run UI is described in the [release guide](../Release/FIRST
   the core has no approved system-mutation or privilege-elevation route.
 - Commands inherit a clean private HOME/cache. Loopback sockets are allowed;
   non-loopback networking, remote Git, SSH, package fetching, and external APIs
-  remain blocked or unqualified.
+  remain blocked or unqualified for ordinary commands. Only the separate
+  `network_command` candidate can use an owner-pinned expiring TCP relay grant;
+  it does not make ordinary commands or package acquisition Internet-enabled.
 - `transaction_restore` validates current state and is automatic only in the
   same MCP process. Recoverable removal keeps bytes under private workspace
   recovery until restore, but restart-time automatic journal replay is not part

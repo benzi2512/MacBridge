@@ -276,7 +276,7 @@ final class ServerAndProcessTests: XCTestCase {
                 "params": [:] as JSONObject,
             ]))
         let result = try XCTUnwrap(listed["result"] as? JSONObject)
-        XCTAssertEqual((result["tools"] as? [JSONObject])?.count, 67)
+        XCTAssertEqual((result["tools"] as? [JSONObject])?.count, 70)
 
         let capabilities = try server.callTool(name: "bridge_capabilities", arguments: [:])
         XCTAssertEqual(capabilities["chatgpt_mode"] as? String, "CHATGPT_FULL")
@@ -396,7 +396,7 @@ final class ServerAndProcessTests: XCTestCase {
             ])
         )
         let listResult = try XCTUnwrap(listed["result"] as? JSONObject)
-        XCTAssertEqual((listResult["tools"] as? [JSONObject])?.count, 67)
+        XCTAssertEqual((listResult["tools"] as? [JSONObject])?.count, 70)
 
         let called = try XCTUnwrap(
             server.handle([

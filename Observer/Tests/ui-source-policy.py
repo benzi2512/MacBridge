@@ -11,6 +11,8 @@ DESIGN = (SOURCES / "MacBridgeDesignSystem.swift").read_text()
 SURFACES = (SOURCES / "CompactSurfaces.swift").read_text()
 LIFECYCLE = (SOURCES / "AppLifecycle.swift").read_text()
 APP = (SOURCES / "ObserverApp.swift").read_text()
+MOTION = (SOURCES / "FloatingMotion.swift").read_text()
+APPEARANCE = (SOURCES / "ObserverAppearance.swift").read_text()
 
 
 def require(condition, message):
@@ -38,9 +40,9 @@ check("canonical-icns", (ROOT / "Assets" / "Brand" / "MacBridge.icns").is_file()
 
 for name, value in {
     "edgeIdleWidth": "30", "edgeIdleHeight": "58", "edgeRailWidth": "36", "edgeRailHeight": "196",
-    "edgeLogoSize": "26", "edgeTargetSize": "28", "edgeRailSpacing": "7",
-    "hoverDelay": "0.10", "hoverExitGrace": "0.15", "openDuration": "0.20",
-    "panelDuration": "0.22", "closeDuration": "0.24", "reducedMotionDuration": "0.10",
+    "edgeLogoSize": "22", "edgeTargetSize": "28", "edgeRailSpacing": "7",
+    "hoverDelay": "0.10", "hoverExitGrace": "0.45", "openDuration": "0.64",
+    "panelDuration": "0.72", "closeDuration": "0.64", "reducedMotionDuration": "0.10",
 }.items():
     check("metric-" + name, re.search(rf"static let {name}: [^=]+ = {re.escape(value)}\b", DESIGN) is not None)
 
@@ -75,7 +77,22 @@ check("bounded-menu-only-refresh", "menuBarOnly ? 30" in APP
       and "visible || menuBarVisible" in APP)
 check("bounded-logo-cache", "cachedSizes.contains(size)" in DESIGN)
 
-compact_source = DESIGN + SURFACES + LIFECYCLE + (SOURCES / "ObserverAppearance.swift").read_text()
+check("native-untinted-glass", ".glassEffect(.regular, in: shape)" in SURFACES
+      and ".regular.tint(" not in SURFACES)
+check("no-blue-glass-wash-or-rim", all(value not in SURFACES + APPEARANCE
+      for value in ["GlassColorTreatment", "MBPalette.deepNavy", "MBPalette.surfaceElevated",
+                    "MBPalette.cyanHighlight", "MBPalette.surfaceHover"]))
+check("spring-motion-not-fixed-curve", ".spring(response:" in MOTION
+      and "FloatingMotion.unfold(reduced:" in SURFACES and ".timingCurve(" not in SURFACES)
+check("bounded-content-stagger", "staggerStep = 0.045" in MOTION and "maximumStagger = 0.18" in MOTION
+      and "FloatingMotion.contents(index: index" in SURFACES)
+check("one-retained-card-shell", "compactPanel.id(controller.layer)" not in SURFACES)
+check("host-does-not-autosize", "hosting.sizingOptions = []" in SURFACES)
+check("resting-material-is-inactive", ".opacity(resting ? 0 : glassOpacity)" in SURFACES)
+check("window-background-has-no-gradient", "LinearGradient" not in APPEARANCE
+      and "view.blendingMode = .behindWindow" in APPEARANCE)
+
+compact_source = DESIGN + SURFACES + LIFECYCLE + APPEARANCE + MOTION
 for forbidden in ["repeatForever", "Timer.scheduledTimer", "CVDisplayLink", "CADisplayLink",
                   "DispatchSource.makeTimerSource", "URLSession", "NWConnection", "Process()"]:
     check("absent-" + forbidden.replace(".", "-"), forbidden not in compact_source)

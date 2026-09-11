@@ -607,7 +607,7 @@ struct ObserverView: View {
             HStack(spacing: 10) {
                 Button { showSidebar.toggle() } label: { Image(systemName: "sidebar.left") }
                     .help(showSidebar ? "Hide workspaces" : "Show workspaces")
-                MacBridgeMark(size: 28)
+                MacBridgeMark(size: 28, style: .monochrome)
                 Text("MacBridge").font(.headline)
                 Spacer()
                 if let recoveryPreferences {
@@ -666,8 +666,9 @@ struct ObserverView: View {
                             .help("This window observes one headless runtime. Closing it does not stop MCP or its jobs.")
                     }.foregroundStyle(.secondary).padding(16)
                 }.padding(.top, 18).frame(minWidth: 180, idealWidth: 200, maxWidth: 240)
-                    .background(.ultraThinMaterial)
+                    .glassSurface(RoundedRectangle(cornerRadius: 16, style: .continuous))
                     .scrollContentBackground(.hidden)
+                    .padding(8)
               }
                 VStack(alignment: .leading, spacing: 12) {
                     HStack {

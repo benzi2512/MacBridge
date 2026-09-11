@@ -94,7 +94,9 @@ final class CompactSurfaceTests: XCTestCase {
         XCTAssertEqual(EdgeLayout.size(for: .idle, visibleFrame: frames[0]),
                        CGSize(width: MBMetrics.edgeIdleWidth, height: MBMetrics.edgeIdleHeight))
         XCTAssertEqual(EdgeLayout.size(for: .rail, visibleFrame: frames[0]),
-                       CGSize(width: MBMetrics.edgeRailWidth, height: MBMetrics.edgeRailHeight))
+                       CGSize(width: MBMetrics.edgeRailWidth + MBMetrics.edgeMotionHorizontalSlack,
+                              height: MBMetrics.edgeRailHeight + MBMetrics.edgeMotionVerticalSlack),
+                       "The backing canvas contains overshoot; the painted rail stays 36×196")
         XCTAssertLessThanOrEqual(MBMetrics.edgeIdleWidth, 30, "The idle handle must remain extremely narrow")
         XCTAssertLessThanOrEqual(MBMetrics.edgeRailWidth, 36, "Hover must not restore the old wide rail")
         XCTAssertEqual(EdgeLayout.railLogoOffset,
@@ -163,7 +165,7 @@ final class CompactSurfaceTests: XCTestCase {
         for expanded in [false, true] {
             for reduced in [false, true] {
                 XCTAssertEqual(FloatingMotion.duration(expanded: expanded, reduced: reduced),
-                               reduced ? 0.10 : expanded ? 0.20 : 0.24, accuracy: 0.001)
+                               reduced ? 0.10 : expanded ? 0.64 : 0.64, accuracy: 0.001)
             }
         }
     }

@@ -22,6 +22,19 @@ name, home directory or secret in shared test fixtures or a shared denylist.
 Reports contain rule identifiers and redacted locations, never matched values.
 They refuse overwriting an existing report.
 
+Location redaction covers all built-in detection rules as well as explicit
+markers, home usernames and email addresses. It matches the original location
+before replacing overlapping spans, so a marker cannot partially unmask a
+credential. The same redacted records are used in console and file reports.
+
+Match processing preserves first-occurrence order and line numbers without
+repeated full-prefix scans. At most 10,000 distinct issues are retained, plus
+the fixed incomplete-scan sentinel. Exceeding this budget yields `blocked`,
+`complete: false` and `issues_truncated: true`; it is never a clean scan.
+Repeated matches on the same line do not consume additional issue slots.
+The cap limits diagnostics, not permission to discard remaining evidence and
+publish. The report's `issue_limit` field states the configured bound.
+
 The tree check does not follow links. It flags generated caches, configuration and
 credential filenames, opaque archives, private paths, non-example emails, common
 credential formats, private-chat URLs and configured private identifiers. It
@@ -56,8 +69,10 @@ network-denied isolation before execution.
 
 `package_dmg.py` uses only already-built, reviewed arm64 binaries. Both exact
 SHA-256 digests are required. It accepts no existing app bundle and copies only
-the core, observer, reviewed Info.plist, canonical PNG/ICNS and the first-run
-guide. Extended metadata from source files is not copied. Quarantined inputs
+the core, observer, reviewed Info.plist, canonical PNG/ICNS, the first-run
+guide and the CodeNotch MIT notice as `Resources/ThirdPartyNotices.txt`.
+The notice is required and bound into the payload manifest and app signature.
+Extended metadata from source files is not copied. Quarantined inputs
 are refused, never stripped to bypass a security decision.
 
 The destination must be a new canonical directory ending in `.noindex`, outside

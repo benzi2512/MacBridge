@@ -18,15 +18,19 @@ enum MBMetrics {
     static let panelRadius: CGFloat = 16
     static let tooltipRadius: CGFloat = 11
     static let hoverDelay: TimeInterval = 0.10
-    static let hoverExitGrace: TimeInterval = 0.15
-    static let openDuration: TimeInterval = 0.20
-    static let panelDuration: TimeInterval = 0.22
-    static let closeDuration: TimeInterval = 0.24
+    static let hoverExitGrace: TimeInterval = 0.45
+    // Canvas retention budgets, not animation speed. A spring must finish
+    // settling before AppKit is allowed to trim its backing surface.
+    static let openDuration: TimeInterval = 0.64
+    static let panelDuration: TimeInterval = 0.72
+    static let closeDuration: TimeInterval = 0.64
     static let reducedMotionDuration: TimeInterval = 0.10
+    static let edgeMotionHorizontalSlack: CGFloat = 4
+    static let edgeMotionVerticalSlack: CGFloat = 16
 }
 
 enum MBPalette {
-    static let brandBlue = Color(red: 10 / 255, green: 132 / 255, blue: 1)
+    static let brandBlue = Color.accentColor
     static let electricBlue = Color(red: 22 / 255, green: 119 / 255, blue: 1)
     static let cyanHighlight = Color(red: 53 / 255, green: 201 / 255, blue: 1)
     static let deepNavy = Color(red: 7 / 255, green: 17 / 255, blue: 31 / 255)
@@ -36,12 +40,12 @@ enum MBPalette {
     static let textPrimary = Color.primary
     static let textSecondary = Color(nsColor: .secondaryLabelColor)
     static let textTertiary = Color(nsColor: .tertiaryLabelColor)
-    static let running = Color(red: 96 / 255, green: 165 / 255, blue: 250 / 255)
-    static let waiting = Color(red: 212 / 255, green: 175 / 255, blue: 124 / 255)
-    static let completed = Color(red: 167 / 255, green: 139 / 255, blue: 250 / 255)
-    static let failed = Color(red: 244 / 255, green: 114 / 255, blue: 182 / 255)
-    static let paused = Color(red: 100 / 255, green: 116 / 255, blue: 139 / 255)
-    static let idle = Color(red: 124 / 255, green: 135 / 255, blue: 153 / 255)
+    static let running = Color.accentColor
+    static let waiting = Color(nsColor: .systemOrange)
+    static let completed = Color(nsColor: .secondaryLabelColor)
+    static let failed = Color(nsColor: .systemRed)
+    static let paused = Color(nsColor: .secondaryLabelColor)
+    static let idle = Color(nsColor: .secondaryLabelColor)
 
     static let nsBrandBlue = NSColor(srgbRed: 10 / 255, green: 132 / 255, blue: 1, alpha: 1)
     static let nsCyan = NSColor(srgbRed: 53 / 255, green: 201 / 255, blue: 1, alpha: 1)
@@ -305,7 +309,10 @@ struct EdgeLayout: Equatable, Sendable {
         case .idle:
             requested = CGSize(width: MBMetrics.edgeIdleWidth, height: MBMetrics.edgeIdleHeight)
         case .rail:
-            requested = CGSize(width: MBMetrics.edgeRailWidth, height: MBMetrics.edgeRailHeight)
+            // Invisible slack contains the soft spring overshoot. The painted
+            // rail and its hit targets keep their original narrow dimensions.
+            requested = CGSize(width: MBMetrics.edgeRailWidth + MBMetrics.edgeMotionHorizontalSlack,
+                               height: MBMetrics.edgeRailHeight + MBMetrics.edgeMotionVerticalSlack)
         case .recentTasks:
             requested = CGSize(width: MBMetrics.edgeRailWidth + MBMetrics.panelGap + MBMetrics.panelWidth,
                                height: max(MBMetrics.edgeRailHeight, recentTasksHeight(taskCount: taskCount)))
@@ -510,7 +517,9 @@ struct AnchoredOrganicEdgeShape: Shape {
         set { expansion = newValue }
     }
     func path(in rect: CGRect) -> Path {
-        let t = min(1, max(0, expansion))
+        // Keep the spring's small settle instead of clipping every value above
+        // one into a hard stop. AppKit's rail canvas reserves room for this.
+        let t = min(1.04, max(0, expansion))
         let width = MBMetrics.edgeIdleWidth + (MBMetrics.edgeRailWidth - MBMetrics.edgeIdleWidth) * t
         let height = MBMetrics.edgeIdleHeight + (MBMetrics.edgeRailHeight - MBMetrics.edgeIdleHeight) * t
         let logoY = rect.midY - EdgeLayout.railLogoOffset

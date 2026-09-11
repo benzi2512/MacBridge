@@ -16,17 +16,28 @@ public struct LocalWorkspaceConfigurationEntry: Codable, Equatable, Sendable {
     public let name: String
     public let path: String
     public let allowBroadAccess: Bool?
+    public let allowDesktopOpen: Bool?
+    public let networkGrants: [LocalNetworkGrant]?
+    public let computerGrants: [LocalComputerGrant]?
 
     enum CodingKeys: String, CodingKey {
         case id, name, path
         case allowBroadAccess = "allow_broad_access"
+        case allowDesktopOpen = "allow_desktop_open"
+        case networkGrants = "network_grants"
+        case computerGrants = "computer_grants"
     }
 
-    public init(id: String, name: String, path: String, allowBroadAccess: Bool? = nil) {
+    public init(id: String, name: String, path: String, allowBroadAccess: Bool? = nil,
+                allowDesktopOpen: Bool? = nil, networkGrants: [LocalNetworkGrant]? = nil,
+                computerGrants: [LocalComputerGrant]? = nil) {
         self.id = id
         self.name = name
         self.path = path
         self.allowBroadAccess = allowBroadAccess
+        self.allowDesktopOpen = allowDesktopOpen
+        self.networkGrants = networkGrants
+        self.computerGrants = computerGrants
     }
 }
 
@@ -36,16 +47,23 @@ public struct RegisteredLocalWorkspace: Equatable, Sendable {
     public let rootURL: URL
     public let rootHash: String
     public let allowsBroadAccess: Bool
+    public let allowsDesktopOpen: Bool
+    public let networkGrants: [LocalNetworkGrant]
+    public let computerGrants: [LocalComputerGrant]
 
     public init(
         id: String, name: String, rootURL: URL, rootHash: String,
-        allowsBroadAccess: Bool = false
+        allowsBroadAccess: Bool = false, allowsDesktopOpen: Bool = false,
+        networkGrants: [LocalNetworkGrant] = [], computerGrants: [LocalComputerGrant] = []
     ) {
         self.id = id
         self.name = name
         self.rootURL = rootURL
         self.rootHash = rootHash
         self.allowsBroadAccess = allowsBroadAccess
+        self.allowsDesktopOpen = allowsDesktopOpen
+        self.networkGrants = networkGrants
+        self.computerGrants = computerGrants
     }
 
     public var json: JSONObject {
@@ -54,6 +72,9 @@ public struct RegisteredLocalWorkspace: Equatable, Sendable {
             "display_name": name,
             "root_hash": rootHash,
             "absolute_paths": true,
+            "desktop_open_enabled": allowsDesktopOpen,
+            "network_grants_configured": networkGrants.count,
+            "computer_grants_configured": computerGrants.count,
         ]
         if allowsBroadAccess {
             value["access_scope"] = "user_filesystem_excluding_credentials"
@@ -99,6 +120,20 @@ public final class LocalWorkspaceRegistry: @unchecked Sendable {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .useDefaultKeys
         let configuration = try decoder.decode(LocalWorkspaceConfiguration.self, from: data)
+        let hasDesktopGrants = configuration.workspaces.contains {
+            $0.allowDesktopOpen == true || !($0.networkGrants ?? []).isEmpty || !($0.computerGrants ?? []).isEmpty
+        }
+        if hasDesktopGrants {
+            // These are authority, not ordinary project data. All MB file and
+            // shell paths already deny .config/macbridge. A custom config in a
+            // writable project must not self-enable capabilities via reload.
+            let policyDirectory = safeURL.deletingLastPathComponent()
+            guard policyDirectory.lastPathComponent.lowercased() == "macbridge",
+                  policyDirectory.deletingLastPathComponent().lastPathComponent.lowercased() == ".config",
+                  LocalFilesystemAccess.isSensitive(safeURL.path) else {
+                throw LocalMCPError.invalidConfiguration("desktop/network/computer grants require owner policy under .config/macbridge, which MB tools cannot write")
+            }
+        }
         try self.init(configuration: configuration)
     }
 
@@ -161,12 +196,24 @@ public final class LocalWorkspaceRegistry: @unchecked Sendable {
                 )
             }
             let rootURL = URL(fileURLWithPath: canonical, isDirectory: true)
+            let grants = entry.networkGrants ?? []
+            guard grants.count <= 8, Set(grants.map(\.id)).count == grants.count else {
+                throw LocalMCPError.invalidConfiguration("network grants must be unique and bounded")
+            }
+            for grant in grants { try grant.validateShape() }
+            let computerGrants = entry.computerGrants ?? []
+            guard computerGrants.count <= 8, Set(computerGrants.map(\.bundleID)).count == computerGrants.count else {
+                throw LocalMCPError.invalidConfiguration("computer grants must be unique and bounded")
+            }
+            for grant in computerGrants { try grant.validateShape() }
             values[id] = RegisteredLocalWorkspace(
                 id: id,
                 name: entry.name,
                 rootURL: rootURL,
                 rootHash: LocalHash.sha256(Data(canonical.utf8)),
-                allowsBroadAccess: entry.allowBroadAccess == true
+                allowsBroadAccess: entry.allowBroadAccess == true,
+                allowsDesktopOpen: entry.allowDesktopOpen == true,
+                networkGrants: grants, computerGrants: computerGrants
             )
         }
         byID = values

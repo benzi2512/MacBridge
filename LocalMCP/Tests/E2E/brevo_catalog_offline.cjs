@@ -68,9 +68,9 @@ const probes = [
     assert.equal(init.protocolVersion, '2025-06-18');
     child.stdin.write(JSON.stringify({jsonrpc: '2.0', method: 'notifications/initialized'}) + '\n');
     const catalog = (await rpc('tools/list')).tools;
-    assert.equal(catalog.length, 67);
+    assert.equal(catalog.length, 70);
     const names = catalog.map(t => t.name), brevo = names.filter(n => n.startsWith('brevo_'));
-    assert.equal(new Set(names).size, 67); assert.equal(brevo.length, 12);
+    assert.equal(new Set(names).size, 70); assert.equal(brevo.length, 12);
     for (const name of brevo) {
       const spec = catalog.find(t => t.name === name);
       assert.equal(spec.inputSchema.additionalProperties, false);
@@ -93,15 +93,26 @@ const probes = [
     assert.equal(rejected.isError, true);
     assert(JSON.stringify(rejected).includes('confirm_write'));
     const identity = await tool('bridge_capabilities');
-    assert.equal(identity.catalog_count, 67);
+    assert.equal(identity.catalog_count, 70);
     assert.equal(identity.network_default, 'loopback_only');
     assert.equal(identity.mcp_executable_sha256, expectedHash);
+    assert.equal(identity.desktop_open_enabled, false);
+    assert.equal(identity.computer_grants_configured, 0);
+    const workspaceID = '11111111-2222-4333-8444-555555555555';
+    for (const [name, args] of [
+      ['desktop_open', {workspace_id: workspaceID, action: 'folder', path: '.'}],
+      ['computer_control', {workspace_id: workspaceID, bundle_id: 'com.apple.TextEdit', action: 'status'}],
+      ['network_command', {workspace_id: workspaceID, grant_id: 'aaaaaaaa-1111-4222-8333-444444444444', executable: 'sh', arguments: ['-c', 'true']}],
+    ]) {
+      const result = await rpc('tools/call', {name, arguments: args});
+      assert.equal(result.isError, true, 'New desktop capabilities must be default off');
+    }
     assert(!JSON.stringify(evidence).includes('xkeysib-'));
     fs.writeFileSync(output, JSON.stringify({status: 'PASS', identity, brevo_tools: brevo,
       dry_run_probes: probes.length, exact_schema_queries: brevo.length, rpc_calls: sequence,
       network_denied_by_os: true, home_reads_denied_by_os: true, production_runtime_touched: false,
       production_acceptance: false, normal_chat_acceptance: false, evidence}, null, 2), {mode: 0o600, flag: 'wx'});
-    console.log(JSON.stringify({status: 'PASS', binary_sha256: expectedHash, catalog_count: 67,
+    console.log(JSON.stringify({status: 'PASS', binary_sha256: expectedHash, catalog_count: 70,
       catalog_sha256: identity.catalog_sha256, build_id: identity.build_id, instance_id: identity.instance_id,
       dry_run_probes: probes.length, rpc_calls: sequence, output}));
   } finally {

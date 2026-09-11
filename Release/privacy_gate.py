@@ -19,6 +19,7 @@ import sys
 MAX_FILE = 64 * 1024 * 1024
 MAX_TOTAL = 1024 * 1024 * 1024
 MAX_ITEMS = 50000
+MAX_ISSUES = 10000
 GIT = "/usr/bin/git"
 HOME_PATH = re.compile(rb"/(?:Users|home)/([^/\s\x00\"'<>]+)")
 EMAIL = re.compile(rb"[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9.\-]{1,253}\.[A-Za-z]{2,63}")
@@ -30,6 +31,11 @@ RULES = {
     "private_chat_link": re.compile(rb"(?:chatgpt\.com/c/|chatgpt-conversation://)[a-zA-Z0-9:-]{12,}"),
     "signed_url": re.compile(rb"(?:X-Amz-Signature|X-Goog-Signature)=[a-fA-F0-9]{16,}"),
 }
+LOCATION_RULES = tuple(re.compile(pattern.pattern.decode("ascii")) for pattern in RULES.values())
+# Filenames are not quoted source tokens. Mask the entire username component,
+# including quotes/angle brackets, using the byte detector's ASCII whitespace.
+LOCATION_HOME = re.compile(r"/(?:Users|home)/([^/\s]+)", re.ASCII)
+LOCATION_EMAIL = re.compile(EMAIL.pattern.decode("ascii"))
 FORBIDDEN_NAMES = {".DS_Store", ".env", "credentials.json", "workspaces.json", "workspaces.local.json", "cookies.sqlite", "login.keychain-db"}
 FORBIDDEN_DIRS = {".git", ".build", ".swiftpm", "__pycache__", "node_modules", ".macbridge", "local-secrets"}
 FORBIDDEN_SUFFIXES = {".pem", ".key", ".p12", ".mobileprovision", ".sock"}
@@ -61,25 +67,61 @@ class Gate:
     def __init__(self, markers=()):
         self.markers = tuple(markers)
         self.issues = []
+        self._issue_keys = set()
+        self._issue_limit_reached = False
+        self._last_redaction_key = None
+        self._last_redacted_location = None
         self.items = 0
         self.bytes = 0
         self.inventory = hashlib.sha256()
 
     def redacted(self, location):
         result = str(location)
+        key = (result, self.markers)
+        if key == self._last_redaction_key:
+            return self._last_redacted_location
+        # Match the original location once: sequential replacements can break
+        # an overlapping credential or marker and leave part of it exposed.
+        spans = [match.span() for pattern in LOCATION_RULES for match in pattern.finditer(result)]
+        spans.extend(match.span(1) for match in LOCATION_HOME.finditer(result))
+        spans.extend(match.span() for match in LOCATION_EMAIL.finditer(result))
         for marker in self.markers:
-            result = re.sub(re.escape(marker), "[private]", result, flags=re.I)
-        result = re.sub(r"/(Users|home)/[^/\s]+", r"/\1/[private]", result)
-        return EMAIL.sub(b"[private-email]", result.encode("utf-8", "replace")).decode("utf-8")
+            spans.extend(match.span() for match in re.finditer(re.escape(marker), result, re.I))
+        merged = []
+        for start, end in sorted(spans):
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        parts, cursor = [], 0
+        for start, end in merged:
+            parts.extend((result[cursor:start], "[private]"))
+            cursor = end
+        parts.append(result[cursor:])
+        redacted = "".join(parts).encode("utf-8", "replace").decode("utf-8")
+        # One-location cache, not an unbounded copy of every scanned filename.
+        self._last_redaction_key, self._last_redacted_location = key, redacted
+        return redacted
 
     def issue(self, rule, location, line=None):
-        item = {"rule": rule, "location": self.redacted(location)}
+        redacted = self.redacted(location)
+        key = (rule, redacted, line)
+        if key in self._issue_keys:
+            return
+        # Keep room for the fixed incomplete sentinel used by main's handler.
+        sentinel = rule == "inspection_incomplete" and str(location) == "input" and line is None
+        if len(self.issues) >= MAX_ISSUES and not sentinel:
+            self._issue_limit_reached = True
+            raise GateError("issue_budget_exceeded")
+        item = {"rule": rule, "location": redacted}
         if line is not None:
             item["line"] = line
-        if item not in self.issues:
-            self.issues.append(item)
+        self._issue_keys.add(key)
+        self.issues.append(item)
 
     def inspect(self, data, location, *, account=True):
+        if self._issue_limit_reached:
+            raise GateError("issue_budget_exceeded")
         if account:
             self.items += 1
             self.bytes += len(data)
@@ -87,27 +129,32 @@ class Gate:
                 raise GateError("scan_budget_exceeded")
             self.inventory.update(str(location).encode("utf-8", "surrogateescape") + b"\x00" + hashlib.sha256(data).digest())
         # UTF-16 source/resource strings are checked in addition to raw bytes.
-        variants = [("raw", data)]
-        if b"\x00" in data or data.startswith((b"\xff\xfe", b"\xfe\xff")):
-            for encoding in ("utf-16-le", "utf-16-be"):
-                variants.append((encoding, data.decode(encoding, "ignore").encode("utf-8")))
-        for encoding, content in variants:
-            hits = []
+        def variants():
+            yield "raw", data
+            if b"\x00" in data or data.startswith((b"\xff\xfe", b"\xfe\xff")):
+                for encoding in ("utf-16-le", "utf-16-be"):
+                    yield encoding, data.decode(encoding, "ignore").encode("utf-8")
+        for encoding, content in variants():
+            text_lines = encoding == "raw" and b"\x00" not in content
+            def record_matches(rule, offsets):
+                # Each pattern's offsets are ordered. Count disjoint segments
+                # instead of rescanning the entire prefix for every match.
+                cursor, line = 0, 1
+                for offset in offsets:
+                    if text_lines:
+                        line += content.count(b"\n", cursor, offset)
+                        cursor = offset
+                    self.issue(rule, location, line if text_lines else None)
             for marker in self.markers:
                 match = re.search(re.escape(marker.encode("utf-8")), content, re.I)
                 if match:
-                    hits.append(("private_marker", match.start()))
+                    record_matches("private_marker", (match.start(),))
             for rule, pattern in RULES.items():
-                hits.extend((rule, match.start()) for match in pattern.finditer(content))
-            for match in HOME_PATH.finditer(content):
-                if match.group(1).lower() not in SYNTHETIC_USERS:
-                    hits.append(("machine_home_path", match.start()))
-            for match in EMAIL.finditer(content):
-                if match.group().rsplit(b"@", 1)[1].lower() not in EXAMPLE_DOMAINS:
-                    hits.append(("non_example_email", match.start()))
-            for rule, offset in hits:
-                line = content.count(b"\n", 0, offset) + 1 if encoding == "raw" and b"\x00" not in content else None
-                self.issue(rule, location, line)
+                record_matches(rule, (match.start() for match in pattern.finditer(content)))
+            record_matches("machine_home_path", (match.start() for match in HOME_PATH.finditer(content)
+                if match.group(1).lower() not in SYNTHETIC_USERS))
+            record_matches("non_example_email", (match.start() for match in EMAIL.finditer(content)
+                if match.group().rsplit(b"@", 1)[1].lower() not in EXAMPLE_DOMAINS))
 
     def name(self, name, location, is_dir=False):
         self.inspect(name.encode("utf-8", "surrogateescape"), location, account=False)
@@ -218,8 +265,10 @@ class Gate:
             process.wait(timeout=10)
 
     def report(self, complete=True):
+        complete = complete and not self._issue_limit_reached
         return {"schema_version": 1, "status": "clear_within_rules" if complete and not self.issues else "blocked", "complete": complete,
                 "items_checked": self.items, "bytes_checked": self.bytes, "inventory_sha256": self.inventory.hexdigest(),
+                "issues_truncated": self._issue_limit_reached, "issue_limit": MAX_ISSUES,
                 "issues": self.issues, "limitations": ["Rule-based checks do not prove absence of all private or encoded information.", "Compressed artifacts need independent inspection; source, history and built payloads are separate gates.", "No publication or execution approval is granted by this report."]}
 
 

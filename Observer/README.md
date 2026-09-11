@@ -6,6 +6,11 @@ full Activity/Details dashboard. It does not start MCP, a tunnel, an AI model,
 XPC, a daemon or a terminal window. Closing its windows does not stop the owner.
 Building it does not change the installed normal-Chat runtime.
 
+The current motion/material reference is
+[CodeNotch 8406a27](CODENOTCH-REFERENCE.md). This is an observer-only adaptation:
+no CodeNotch provider integration, dependency, updater or credential access is
+included. A source build is not an authorization to replace a running interface.
+
 Raw packages retain the canonical blue PNG and ICNS for app identity, Dashboard,
 Finder and Spotlight. Compact chrome (menu bar, edge tab and its panel header)
 uses a transparent native ribbon template, black in light appearance and white
@@ -50,28 +55,29 @@ hashes; packaging does not download or regenerate artwork.
   opening a wider task detail expands immediately, while a smaller Recent Tasks
   panel retains the outgoing bounds until its exit completes. A pending icon
   dwell rechecks Hover previews before opening.
-- The visual outline morphs on a constant 36×196 canvas around one retained logo
-  button. Window geometry is not animated. Closing retains that canvas for
-  240 ms before shrinking; reopening cancels the shrink. Expansion uses 200 ms,
-  panels 220 ms and reduced motion 100 ms without shape interpolation.
+- The visual outline uses a native spring (response 0.42, damping 0.78).
+  The 36×196 rail remains narrow; its transparent backing reserves 4pt across
+  and 16pt vertically for a small settle without clipping. One retained logo
+  button stays fixed. Window geometry is not animated. Closing retains its
+  canvas for 640ms and a smaller panel for 720ms; reopening cancels the shrink.
+  Icons enter with a capped 45ms stagger; exits are not staggered. Reduced
+  motion uses 100ms crossfades without shape or offset interpolation.
   Context panels fade and enter 12pt from the rail; Reduce Motion uses opacity
   only. The canvas remains until the panel exit finishes, and reopening cancels
   its pending shrink. The logo and window frame have no implicit animation.
   Native pointer/compositor acceptance is separate from geometry unit tests;
   these timings are not a measured 120 Hz frame-rate claim.
-- On macOS 26+, edge and context surfaces use native SwiftUI Liquid Glass, with
-  a separate translucent navy wash above the adaptive tint and below labels.
-  Dark panel wash alpha is 28–40%; the rail uses 20–30%. Light appearance uses
-  a 10–6% white wash. The reduced color cover leaves most of the system material
-  visible instead of painting a dense navy panel; it does not dim controls.
-  A restrained cyan/blue rim remains. The dashboard uses a transparent native
-  window and behind-window material so its desktop backdrop is not blocked by
-  an opaque NSWindow.
-  Reading panes keep a stable tinted backing. Older systems use standard
-  material. Floating Tab glass opacity is adjustable from 35% to 100% and
-  defaults to 55%; it changes the floating material, wash, rim and shadow,
-  never labels or controls. Reduce Transparency uses an opaque navy/system
-  background. Label colors adapt to light/dark appearance. Dashboard and
+- On macOS 26+, expanded edge and context surfaces use native SwiftUI Liquid
+  Glass without a custom tint, navy wash or cyan glow. The system's material
+  supplies the surface; no colored overlay overrides Clear/Tinted appearance.
+  The idle handle uses a neutral translucent fill with no glass contribution.
+  The dashboard uses a transparent native window and behind-window material,
+  a neutral reading backing and an inset glass workspace sidebar.
+  Older systems use standard material. Floating Tab glass opacity is adjustable
+  from 35% to 100% and defaults to 55%; it changes material and shadow, never
+  labels or controls. Existing saved choices are preserved.
+  Reduce Transparency uses an opaque neutral system background.
+  Label colors adapt to light/dark appearance. Dashboard and
   floating UI share the same System / Light / Dark preference, applied to both
   SwiftUI and AppKit windows.
   Dashboard and settings controllers own the native window appearance from

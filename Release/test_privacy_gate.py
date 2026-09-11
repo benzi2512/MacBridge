@@ -95,6 +95,166 @@ class PrivacyGateTests(unittest.TestCase):
         gate.inspect(("-----BEGIN " + "PRIVATE KEY-----\nhttps://chatgpt.com/" + "c/12345678-abcd-ef01-2345-67890abcdef1").encode(), "fixture")
         self.assertEqual({x["rule"] for x in gate.issues}, {"private_key", "private_chat_link"})
 
+    def test_all_builtin_location_matches_are_removed_before_storage(self):
+        cases = [
+            ("provider_credential", "gh" + "p_" + "A" * 36),
+            ("signed_url", "X-Amz-" + "Signature=" + "a" * 32),
+            ("signed_url", "X-Goog-" + "Signature=" + "b" * 32),
+            ("private_key", "-----BEGIN " + "PRIVATE KEY-----"),
+            ("private_chat_link", "chatgpt.com/" + "c/" + "1234abcd" * 4),
+            ("private_chat_link", "chatgpt-" + "conversation://" + "1234abcd" * 4),
+        ]
+        for rule, value in cases:
+            with self.subTest(rule=rule):
+                gate = pg.Gate()
+                location = "parent/" + value + "/file"
+                gate.issue("symlink_requires_review", location)
+                gate.inspect(value.encode(), location)
+                self.assertIn(rule, {item["rule"] for item in gate.issues})
+                self.assertTrue(all(item["location"] == "parent/[private]/file" for item in gate.issues))
+                self.assertNotIn(value, json.dumps(gate.issues))
+                self.assertNotIn(value, json.dumps(gate.report()))
+
+    def test_filename_and_parent_tokens_are_absent_from_both_report_sinks(self):
+        for index, value in enumerate(("gh" + "p_" + "A" * 36,
+                "X-Amz-" + "Signature=" + "b" * 32)):
+            with self.subTest(index=index):
+                folder = self.root / (value + ".folder")
+                folder.mkdir()
+                (folder / (value + ".txt")).write_text("inert fixture")
+                (folder / "outside-link").symlink_to("../not-followed")
+                report = self.base / ("report-" + str(index) + ".json")
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    code = pg.main(["tree", str(self.root), "--report", str(report)])
+                self.assertEqual(code, 1)
+                self.assertEqual(output.getvalue(), report.read_text())
+                self.assertNotIn(value, output.getvalue())
+                self.assertIn("symlink_requires_review", output.getvalue())
+
+    def test_redaction_handles_overlaps_in_both_directions(self):
+        token = "gh" + "p_" + "A" * 36
+        gate = pg.Gate([token[6:12]])
+        self.assertEqual(gate.redacted("dir/" + token + "/file"), "dir/[private]/file")
+        marker = "prefix-" + token + "-tail"
+        gate = pg.Gate([marker])
+        self.assertEqual(gate.redacted("dir/" + marker + "/file"), "dir/[private]/file")
+
+    def test_location_unicode_invalid_bytes_and_marker_changes(self):
+        token = "gh" + "p_" + "A" * 36
+        location = os.fsdecode(b"dir/\xff" + token.encode() + b"/file")
+        gate = pg.Gate()
+        self.assertNotIn(token, gate.redacted(location))
+        self.assertEqual(gate.redacted("src/naïve.swift"), "src/naïve.swift")
+        gate.markers = ("Fixture-Ä-Private",)
+        self.assertEqual(gate.redacted("dir/fixture-ä-private/file"), "dir/[private]/file")
+        gate.markers = ("naïve",)
+        self.assertEqual(gate.redacted("src/naïve.swift"), "src/[private].swift")
+
+    def test_dense_lines_preserve_order_without_quadratic_prefix_scans(self):
+        class CountingBytes(bytes):
+            scanned = 0
+            nul_checks = 0
+
+            def count(self, sub, start=0, end=None):
+                stop = len(self) if end is None else end
+                self.scanned += stop - start
+                return super().count(sub, start, stop)
+
+            def __contains__(self, item):
+                if item == b"\x00":
+                    self.nul_checks += 1
+                return super().__contains__(item)
+
+        class NoListMembership(list):
+            def __contains__(self, item):
+                raise AssertionError("deduplication must not scan the growing issue list")
+
+        token = "gh" + "p_" + "A" * 36
+        data = CountingBytes(((token + "\n") * 1000).encode())
+        gate = pg.Gate()
+        gate.issues = NoListMembership()
+        gate.inspect(data, "fixture")
+        self.assertEqual([item["line"] for item in gate.issues], list(range(1, 1001)))
+        self.assertLessEqual(data.scanned, len(data))
+        self.assertLessEqual(data.nul_checks, 3)
+
+    def test_home_location_redaction_covers_byte_whitespace_and_filename_punctuation(self):
+        for character in ("\u00a0", "\u2003", "'", '"', "<", ">"):
+            for prefix in ("Users", "home"):
+                with self.subTest(character=repr(character), prefix=prefix):
+                    username = character + "private-fixture" + character + "suffix"
+                    location = "parent/" + prefix + "/" + username + "/file.pem"
+                    gate = pg.Gate()
+                    gate.name("file.pem", location)
+                    expected = "parent/" + prefix + "/[private]/file.pem"
+                    self.assertEqual(gate.issues[0]["location"], expected)
+                    self.assertNotIn("private-fixture", json.dumps(gate.report()))
+                    self.assertNotIn("suffix", json.dumps(gate.report()))
+                    if character in ("\u00a0", "\u2003"):
+                        self.assertIsNotNone(pg.HOME_PATH.search(location.encode()))
+                        gate.inspect(location.encode(), location)
+                        self.assertIn("machine_home_path", {item["rule"] for item in gate.issues})
+                        self.assertTrue(all(item["location"] == expected for item in gate.issues))
+
+    def test_dense_single_line_and_binary_matches_are_deduplicated(self):
+        token = "gh" + "p_" + "A" * 36
+        gate = pg.Gate()
+        gate.inspect(((token + " ") * 4000).encode(), "fixture")
+        self.assertEqual(gate.issues, [{"rule": "provider_credential", "location": "fixture", "line": 1}])
+        for encoding in ("utf-16-le", "utf-16-be"):
+            with self.subTest(encoding=encoding):
+                gate = pg.Gate()
+                gate.inspect(((token + "\n") * 1000).encode(encoding), "binary")
+                self.assertEqual(gate.issues, [{"rule": "provider_credential", "location": "binary"}])
+
+    def test_matching_order_and_line_semantics_are_unchanged(self):
+        token = "gh" + "p_" + "A" * 36
+        signed = "X-Amz-" + "Signature=" + "b" * 32
+        home = "/" + "Users" + "/private-fixture/file"
+        email = "private-fixture" + "@" + "non-example.invalid"
+        data = ("marker-fixture " + token + "\n" + signed + " " + token + "\n" + home + "\n" + email).encode()
+        gate = pg.Gate(["marker-fixture"])
+        gate.inspect(data, "fixture")
+        self.assertEqual([(item["rule"], item["line"]) for item in gate.issues], [
+            ("private_marker", 1), ("provider_credential", 1), ("provider_credential", 2),
+            ("signed_url", 2), ("machine_home_path", 3), ("non_example_email", 4)])
+        gate = pg.Gate(["\nZZ"])
+        gate.inspect(b"\nZZ", "fixture")
+        self.assertEqual(gate.issues[0]["line"], 1)
+
+    def test_issue_budget_is_explicit_and_fails_closed_even_for_direct_callers(self):
+        token = "gh" + "p_" + "A" * 36
+        data = ((token + "\n") * 5).encode()
+        with patch.object(pg, "MAX_ISSUES", 3):
+            gate = pg.Gate()
+            with self.assertRaises(pg.GateError):
+                gate.inspect(data, "fixture")
+            self.assertEqual(len(gate.issues), 3)
+            self.assertFalse(gate.report()["complete"])
+            self.assertEqual(gate.report()["status"], "blocked")
+            self.assertTrue(gate.report()["issues_truncated"])
+            self.assertEqual(gate.report()["issue_limit"], 3)
+            with self.assertRaises(pg.GateError):
+                gate.inspect(b"clean", "later")
+            (self.root / "dense.txt").write_bytes(data)
+            code, report = self.run_gate("tree", str(self.root))
+            self.assertEqual(code, 1)
+            self.assertFalse(report["complete"])
+            self.assertEqual(len(report["issues"]), 4)
+            self.assertEqual(report["issues"][-1], {"rule": "inspection_incomplete", "location": "input"})
+            self.assertNotIn(token, json.dumps(report))
+
+    def test_reaching_exact_issue_budget_does_not_truncate_a_complete_scan(self):
+        token = "gh" + "p_" + "A" * 36
+        with patch.object(pg, "MAX_ISSUES", 3):
+            gate = pg.Gate()
+            gate.inspect(((token + "\n") * 3).encode(), "fixture")
+            self.assertTrue(gate.report()["complete"])
+            self.assertFalse(gate.report()["issues_truncated"])
+            gate.issue("provider_credential", "fixture", 1)
+            self.assertEqual(len(gate.issues), 3)
+
     def test_symlink_outside_is_not_read(self):
         outside = self.base / "outside"
         outside.write_text("private-fixture")

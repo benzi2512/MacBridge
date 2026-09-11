@@ -14,7 +14,7 @@ enum ActivityDetail {
             "file_read", "file_read_lines", "file_tail", "file_stat", "file_patch",
             "file_apply_edits", "file_write", "file_append", "file_search", "directory_list",
             "directory_summary", "directory_find", "directory_create", "path_remove", "workspace_inspect",
-            "git_diff", "git_blame", "developer_inspect",
+            "git_diff", "git_blame", "developer_inspect", "desktop_open",
         ]
         var paths: [String] = []
         if fileTools.contains(name), let path = a["path"] as? String { paths = [path] }
@@ -54,7 +54,7 @@ enum ActivityDetail {
             result["edit_count"] = 1
             result["edit_count_scope"] = "requested"
         }
-        if name == "command_start" || name == "command_run", let executable = a["executable"] as? String {
+        if ["command_start", "command_run", "network_command"].contains(name), let executable = a["executable"] as? String {
             result["command_preview"] = commandPreview(executable: executable,
                 arguments: a["arguments"] as? [String] ?? [], omitted: &omitted, truncated: &truncated)
         }
