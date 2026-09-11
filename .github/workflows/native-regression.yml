@@ -1,0 +1,137 @@
+name: Reviewed native macOS regression
+
+'on':
+  push:
+    branches: [ci/native-regression]
+  workflow_dispatch:
+
+# No repository write, package, deployment, OIDC or secret capability.
+permissions: {}
+
+concurrency:
+  group: reviewed-native-regression
+  cancel-in-progress: false
+
+jobs:
+  native-regression:
+    runs-on: macos-26
+    timeout-minutes: 20
+    env:
+      MB_SOURCE_SHA: bdaf4dab4370987603140a21c947c7356697f789
+      MB_SOURCE_TREE: b3f838bfc4d0b79b45282b81e37655ac2c2eb3ca
+    steps:
+      - name: Qualify reviewed source in a disposable GitHub Mac
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$RUNNER_OS" = macOS
+          test "$RUNNER_ARCH" = ARM64
+          test "$GITHUB_REPOSITORY" = benzi2512/MacBridge-Release
+          # Only preinstalled tools. Never install packages or modify the host's
+          # security, certificates, login services or keychain.
+          /usr/bin/sw_vers
+          /usr/bin/xcrun swift --version
+          /usr/bin/xcodebuild -version
+          mb_ci_root=$(/usr/bin/mktemp -d /private/tmp/macbridge-ci.XXXXXX)
+          /bin/mkdir -m 700 "$mb_ci_root/source" "$mb_ci_root/home" "$mb_ci_root/temp" "$mb_ci_root/cache" "$mb_ci_root/config" "$mb_ci_root/security" "$mb_ci_root/renders"
+          # Anonymous public fetch. No checkout action, credential helper,
+          # submodule, LFS, shared cache or job token is passed to the source.
+          /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+            /usr/bin/git -c init.templateDir= -c core.hooksPath=/dev/null init "$mb_ci_root/source"
+          /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+            /usr/bin/git -C "$mb_ci_root/source" -c credential.helper= -c core.hooksPath=/dev/null fetch --depth=1 https://github.com/benzi2512/MacBridge-Release.git "$MB_SOURCE_SHA"
+          test "$(/usr/bin/git -C "$mb_ci_root/source" rev-parse FETCH_HEAD)" = "$MB_SOURCE_SHA"
+          test "$(/usr/bin/git -C "$mb_ci_root/source" rev-parse 'FETCH_HEAD^{tree}')" = "$MB_SOURCE_TREE"
+          /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+            /usr/bin/git -C "$mb_ci_root/source" -c core.hooksPath=/dev/null checkout --detach "$MB_SOURCE_SHA"
+          # The VM, not a weakened sandbox on a personal Mac, is the outer
+          # isolation boundary. Real child commands keep MacBridge's sandbox.
+          # The clean environment prevents runner/job credentials from reaching
+          # compiler or tests. All provider transports use synthetic fixtures.
+          /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            CFFIXED_USER_HOME="$mb_ci_root/home" TMPDIR="$mb_ci_root/temp/" \
+            GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+            MB_CI_ROOT="$mb_ci_root" MB_SOURCE_SHA="$MB_SOURCE_SHA" \
+            MB_OBSERVER_RENDER_DIR="$mb_ci_root/renders" MB_OBSERVER_RENDER_OPAQUE=1 \
+            /usr/bin/python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, signal, subprocess, time
+
+          root = pathlib.Path(os.environ['MB_CI_ROOT']).resolve(strict=True)
+          assert root.parent == pathlib.Path('/private/tmp') and root.name.startswith('macbridge-ci.')
+          package = root / 'source/LocalMCP'
+          common = ['--package-path', str(package), '--cache-path', str(root / 'cache'),
+                    '--config-path', str(root / 'config'), '--security-path', str(root / 'security'),
+                    '--disable-netrc', '--disable-keychain', '--skip-update',
+                    '--disable-sandbox', '--disable-index-store', '--jobs', '2']
+          # disable-sandbox affects only SwiftPM's manifest wrapper. No security
+          # rule in MacBridge or on the user's computer is changed.
+          records = []
+          def run(label, argv, timeout, inspect_failure=False):
+              log = root / (label + '.log')
+              start = time.monotonic()
+              with log.open('xb') as output:
+                  process = subprocess.Popen(argv, cwd=root, stdout=output,
+                                             stderr=subprocess.STDOUT, start_new_session=True)
+                  reason = None
+                  while process.poll() is None:
+                      if time.monotonic() - start > timeout or log.stat().st_size > 32 * 1024 * 1024:
+                          reason = 'timeout_or_log_limit'
+                          os.killpg(process.pid, signal.SIGTERM)
+                          try:
+                              process.wait(timeout=5)
+                          except subprocess.TimeoutExpired:
+                              os.killpg(process.pid, signal.SIGKILL)
+                              process.wait(timeout=5)
+                          break
+                      time.sleep(0.25)
+              data = log.read_bytes()
+              text = data.decode('utf-8', errors='replace')
+              record = {'step': label, 'exit_code': process.returncode, 'failure': reason,
+                        'elapsed_seconds': round(time.monotonic() - start, 3),
+                        'log_sha256': hashlib.sha256(data).hexdigest(), 'log_bytes': len(data)}
+              records.append(record)
+              print('MB_CI_STEP ' + json.dumps(record), flush=True)
+              for line in text[-24000:].splitlines():
+                  print('MB_CI_LOG ' + line, flush=True)
+              if reason or (process.returncode != 0 and not inspect_failure):
+                  print('MB_CI_FAILURE ' + json.dumps({'source': os.environ['MB_SOURCE_SHA'], 'records': records}), flush=True)
+                  raise SystemExit(1)
+              return text
+
+          run('build', ['/usr/bin/xcrun', 'swift', 'build', '--build-tests'] + common, 600)
+          binary = package / '.build/debug/macbridge-mcp'
+          bundle = package / '.build/debug/MacBridgeLocalPackageTests.xctest'
+          assert binary.is_file() and os.access(binary, os.X_OK) and bundle.is_dir()
+          listing = run('list', ['/usr/bin/xcrun', 'swift', 'test'] + common + ['list', '--skip-build'], 60)
+          expected = set(re.findall(r'^(MacBridge(?:LocalCore|Observer)Tests\.[A-Za-z0-9_]+/[A-Za-z0-9_]+)$', listing, re.M))
+          assert len(expected) >= 576, 'Missing test discovery coverage'
+          # Do not filter out the process/security/streaming tests that failed
+          # under nested sandboxing on the personal machine.
+          tests = run('tests', ['/usr/bin/xcrun', 'xctest', str(bundle)], 360, inspect_failure=True)
+          terminal = re.findall(r"^Test Case '-\[([^ ]+) ([^\]]+)\]' (passed|failed|skipped) \(", tests, re.M)
+          actual = {owner + '/' + method: status for owner, method, status in terminal}
+          failures = [case for case, status in actual.items() if status == 'failed']
+          print('MB_CI_CASES ' + json.dumps({'expected': len(expected), 'executed': len(actual),
+              'failed': failures, 'skipped': [case for case, status in actual.items() if status == 'skipped']}), flush=True)
+          for line in tests.splitlines():
+              if ': error: -[' in line:
+                  print('MB_CI_ASSERTION ' + line[:6000], flush=True)
+          assert len(actual) == len(terminal) and set(actual) == expected, 'Test cases missing or duplicated'
+          allowed_skips = {
+              'MacBridgeObserverTests.CompactLiveHoverTests/testRealPointerKeepsLogoAndPreviewStable',
+              'MacBridgeObserverTests.ObserverFeedPerformanceTests/testRepeatedSurfaceReads',
+              'MacBridgeObserverTests.ObserverFeedSoakTests/testSustainedSnapshotChurnReleasesOldPayloadsAndKeepsScopesAccurate'
+          }
+          skipped = {case for case, status in actual.items() if status == 'skipped'}
+          assert skipped <= allowed_skips, 'Unexpected skip: actual runtime product may be unavailable'
+          assert records[-1]['exit_code'] == 0, 'Native test bundle failed'
+          assert all(status in ('passed', 'skipped') for status in actual.values())
+          print('MB_CI_ACCEPTANCE ' + json.dumps({
+              'source': os.environ['MB_SOURCE_SHA'], 'executed': len(actual),
+              'passed': sum(status == 'passed' for status in actual.values()), 'skipped': sorted(skipped),
+              'core_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
+              'personal_machine_used': False, 'production_credentials_supplied': False,
+              'native_pointer_or_energy_qualified': False, 'notarization_qualified': False
+          }), flush=True)
+          PY
