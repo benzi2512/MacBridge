@@ -25,18 +25,7 @@ public struct LocalSetupPlan: Sendable {
               !home.hasPrefix(root + "/"), root != "/" else {
             throw LocalMCPError.invalidConfiguration("choose a project folder, not an account home or whole disk")
         }
-        let executable = executableURL.path
-        guard executable.hasPrefix("/"),
-              executable.hasSuffix("/MacBridge.app/Contents/MacOS/macbridge-mcp"),
-              !executable.hasPrefix("/Volumes/"), !executable.contains("/AppTranslocation/"),
-              !executable.split(separator: "/").contains(where: { $0 == "." || $0 == ".." }) else {
-            throw LocalMCPError.invalidConfiguration("move MacBridge.app to a permanent Applications folder before setup")
-        }
-        let executableStatus = try lstatValue(executable)
-        guard executableStatus.st_mode & S_IFMT == S_IFREG, executableStatus.st_mode & 0o111 != 0,
-              try canonicalExistingPath(executable) == executable else {
-            throw LocalMCPError.invalidConfiguration("the bundled MacBridge core is missing or is a symlink")
-        }
+        let executable = try Self.validatedBundledExecutable(executableURL)
         homePath = home
         configurationPath = home + "/.config/macbridge/workspaces.json"
         observerDirectory = home + "/.config/macbridge/observer"
@@ -65,6 +54,12 @@ public struct LocalSetupPlan: Sendable {
     }
 
     public func createConfiguration() throws {
+        // The app may have moved while the owner reviewed the proposal. Reject
+        // a stale/missing core before creating even a configuration directory,
+        // so fixing its location leaves the original plan safely retryable.
+        // This validates the local path, not publisher identity or a signature;
+        // the client still owns the later decision to start the executable.
+        _ = try Self.validatedBundledExecutable(URL(fileURLWithPath: executablePath))
         // Revalidate selected scope immediately before any write. Existing
         // symlinks are never traversed by the destination directory walk.
         _ = try LocalWorkspaceRegistry(configuration: configuration)
@@ -113,6 +108,22 @@ public struct LocalSetupPlan: Sendable {
         guard fsync(bridgeFD) == 0 else {
             throw setupError("configuration was created, but directory sync failed; inspect it before continuing")
         }
+    }
+
+    private static func validatedBundledExecutable(_ url: URL) throws -> String {
+        let executable = url.path
+        guard executable.hasPrefix("/"),
+              executable.hasSuffix("/MacBridge.app/Contents/MacOS/macbridge-mcp"),
+              !executable.hasPrefix("/Volumes/"), !executable.contains("/AppTranslocation/"),
+              !executable.split(separator: "/").contains(where: { $0 == "." || $0 == ".." }) else {
+            throw LocalMCPError.invalidConfiguration("move MacBridge.app to a permanent Applications folder before setup")
+        }
+        let status = try lstatValue(executable)
+        guard status.st_mode & S_IFMT == S_IFREG, status.st_mode & 0o111 != 0,
+              try canonicalExistingPath(executable) == executable else {
+            throw LocalMCPError.invalidConfiguration("the bundled MacBridge core is missing, not executable or is a symlink")
+        }
+        return executable
     }
 
     private func childDirectory(_ name: String, parent: Int32, privateOnly: Bool) throws -> Int32 {

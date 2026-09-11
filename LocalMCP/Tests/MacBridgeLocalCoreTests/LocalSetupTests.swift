@@ -173,4 +173,54 @@ final class LocalSetupTests: XCTestCase {
         try FileManager.default.createSymbolicLink(at: executable, withDestinationURL: moved)
         XCTAssertThrowsError(try plan())
     }
+
+    func testCoreRemovedAfterReviewFailsBeforeProvisioning() throws {
+        let value = try plan()
+        try FileManager.default.removeItem(at: executable)
+        XCTAssertThrowsError(try value.createConfiguration())
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: home.path), [])
+    }
+
+    func testCoreChangedToSymlinkAfterReviewFailsBeforeProvisioning() throws {
+        let value = try plan()
+        let moved = executable.deletingLastPathComponent().appendingPathComponent("moved-fixture")
+        try FileManager.default.moveItem(at: executable, to: moved)
+        try FileManager.default.createSymbolicLink(at: executable, withDestinationURL: moved)
+        XCTAssertThrowsError(try value.createConfiguration())
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: home.path), [])
+        XCTAssertEqual(try String(contentsOf: moved, encoding: .utf8), "inert test fixture; never executed\n")
+    }
+
+    func testCoreLosingExecutablePermissionAfterReviewFailsBeforeProvisioning() throws {
+        let value = try plan()
+        XCTAssertEqual(chmod(executable.path, 0o600), 0)
+        XCTAssertThrowsError(try value.createConfiguration())
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: home.path), [])
+        var status = stat()
+        XCTAssertEqual(lstat(executable.path, &status), 0)
+        XCTAssertEqual(status.st_mode & 0o777, 0o600, "Setup must not silently grant execute permission")
+    }
+
+    func testCoreChangedToDirectoryAfterReviewFailsBeforeProvisioning() throws {
+        let value = try plan()
+        try FileManager.default.removeItem(at: executable)
+        try FileManager.default.createDirectory(at: executable, withIntermediateDirectories: false)
+        XCTAssertThrowsError(try value.createConfiguration())
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: home.path), [])
+    }
+
+    func testRestoredCoreCanRetryTheReviewedPlanWithoutLeftoverConfiguration() throws {
+        let value = try plan()
+        let moved = executable.deletingLastPathComponent().appendingPathComponent("restorable-fixture")
+        try FileManager.default.moveItem(at: executable, to: moved)
+        XCTAssertThrowsError(try value.createConfiguration())
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: home.path), [])
+        try FileManager.default.moveItem(at: moved, to: executable)
+        try value.createConfiguration()
+        let registry = try LocalWorkspaceRegistry(configurationURL: URL(fileURLWithPath: value.configurationPath))
+        XCTAssertEqual(registry.workspaces.count, 1)
+        XCTAssertEqual(registry.workspaces[0].rootURL.path, workspace.path)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: home.path + "/.config/macbridge").sorted(),
+                       ["observer", "workspaces.json"])
+    }
 }
