@@ -135,6 +135,15 @@ jobs:
           for line in tests.splitlines():
               if ': error: -[' in line:
                   print('MB_CI_ASSERTION ' + line[:6000], flush=True)
+          # Keep bounded multiline context, not only XCTest's first assertion
+          # line: compiler/linker diagnostics often follow on subsequent lines.
+          for case in failures[:8]:
+              owner, method = case.split('/', 1)
+              label = re.escape("Test Case '-[" + owner + ' ' + method + "]'")
+              block = re.search('^' + label + r' started\.\n(.*?)^' + label + r' failed', tests, re.M | re.S)
+              if block:
+                  for line in block.group(1)[-12000:].splitlines():
+                      print('MB_CI_FAILED_LOG ' + line, flush=True)
           assert len(actual) == len(terminal) and set(actual) == expected, 'Test cases missing or duplicated'
           allowed_skips = {
               'MacBridgeObserverTests.CompactLiveHoverTests/testRealPointerKeepsLogoAndPreviewStable',
