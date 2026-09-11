@@ -7,11 +7,18 @@ same owner's activity rather than operating a second execution engine.
 
 ## Current source
 
-This source contains 67 MCP tools, including 12 Brevo tools, a compact discovery
+This source contains 70 MCP tools, including 12 Brevo tools, a compact discovery
 index, high-level developer workflows, parent activity, process control, guarded
 file changes and bounded undo. See [LocalMCP](LocalMCP/README.md),
 [tool discovery](LocalMCP/TOOL-GUIDE.md), [Brevo](LocalMCP/BREVO-CAPABILITIES.md),
 [Observer](Observer/README.md) and the [security policy](SECURITY.md).
+
+The desktop tools can open an approved workspace folder in Finder, run a command
+with a short-lived network grant, or operate one explicitly approved application.
+These capabilities are **off by default** and do not grant themselves access.
+See [desktop access and its limits](LocalMCP/DESKTOP-ACCESS.md). The native
+observer uses system glass, a compact monochrome widget and retained task
+selection; it never changes a client's tool permissions.
 
 The implementation is Swift 6, targets macOS 13 or later and declares no external
 Swift package dependencies. It uses macOS system frameworks and the installed
