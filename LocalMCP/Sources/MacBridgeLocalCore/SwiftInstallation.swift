@@ -28,7 +28,7 @@ struct SwiftInstallation {
         frameworks: "/Library/Developer/CommandLineTools/Library/Developer/Frameworks")
 
     static func select(
-        executable: (String) -> Bool = { FileManager.default.isExecutableFile(atPath: $0) },
+        executable: (String) -> Bool = isTrustedSystemExecutable,
         exists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }
     ) -> SwiftInstallation {
         if executable(xcode.swift), executable(xcode.swiftc),

@@ -254,6 +254,22 @@ func lstatValue(_ path: String) throws -> stat {
     return value
 }
 
+/// Selection and launch must use the same trust rule. Merely being executable
+/// is not enough: an untrusted preferred tool must not hide a usable fallback.
+func isTrustedSystemExecutable(_ path: String) -> Bool {
+    guard let canonical = try? canonicalExistingPath(path),
+        let metadata = try? lstatValue(canonical)
+    else { return false }
+    return hasTrustedSystemExecutableMetadata(metadata, executable: access(path, X_OK) == 0)
+}
+
+func hasTrustedSystemExecutableMetadata(_ metadata: stat, executable: Bool) -> Bool {
+    metadata.st_mode & S_IFMT == S_IFREG
+        && metadata.st_uid == 0
+        && metadata.st_mode & 0o022 == 0
+        && executable
+}
+
 func posixMode(_ value: stat) -> Int {
     Int(value.st_mode & 0o7777)
 }

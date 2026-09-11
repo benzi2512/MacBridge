@@ -1082,13 +1082,7 @@ public final class LocalProcessService: @unchecked Sendable {
 
     private func allowedExecutable(_ id: String) throws -> AllowedExecutable {
         guard let path = executablePaths[id] else { throw LocalMCPError.unsupportedCommand }
-        let canonical = try canonicalExistingPath(path)
-        let status = try lstatValue(canonical)
-        guard status.st_mode & S_IFMT == S_IFREG,
-            status.st_uid == 0,
-            status.st_mode & 0o022 == 0,
-            access(path, X_OK) == 0
-        else { throw LocalMCPError.unsupportedCommand }
+        guard isTrustedSystemExecutable(path) else { throw LocalMCPError.unsupportedCommand }
         return AllowedExecutable(id: id, invocationPath: path)
     }
 
