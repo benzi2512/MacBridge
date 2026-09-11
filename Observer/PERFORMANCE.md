@@ -53,6 +53,19 @@ No owner socket, credentials, app window, filesystem fixture or live task is use
 The test reports timing samples and a result checksum; it does not impose a
 hardware-specific timing threshold or claim native frame-pacing acceptance.
 
+`ObserverFeedSoakTests`, enabled separately with `MB_OBSERVER_FEED_SOAK=1`,
+exercises 2,048 changed snapshots, 6,144 workspace-scope checks and 160 clock-only
+refreshes. It rotates 64 receipts, 16 jobs and 32 parents through current, busy,
+stale, disconnected and missing-job snapshots. Weak lifetime markers require
+every replaced payload and the final model to release; repeated unchanged-clock
+updates must not redraw the model. It reports its own test-process resident and
+physical-footprint samples after each 128 updates, without reading other
+processes or user files. Run it in release mode inside the same isolated harness.
+This is accelerated model churn, not a wall-clock endurance, compositor, total
+app memory or battery test. Retained allocator pages are not automatically leaks;
+reported footprints are evidence, while payload lifetime and scope checks are
+functional assertions.
+
 Before interpreting any improvement as whole-app efficiency, measure a signed
 release on the intended Mac with a controlled workload. Include idle/active,
 hidden/visible, Low Power Mode, memory after repeated updates, and native hover
