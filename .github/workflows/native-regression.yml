@@ -59,6 +59,23 @@ jobs:
 
           root = pathlib.Path(os.environ['MB_CI_ROOT']).resolve(strict=True)
           assert root.parent == pathlib.Path('/private/tmp') and root.name.startswith('macbridge-ci.')
+          # Read metadata only from the two supported, already-installed Apple
+          # toolchains. Diagnose allowlist rejection without weakening it or
+          # exposing the runner environment, credentials or arbitrary files.
+          for developer, compiler in [
+              ('/Applications/Xcode.app/Contents/Developer',
+               '/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swift'),
+              ('/Library/Developer/CommandLineTools',
+               '/Library/Developer/CommandLineTools/usr/bin/swift')
+          ]:
+              for candidate in (developer, compiler, compiler + 'c', developer + '/usr/bin/xctest'):
+                  entry = {'path': candidate, 'exists': os.path.exists(candidate)}
+                  if entry['exists']:
+                      metadata = os.stat(candidate)
+                      entry.update(canonical=os.path.realpath(candidate), uid=metadata.st_uid,
+                                   gid=metadata.st_gid, mode=oct(metadata.st_mode),
+                                   executable=os.access(candidate, os.X_OK))
+                  print('MB_CI_TOOLCHAIN ' + json.dumps(entry), flush=True)
           package = root / 'source/LocalMCP'
           common = ['--package-path', str(package), '--cache-path', str(root / 'cache'),
                     '--config-path', str(root / 'config'), '--security-path', str(root / 'security'),
