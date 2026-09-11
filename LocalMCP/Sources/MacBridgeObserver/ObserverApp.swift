@@ -58,6 +58,17 @@ final class ObserverModel: ObservableObject {
     private var rediscoverOwner = false
     private var contextNow = Date()
     private var nextContextExpiry: Date?
+    // Both the dashboard and compact surfaces read the same derived feed many
+    // times per update. Retain only All and one workspace, never a feed history.
+    // Health is part of the key because refresh updates it after the snapshot.
+    private struct CachedFeed {
+        let workspace: String
+        let connected: Bool
+        let stale: Bool
+        let value: ActivityFeed
+    }
+    private var allFeedCache: CachedFeed?
+    private var workspaceFeedCache: CachedFeed?
     // Internal synthetic transport seam; normal app initialization always uses
     // the private, peer-validated ObserverSocket exchange below.
     private let exchangeOverride: Exchange?
@@ -89,11 +100,17 @@ final class ObserverModel: ObservableObject {
         makeActivityFeed(workspace: "all")
     }
     private func makeActivityFeed(workspace: String) -> ActivityFeed {
-        ActivityFeed(history: allHistory, jobs: jobs, workItems: workItems,
-                     workspaces: snapshot["workspaces"] as? [[String: Any]] ?? [],
-                     workspace: workspace, connected: connected,
-                     stale: busy || snapshot["snapshot_stale"] as? Bool == true || snapshot["jobs"] == nil,
-                     now: contextNow)
+        let stale = busy || snapshot["snapshot_stale"] as? Bool == true || snapshot["jobs"] == nil
+        let cached = workspace == "all" ? allFeedCache : workspaceFeedCache
+        if let cached, cached.workspace == workspace, cached.connected == connected, cached.stale == stale {
+            return cached.value
+        }
+        let value = ActivityFeed(history: allHistory, jobs: jobs, workItems: workItems,
+            workspaces: snapshot["workspaces"] as? [[String: Any]] ?? [],
+            workspace: workspace, connected: connected, stale: stale, now: contextNow)
+        let entry = CachedFeed(workspace: workspace, connected: connected, stale: stale, value: value)
+        if workspace == "all" { allFeedCache = entry } else { workspaceFeedCache = entry }
+        return value
     }
 
     func selectGlobalActivity(_ id: String) {
@@ -255,23 +272,31 @@ final class ObserverModel: ObservableObject {
             next.removeValue(forKey: key)
         }
         let changed = !NSDictionary(dictionary: previous).isEqual(to: next)
-        let expired = nextContextExpiry.map { now >= $0 } ?? false
+        // A clock correction can move a retained timestamp into the future.
+        // Re-evaluate then as well as at the normal Recent boundary.
+        let expired = now < contextNow || (nextContextExpiry.map { now >= $0 } ?? false)
         if changed || expired {
             objectWillChange.send()
         }
         snapshot = result
         contextNow = now
         if changed || expired {
+            allFeedCache = nil
+            workspaceFeedCache = nil
             // Reuse the visible-window refresh cycle; publish once at a Recent
             // boundary, not on every clock tick. No new timer or history store.
             // Include hidden workspaces so switching scope cannot leave a
             // Recent row stuck after its deadline on clock-only snapshots.
-            let all = ActivityFeed(history: allHistory, jobs: jobs, workItems: workItems,
-                workspaces: snapshot["workspaces"] as? [[String: Any]] ?? [], workspace: "all",
-                connected: connected, stale: busy || snapshot["snapshot_stale"] as? Bool == true || snapshot["jobs"] == nil,
-                now: now)
+            let all = allActivityFeed
             nextContextExpiry = all.contextGroups
-                .map { Date(timeIntervalSince1970: $0.updatedMilliseconds / 1000 + ContextActivity.recentWindowSeconds) }
+                .flatMap { context -> [Date] in
+                    let updated = context.updatedMilliseconds / 1000
+                    guard updated.isFinite, updated > 0 else { return [] }
+                    // A future-dated receipt becomes Recent when the local
+                    // clock catches up; do not keep its cached Idle state.
+                    return [Date(timeIntervalSince1970: updated),
+                            Date(timeIntervalSince1970: updated + ContextActivity.recentWindowSeconds)]
+                }
                 .filter { $0 > now }.min()
         }
     }
