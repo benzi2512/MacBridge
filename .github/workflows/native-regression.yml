@@ -17,8 +17,8 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 20
     env:
-      MB_SOURCE_SHA: bdaf4dab4370987603140a21c947c7356697f789
-      MB_SOURCE_TREE: b3f838bfc4d0b79b45282b81e37655ac2c2eb3ca
+      MB_SOURCE_SHA: b64cefce7de37ee70603998faaee844492080b51
+      MB_SOURCE_TREE: 58cd16d8ebae6d6d01fc500e8cf63446cdcadfd3
     steps:
       - name: Qualify reviewed source in a disposable GitHub Mac
         shell: bash
@@ -68,7 +68,8 @@ jobs:
               ('/Library/Developer/CommandLineTools',
                '/Library/Developer/CommandLineTools/usr/bin/swift')
           ]:
-              for candidate in (developer, compiler, compiler + 'c', developer + '/usr/bin/xctest'):
+              for candidate in (developer, compiler, compiler + 'c', developer + '/usr/bin/xctest',
+                                developer + '/Library/Developer/Frameworks/XCTest.framework'):
                   entry = {'path': candidate, 'exists': os.path.exists(candidate)}
                   if entry['exists']:
                       metadata = os.stat(candidate)
@@ -122,7 +123,7 @@ jobs:
           assert binary.is_file() and os.access(binary, os.X_OK) and bundle.is_dir()
           listing = run('list', ['/usr/bin/xcrun', 'swift', 'test'] + common + ['list', '--skip-build'], 60)
           expected = set(re.findall(r'^(MacBridge(?:LocalCore|Observer)Tests\.[A-Za-z0-9_]+/[A-Za-z0-9_]+)$', listing, re.M))
-          assert len(expected) >= 576, 'Missing test discovery coverage'
+          assert len(expected) >= 616, 'Missing test discovery coverage'
           # Do not filter out the process/security/streaming tests that failed
           # under nested sandboxing on the personal machine.
           tests = run('tests', ['/usr/bin/xcrun', 'xctest', str(bundle)], 360, inspect_failure=True)
