@@ -15,9 +15,10 @@ source with your existing toolchain under your own software-security policy.
 
 1. Move **MacBridge.app** to a permanent Applications folder in Finder. Do not
    configure it from the mounted image or from a temporary/translocated path.
-2. Open MacBridge. It appears in the menu bar; opening the UI does not start a
-   core, tunnel, login service or network listener.
-3. In the MacBridge menu, choose **Set Up Local Connection…**.
+2. Open MacBridge. On a new account, setup opens automatically. Opening the UI
+   does not start a core, tunnel, login service or network listener. An existing
+   configuration or explicit observer connection keeps its normal startup.
+3. To reopen setup later, choose **Set Up Local Connection…** in the MacBridge menu.
 4. Choose one existing project folder. Review it, then click **Create local
    configuration**. Setup creates a private workspace registry and observer
    directory under your own `.config/macbridge`; it will not overwrite an
@@ -29,6 +30,14 @@ source with your existing toolchain under your own software-security policy.
 6. Start that connection in the client. Check `bridge_capabilities` and
    `workspace_overview` with read-only calls. The observer should then show the
    same owner. A working local connection is not proof of ChatGPT web access.
+
+If you close the app before finishing the client connection, reopen **Set Up
+Local Connection…** to copy the settings again. Setup validates the existing
+private registry and uses the app's current bundled executable. It preserves
+all configured workspaces and grants without recreating the registry or starting
+another core. Malformed or unsafe existing state is shown as an error, never
+silently replaced. The displayed `mcpServers` JSON is a local-client example;
+use your client's documented configuration format.
 
 The menu and dashboard also offer **Choose connection** for an existing owner.
 Do not run two clients against the same observer directory. They need separate

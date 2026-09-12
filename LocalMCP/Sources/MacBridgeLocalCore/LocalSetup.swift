@@ -1,6 +1,14 @@
 import Darwin
 import Foundation
 
+/// Read-only instructions for a registry the owner already created. The JSON
+/// refers to that registry; it never copies its workspaces, grants or secrets.
+public struct ExistingLocalSetup: Sendable {
+    public let configurationPath: String
+    public let workspaceCount: Int
+    public let clientConfiguration: String
+}
+
 /// Explicit, on-device first-run provisioning. This is not an MCP action and
 /// never starts a process, installs a service, reads credentials or overwrites
 /// a registry. A client still needs its own reviewed connection configuration.
@@ -44,13 +52,94 @@ public struct LocalSetupPlan: Sendable {
 
     public var clientConfiguration: String {
         get throws {
-            let value: [String: Any] = ["mcpServers": ["MacBridge": [
-                "command": executablePath,
-                "args": ["--config", configurationPath, "--observer-directory", observerDirectory]
-            ]]]
-            let data = try JSONSerialization.data(withJSONObject: value, options: [.prettyPrinted, .sortedKeys])
-            return String(decoding: data, as: UTF8.self)
+            try Self.clientConfiguration(executable: executablePath,
+                configuration: configurationPath, observer: observerDirectory)
         }
+    }
+
+    /// Reopen setup after a restart without provisioning anything. Every read
+    /// stays beneath owned directory descriptors, including the final leaf.
+    /// Only an absent registry returns nil; unsafe existing state is an error.
+    public static func existingConfiguration(executableURL: URL,
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) throws -> ExistingLocalSetup? {
+        let home = try canonicalExistingPath(homeDirectory.path)
+        let homeFD = open(home, O_RDONLY | O_DIRECTORY | O_NOFOLLOW_ANY | O_CLOEXEC)
+        guard homeFD >= 0 else { throw LocalMCPError.invalidConfiguration("cannot open the owned home directory") }
+        defer { close(homeFD) }
+        try validateDirectory(homeFD, privateOnly: false)
+
+        func existingDirectory(_ name: String, parent: Int32, privateOnly: Bool) throws -> Int32? {
+            let descriptor = openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            if descriptor < 0, errno == ENOENT { return nil }
+            guard descriptor >= 0 else {
+                throw LocalMCPError.invalidConfiguration("existing setup contains an inaccessible or symlink directory")
+            }
+            do { try validateDirectory(descriptor, privateOnly: privateOnly) }
+            catch { close(descriptor); throw error }
+            return descriptor
+        }
+
+        guard let configFD = try existingDirectory(".config", parent: homeFD, privateOnly: false) else { return nil }
+        defer { close(configFD) }
+        guard let bridgeFD = try existingDirectory("macbridge", parent: configFD, privateOnly: true) else { return nil }
+        defer { close(bridgeFD) }
+        let fileFD = openat(bridgeFD, "workspaces.json", O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        if fileFD < 0, errno == ENOENT { return nil }
+        guard fileFD >= 0 else {
+            throw LocalMCPError.invalidConfiguration("existing workspace configuration cannot be opened safely")
+        }
+        defer { close(fileFD) }
+        var before = stat()
+        guard fstat(fileFD, &before) == 0, before.st_mode & S_IFMT == S_IFREG,
+              before.st_uid == getuid(), before.st_nlink == 1, before.st_mode & 0o077 == 0 else {
+            throw LocalMCPError.invalidConfiguration("existing workspace configuration must be a private, owned regular file")
+        }
+        let data = try LocalFileReader.read(descriptor: fileFD, maximumBytes: 1_048_576)
+        var current = stat()
+        guard fstatat(bridgeFD, "workspaces.json", &current, AT_SYMLINK_NOFOLLOW) == 0,
+              before.st_dev == current.st_dev, before.st_ino == current.st_ino,
+              before.st_mode == current.st_mode, before.st_nlink == current.st_nlink,
+              before.st_size == current.st_size,
+              before.st_mtimespec.tv_sec == current.st_mtimespec.tv_sec,
+              before.st_mtimespec.tv_nsec == current.st_mtimespec.tv_nsec,
+              before.st_ctimespec.tv_sec == current.st_ctimespec.tv_sec,
+              before.st_ctimespec.tv_nsec == current.st_ctimespec.tv_nsec else {
+            throw LocalMCPError.conflict("workspace configuration changed while reading")
+        }
+        let configuration = try JSONDecoder().decode(LocalWorkspaceConfiguration.self, from: data)
+        _ = try LocalWorkspaceRegistry(configuration: configuration)
+        guard let observerFD = try existingDirectory("observer", parent: bridgeFD, privateOnly: true) else {
+            throw LocalMCPError.invalidConfiguration("existing setup is missing its observer directory; inspect your connection before continuing")
+        }
+        defer { close(observerFD) }
+        // Reject a renamed/replaced ancestor rather than returning instructions
+        // for a different path than the one whose configuration was inspected.
+        for (descriptor, path) in [(homeFD, home), (configFD, home + "/.config"),
+            (bridgeFD, home + "/.config/macbridge"), (observerFD, home + "/.config/macbridge/observer")] {
+            var held = stat()
+            var named = stat()
+            guard fstat(descriptor, &held) == 0, lstat(path, &named) == 0,
+                  named.st_mode & S_IFMT == S_IFDIR, held.st_dev == named.st_dev,
+                  held.st_ino == named.st_ino, held.st_mode == named.st_mode, held.st_uid == named.st_uid else {
+                throw LocalMCPError.conflict("setup directory changed while reading")
+            }
+        }
+        let executable = try validatedBundledExecutable(executableURL)
+        let path = home + "/.config/macbridge/workspaces.json"
+        let observer = home + "/.config/macbridge/observer"
+        guard (observer + "/observer.sock").utf8.count <= 103 else {
+            throw LocalMCPError.invalidConfiguration("default observer path is too long; use an explicitly configured short private directory")
+        }
+        return ExistingLocalSetup(configurationPath: path, workspaceCount: configuration.workspaces.count,
+            clientConfiguration: try clientConfiguration(executable: executable, configuration: path, observer: observer))
+    }
+
+    private static func clientConfiguration(executable: String, configuration: String, observer: String) throws -> String {
+        let value: [String: Any] = ["mcpServers": ["MacBridge": [
+            "command": executable, "args": ["--config", configuration, "--observer-directory", observer]
+        ]]]
+        let data = try JSONSerialization.data(withJSONObject: value, options: [.prettyPrinted, .sortedKeys])
+        return String(decoding: data, as: UTF8.self)
     }
 
     public func createConfiguration() throws {
@@ -66,7 +155,7 @@ public struct LocalSetupPlan: Sendable {
         let homeFD = open(homePath, O_RDONLY | O_DIRECTORY | O_NOFOLLOW_ANY | O_CLOEXEC)
         guard homeFD >= 0 else { throw setupError("cannot open the owned home directory") }
         defer { close(homeFD) }
-        try validateDirectory(homeFD, privateOnly: false)
+        try Self.validateDirectory(homeFD, privateOnly: false)
         let configFD = try childDirectory(".config", parent: homeFD, privateOnly: false)
         defer { close(configFD) }
         let bridgeFD = try childDirectory("macbridge", parent: configFD, privateOnly: true)
@@ -132,16 +221,16 @@ public struct LocalSetupPlan: Sendable {
         }
         let descriptor = openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         guard descriptor >= 0 else { throw setupError("refusing a missing, symlink or inaccessible configuration directory") }
-        do { try validateDirectory(descriptor, privateOnly: privateOnly) }
+        do { try Self.validateDirectory(descriptor, privateOnly: privateOnly) }
         catch { close(descriptor); throw error }
         return descriptor
     }
 
-    private func validateDirectory(_ descriptor: Int32, privateOnly: Bool) throws {
+    private static func validateDirectory(_ descriptor: Int32, privateOnly: Bool) throws {
         var value = stat()
         guard fstat(descriptor, &value) == 0, value.st_mode & S_IFMT == S_IFDIR,
               value.st_uid == getuid(), value.st_mode & (privateOnly ? 0o077 : 0o022) == 0 else {
-            throw setupError("existing configuration directories have unexpected ownership or permissions; setup will not change them")
+            throw LocalMCPError.invalidConfiguration("existing configuration directories have unexpected ownership or permissions; setup will not change them")
         }
     }
 

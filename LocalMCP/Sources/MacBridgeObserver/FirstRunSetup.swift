@@ -6,19 +6,58 @@ import MacBridgeLocalCore
 final class FirstRunSetupModel: ObservableObject {
     @Published private(set) var plan: LocalSetupPlan?
     @Published private(set) var created = false
+    @Published private(set) var existing: ExistingLocalSetup?
+    @Published private(set) var recoveryFailed = false
     @Published private(set) var notice = ""
     @Published private(set) var clientConfiguration = ""
     private let executableURL: URL
+    private let homeDirectory: URL
     private let onConfigured: (String) -> Void
+    private let copyToClipboard: (String) -> Void
+
+    var configured: Bool { created || existing != nil }
 
     init(executableURL: URL = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/macbridge-mcp"),
+         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
+         copyToClipboard: @escaping (String) -> Void = { text in
+             NSPasteboard.general.clearContents()
+             NSPasteboard.general.setString(text, forType: .string)
+         },
          onConfigured: @escaping (String) -> Void) {
         self.executableURL = executableURL
+        self.homeDirectory = homeDirectory
         self.onConfigured = onConfigured
+        self.copyToClipboard = copyToClipboard
+        reloadExistingConfiguration()
+    }
+
+    func reloadExistingConfiguration() {
+        guard !created || recoveryFailed else { return }
+        do {
+            let recovered = try LocalSetupPlan.existingConfiguration(executableURL: executableURL, homeDirectory: homeDirectory)
+            guard recovered != nil || !configured else {
+                throw LocalMCPError.invalidConfiguration("workspace configuration is missing")
+            }
+            existing = recovered
+            recoveryFailed = false
+            if let existing {
+                plan = nil
+                clientConfiguration = existing.clientConfiguration
+                notice = "Your existing configuration is ready. Copy its connection settings into your local MCP client. No files or permissions were changed."
+            } else if plan == nil {
+                clientConfiguration = ""
+                notice = ""
+            }
+        } catch {
+            existing = nil
+            recoveryFailed = true
+            clientConfiguration = ""
+            notice = "Existing setup needs attention: \(error). No files were changed."
+        }
     }
 
     func chooseWorkspace() {
-        guard !created else { return }
+        guard !configured, !recoveryFailed else { return }
         let panel = NSOpenPanel()
         panel.title = "Choose a project folder"
         panel.message = "Only this folder will be registered. Credentials, browser profiles and system protections remain excluded. Nothing changes until you click Create local configuration."
@@ -27,7 +66,8 @@ final class FirstRunSetupModel: ObservableObject {
         panel.allowsMultipleSelection = false
         guard panel.runModal() == .OK, let selected = panel.url else { return }
         do {
-            let proposal = try LocalSetupPlan(workspaceURL: selected, executableURL: executableURL)
+            let proposal = try LocalSetupPlan(workspaceURL: selected, executableURL: executableURL,
+                                              homeDirectory: homeDirectory)
             clientConfiguration = try proposal.clientConfiguration
             plan = proposal
             notice = "Review the selected folder before creating your local configuration."
@@ -39,7 +79,7 @@ final class FirstRunSetupModel: ObservableObject {
     }
 
     func createConfiguration() {
-        guard !created, let plan else { return }
+        guard !configured, !recoveryFailed, let plan else { return }
         do {
             try plan.createConfiguration()
             created = true
@@ -53,10 +93,24 @@ final class FirstRunSetupModel: ObservableObject {
     }
 
     func copyClientConfiguration() {
-        guard created, !clientConfiguration.isEmpty else { return }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(clientConfiguration, forType: .string)
-        notice = "Copied local MCP configuration. It contains your local paths, but no credentials."
+        guard configured else { return }
+        do {
+            // The app or registry may have moved since this window was shown.
+            // Copy only freshly validated instructions; leave the clipboard
+            // alone on failure and never attach/start a second owner here.
+            guard let current = try LocalSetupPlan.existingConfiguration(executableURL: executableURL,
+                homeDirectory: homeDirectory) else {
+                throw LocalMCPError.invalidConfiguration("workspace configuration is missing")
+            }
+            existing = current
+            clientConfiguration = current.clientConfiguration
+            copyToClipboard(clientConfiguration)
+            notice = "Copied local MCP configuration. It contains your local paths, but no credentials."
+        } catch {
+            recoveryFailed = true
+            clientConfiguration = ""
+            notice = "Cannot copy connection settings: \(error). No files were changed."
+        }
     }
 }
 
@@ -72,7 +126,18 @@ struct FirstRunSetupView: View {
                 Text("No account, workspace, token or service is copied from another installation. Existing configuration is never overwritten.")
                     .font(.callout).foregroundStyle(.secondary)
                 Button(model.plan == nil ? "Choose project folder…" : "Choose another folder…", action: model.chooseWorkspace)
-                    .disabled(model.created)
+                    .disabled(model.configured || model.recoveryFailed)
+                if let existing = model.existing {
+                    GroupBox("Existing workspace configuration") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("\(existing.workspaceCount) configured workspace(s)")
+                            Text(existing.configurationPath)
+                                .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                            Text("Your existing workspace access and grants are preserved. These settings connect to that registry; they do not create a new one.")
+                                .font(.callout).foregroundStyle(.secondary)
+                        }.frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
                 if let plan = model.plan {
                     GroupBox("Folder access") {
                         VStack(alignment: .leading, spacing: 8) {
@@ -92,13 +157,16 @@ struct FirstRunSetupView: View {
                 if !model.notice.isEmpty {
                     Text(model.notice).font(.callout).textSelection(.enabled)
                 }
-                if model.created {
+                if model.configured && !model.clientConfiguration.isEmpty {
                     GroupBox("Local MCP client configuration") {
                         Text(model.clientConfiguration)
                             .font(.system(.caption, design: .monospaced))
                             .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
                     }
                     Button("Copy client configuration", action: model.copyClientConfiguration)
+                }
+                if model.recoveryFailed {
+                    Button("Check existing setup again", action: model.reloadExistingConfiguration)
                 }
                 Divider()
                 Text("Normal Chat needs a separate, approved tunnel connection for this owner's account. This setup does not register a cloud app, repair a disabled chat, or start a background service.")
@@ -121,6 +189,7 @@ final class FirstRunSetupWindowController: NSObject, NSWindowDelegate {
     }
 
     func show() {
+        model.reloadExistingConfiguration()
         if window == nil {
             let created = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 590, height: 610),
                 styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)

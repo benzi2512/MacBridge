@@ -54,6 +54,11 @@ observer directory. It produces a local-client configuration without starting
 a core, modifying an existing registry, or creating a ChatGPT tunnel. See the
 [first-run guide](Release/FIRST-RUN.md).
 
+Setup opens automatically on a new account. After restarting the app, the same
+setup window can recover and copy connection instructions for an existing,
+validated private registry. It preserves that registry's workspace scopes and
+grants; it does not replace configuration or start another runtime.
+
 Every recipient needs their own workspace configuration, credentials and host
 connection. Do not copy an existing user's runtime directory, workspace registry,
 browser session, connection token or credential file into an app or installer.

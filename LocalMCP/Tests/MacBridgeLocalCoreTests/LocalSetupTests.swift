@@ -223,4 +223,120 @@ final class LocalSetupTests: XCTestCase {
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: home.path + "/.config/macbridge").sorted(),
                        ["observer", "workspaces.json"])
     }
+
+    private func existing() throws -> ExistingLocalSetup? {
+        try LocalSetupPlan.existingConfiguration(executableURL: executable, homeDirectory: home)
+    }
+
+    func testMissingSetupRecoveryDoesNotProvisionAnyDirectory() throws {
+        XCTAssertNil(try existing())
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: home.path), [])
+    }
+
+    func testReopenedSetupRecoversTheSameClientArgumentsWithoutStartingOwner() throws {
+        let proposal = try plan()
+        try proposal.createConfiguration()
+        let before = try Data(contentsOf: URL(fileURLWithPath: proposal.configurationPath))
+        let recovered = try XCTUnwrap(existing())
+        XCTAssertEqual(recovered.clientConfiguration, try proposal.clientConfiguration)
+        XCTAssertEqual(recovered.workspaceCount, 1)
+        XCTAssertEqual(recovered.configurationPath, proposal.configurationPath)
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: proposal.configurationPath)), before)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: proposal.observerDirectory), [])
+    }
+
+    func testRecoveryPreservesMultipleWorkspacesAndExistingGrants() throws {
+        let proposal = try plan()
+        try proposal.createConfiguration()
+        let second = root.appendingPathComponent("project unicode å")
+        try FileManager.default.createDirectory(at: second, withIntermediateDirectories: false)
+        let first = proposal.configuration.workspaces[0]
+        let configuration = LocalWorkspaceConfiguration(workspaces: [
+            .init(id: first.id, name: first.name, path: first.path, allowDesktopOpen: true),
+            .init(id: UUID().uuidString, name: "Second", path: second.path)
+        ])
+        let bytes = try JSONEncoder().encode(configuration)
+        let url = URL(fileURLWithPath: proposal.configurationPath)
+        try bytes.write(to: url)
+        XCTAssertEqual(chmod(url.path, 0o600), 0)
+        XCTAssertEqual(try existing()?.workspaceCount, 2)
+        XCTAssertEqual(try Data(contentsOf: url), bytes)
+        XCTAssertFalse(try XCTUnwrap(existing()).clientConfiguration.contains("allow_desktop_open"))
+    }
+
+    func testRecoveryRejectsSymlinkAncestorAndLeafWithoutFollowingThem() throws {
+        let proposal = try plan()
+        try proposal.createConfiguration()
+        let configuration = URL(fileURLWithPath: proposal.configurationPath)
+        let moved = root.appendingPathComponent("saved-registry")
+        try FileManager.default.moveItem(at: configuration, to: moved)
+        try FileManager.default.createSymbolicLink(at: configuration, withDestinationURL: moved)
+        XCTAssertThrowsError(try existing())
+        try FileManager.default.removeItem(at: configuration)
+        try FileManager.default.moveItem(at: moved, to: configuration)
+        let bridge = home.appendingPathComponent(".config/macbridge")
+        let movedBridge = root.appendingPathComponent("saved-bridge")
+        try FileManager.default.moveItem(at: bridge, to: movedBridge)
+        try FileManager.default.createSymbolicLink(at: bridge, withDestinationURL: movedBridge)
+        XCTAssertThrowsError(try existing())
+    }
+
+    func testRecoveryRejectsHardlinkAndFIFOBeforeReading() throws {
+        let proposal = try plan()
+        try proposal.createConfiguration()
+        let url = URL(fileURLWithPath: proposal.configurationPath)
+        let alias = root.appendingPathComponent("registry-hardlink")
+        XCTAssertEqual(link(url.path, alias.path), 0)
+        XCTAssertThrowsError(try existing())
+        try FileManager.default.removeItem(at: alias)
+        try FileManager.default.removeItem(at: url)
+        XCTAssertEqual(mkfifo(url.path, 0o600), 0)
+        let began = Date()
+        XCTAssertThrowsError(try existing())
+        XCTAssertLessThan(Date().timeIntervalSince(began), 1, "Special files must not block setup")
+    }
+
+    func testRecoveryRejectsNonPrivateRegistryAndPreservesItsPermissions() throws {
+        let proposal = try plan()
+        try proposal.createConfiguration()
+        XCTAssertEqual(chmod(proposal.configurationPath, 0o644), 0)
+        XCTAssertThrowsError(try existing())
+        var status = stat()
+        XCTAssertEqual(lstat(proposal.configurationPath, &status), 0)
+        XCTAssertEqual(status.st_mode & 0o777, 0o644)
+    }
+
+    func testRecoveryRejectsMalformedAndOversizedRegistryWithoutChanges() throws {
+        let proposal = try plan()
+        try proposal.createConfiguration()
+        let url = URL(fileURLWithPath: proposal.configurationPath)
+        for bytes in [Data("not a registry".utf8), Data(repeating: 65, count: 1_048_577)] {
+            try bytes.write(to: url)
+            XCTAssertEqual(chmod(url.path, 0o600), 0)
+            XCTAssertThrowsError(try existing())
+            XCTAssertEqual(try Data(contentsOf: url), bytes)
+        }
+    }
+
+    func testRecoveryDoesNotRecreateMissingObserverOrTrustItsSymlink() throws {
+        let proposal = try plan()
+        try proposal.createConfiguration()
+        let observer = URL(fileURLWithPath: proposal.observerDirectory)
+        try FileManager.default.removeItem(at: observer)
+        XCTAssertThrowsError(try existing())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: observer.path))
+        try FileManager.default.createSymbolicLink(at: observer, withDestinationURL: workspace)
+        XCTAssertThrowsError(try existing())
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: workspace.path), [])
+    }
+
+    func testRecoveryRefusesRemovedExecutableAndKeepsTheRegistry() throws {
+        let proposal = try plan()
+        try proposal.createConfiguration()
+        let url = URL(fileURLWithPath: proposal.configurationPath)
+        let before = try Data(contentsOf: url)
+        try FileManager.default.removeItem(at: executable)
+        XCTAssertThrowsError(try existing())
+        XCTAssertEqual(try Data(contentsOf: url), before)
+    }
 }

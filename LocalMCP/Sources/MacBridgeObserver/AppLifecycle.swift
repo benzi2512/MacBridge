@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import Darwin
 import SwiftUI
 
 @MainActor
@@ -324,6 +325,23 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 }
 
 enum ObserverLaunchConnection {
+    static func shouldShowSetup(arguments: [String],
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) -> Bool {
+        if arguments.contains("--setup") { return true }
+        guard !arguments.contains("--observer-directory"), !arguments.contains("--dashboard") else { return false }
+        let directory = homeDirectory.appendingPathComponent(".config/macbridge", isDirectory: true)
+        // Read only existence metadata. A registry (even malformed) or an
+        // existing owner must not trigger a replacement setup at login. lstat
+        // also preserves dangling symlinks; setup never treats them as absent.
+        for component in ["workspaces.json", "observer/observer-owner.json", "observer/observer.sock"] {
+            var status = stat()
+            if lstat(directory.appendingPathComponent(component).path, &status) == 0 || errno != ENOENT {
+                return false
+            }
+        }
+        return true
+    }
+
     static func defaultObserverDirectory(
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
     ) -> String {
@@ -379,7 +397,7 @@ final class MacBridgeLifecycle: NSObject, NSApplicationDelegate {
         }.store(in: &lifecycleSubscriptions)
         if args.contains("--show-widget") { preferences.showFloatingTab = true }
         if args.contains("--dashboard") { dashboard.show() }
-        if args.contains("--setup") { setup.show() }
+        if ObserverLaunchConnection.shouldShowSetup(arguments: args) { setup.show() }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
