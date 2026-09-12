@@ -559,6 +559,28 @@ public final class LocalProcessService: @unchecked Sendable {
         maximumOutputBytes: Int,
         readOnlyGit: Bool = false
     ) throws -> @Sendable () -> JSONObject {
+        try prepareIdentifiedCommandRun(
+            workspaceID: workspaceID, executableID: executableID,
+            arguments: arguments, cwd: cwd,
+            timeoutMilliseconds: timeoutMilliseconds,
+            maximumOutputBytes: maximumOutputBytes,
+            readOnlyGit: readOnlyGit
+        ).finish
+    }
+
+    /// Return the exact identity allocated by this launch together with its
+    /// one-shot completion. Callers must not infer ownership from process-list
+    /// differences because unrelated read-only inspections may launch between
+    /// snapshots on the shared Web runtime.
+    func prepareIdentifiedCommandRun(
+        workspaceID: String,
+        executableID: String,
+        arguments: [String],
+        cwd: String,
+        timeoutMilliseconds: Int,
+        maximumOutputBytes: Int,
+        readOnlyGit: Bool = false
+    ) throws -> (taskID: String, finish: @Sendable () -> JSONObject) {
         let command = try startCommandInternal(
             workspaceID: workspaceID,
             executableID: executableID,
@@ -569,7 +591,7 @@ public final class LocalProcessService: @unchecked Sendable {
             readOnlyGit: readOnlyGit
         )
         let admittedAt = ProcessInfo.processInfo.systemUptime
-        return { [self, command] in
+        let finish: @Sendable () -> JSONObject = { [self, command] in
             // Worker scheduling time must not extend the command's timeout.
             let elapsed = Int((ProcessInfo.processInfo.systemUptime - admittedAt) * 1000)
             let snapshot = command.wait(timeoutMilliseconds: max(0, timeoutMilliseconds - elapsed))
@@ -577,6 +599,7 @@ public final class LocalProcessService: @unchecked Sendable {
             forget(command, releaseSynchronousResponse: true)
             return result
         }
+        return (command.taskID, finish)
     }
 
     public func startCommand(

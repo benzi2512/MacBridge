@@ -147,26 +147,54 @@ final class MonochromeBadgeTests: XCTestCase {
     @MainActor
     func testVisibleBrandAndCountStayInsideGlassThroughoutMorph() throws {
         let summary = model(running: 100).compactSummary
-        let renderer = ImageRenderer(content: CompactBrandBadge(summary: summary, showCount: true)
-            .environment(\.colorScheme, .dark))
-        renderer.scale = 3
-        let bitmap = NSBitmapImageRep(cgImage: try XCTUnwrap(renderer.cgImage))
-        let canvas = CGRect(x: 0, y: 0, width: MBMetrics.edgeRailWidth, height: MBMetrics.edgeRailHeight)
-        let origin = CGPoint(x: canvas.maxX - EdgeLayout.logoInset - MBMetrics.edgeBrandWidth / 2,
-                             y: canvas.midY - EdgeLayout.railLogoOffset - MBMetrics.edgeBrandHeight / 2)
-        for progress: CGFloat in [0, 0.25, 0.5, 0.75, 1] {
-            let silhouette = AnchoredOrganicEdgeShape(expansion: progress).path(in: canvas)
-            var outside = 0
-            for x in 0..<bitmap.pixelsWide {
-                for y in 0..<bitmap.pixelsHigh {
-                    let color = try XCTUnwrap(bitmap.colorAt(x: x, y: y))
-                    guard color.alphaComponent > 0.04 else { continue }
-                    let point = CGPoint(x: origin.x + (CGFloat(x) + 0.5) / 3,
-                                        y: origin.y + (CGFloat(y) + 0.5) / 3)
-                    if !silhouette.contains(point) { outside += 1 }
+        let visibleFrame = CGRect(x: 0, y: 0, width: 1512, height: 982)
+        let visualInset = EdgeLayout.logoInset - EdgeLayout.brandVisualInset
+        for edge in FloatingDockEdge.allCases {
+            let renderer = ImageRenderer(content: CompactBrandBadge(
+                summary: summary, showCount: true, horizontal: edge == .bottom
+            ).environment(\.colorScheme, .dark))
+            renderer.scale = 3
+            let bitmap = NSBitmapImageRep(cgImage: try XCTUnwrap(renderer.cgImage))
+            let canvas = CGRect(origin: .zero,
+                size: FloatingDockLayout.size(for: .rail, visibleFrame: visibleFrame, edge: edge))
+            for direction in [FloatingRailDirection.forward, .reverse] {
+                let logo = edge == .right
+                    ? CGPoint(x: canvas.maxX - EdgeLayout.logoInset,
+                              y: canvas.midY - direction.sign * EdgeLayout.railLogoOffset)
+                    : CGPoint(x: canvas.midX - direction.sign * EdgeLayout.railLogoOffset,
+                              y: canvas.maxY - EdgeLayout.logoInset)
+                let origin = edge == .right
+                    ? CGPoint(x: logo.x + visualInset - MBMetrics.edgeBrandWidth / 2,
+                              y: logo.y + direction.sign * EdgeLayout.brandVisualAlongOffset
+                                - MBMetrics.edgeBrandHeight / 2)
+                    : CGPoint(x: logo.x + direction.sign * EdgeLayout.brandVisualAlongOffset - 19,
+                              y: logo.y + visualInset - 14)
+                let clickTarget = CGRect(x: logo.x - MBMetrics.edgeTargetSize / 2,
+                                         y: logo.y - MBMetrics.edgeTargetSize / 2,
+                                         width: MBMetrics.edgeTargetSize,
+                                         height: MBMetrics.edgeTargetSize)
+                for progress: CGFloat in [0, 0.25, 0.5, 0.75, 1] {
+                    let silhouette = DockedOrganicEdgeShape(
+                        edge: edge, expansion: progress, direction: direction
+                    ).path(in: canvas)
+                    var outsideGlass = 0
+                    var outsideClickTarget = 0
+                    for x in 0..<bitmap.pixelsWide {
+                        for y in 0..<bitmap.pixelsHigh {
+                            let color = try XCTUnwrap(bitmap.colorAt(x: x, y: y))
+                            guard color.alphaComponent > 0.04 else { continue }
+                            let point = CGPoint(x: origin.x + (CGFloat(x) + 0.5) / 3,
+                                                y: origin.y + (CGFloat(y) + 0.5) / 3)
+                            if !silhouette.contains(point) { outsideGlass += 1 }
+                            if !clickTarget.contains(point) { outsideClickTarget += 1 }
+                        }
+                    }
+                    XCTAssertEqual(outsideGlass, 0,
+                                   "\(edge)/\(direction): brand paint must remain on glass at \(progress)")
+                    XCTAssertEqual(outsideClickTarget, 0,
+                                   "\(edge)/\(direction): brand paint must remain in its 44-point target")
                 }
             }
-            XCTAssertEqual(outside, 0, "Visible logo/count must not cross the glass shoulder at \(progress)")
         }
     }
 

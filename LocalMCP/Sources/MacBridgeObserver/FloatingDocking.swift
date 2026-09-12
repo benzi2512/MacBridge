@@ -6,6 +6,18 @@ enum FloatingDockEdge: String, Codable, CaseIterable, Sendable {
     var label: String { rawValue.capitalized }
 }
 
+enum FloatingRailDirection: CGFloat, Equatable, Sendable {
+    case reverse = -1
+    case forward = 1
+    var sign: CGFloat { rawValue }
+}
+
+struct FloatingDockPlacement: Equatable, Sendable {
+    let frame: CGRect
+    let logo: CGPoint
+    let direction: FloatingRailDirection
+}
+
 struct FloatingDockAnchor: Codable, Equatable, Sendable {
     var edge: FloatingDockEdge
     var position: Double
@@ -33,19 +45,14 @@ struct FloatingLogoDrag: Equatable {
 }
 
 enum FloatingDockLayout {
-    static let edgeHysteresis: CGFloat = 20
-
     static func anchor(at point: CGPoint, visibleFrame: CGRect,
                        previousEdge: FloatingDockEdge) -> FloatingDockAnchor {
         guard point.x.isFinite, point.y.isFinite, visibleFrame.width > 0,
               visibleFrame.height > 0 else { return .init(edge: previousEdge, position: 0.5) }
-        let right = abs(visibleFrame.maxX - point.x)
-        let bottom = abs(point.y - visibleFrame.minY)
-        let edge: FloatingDockEdge
-        switch previousEdge {
-        case .right: edge = bottom + edgeHysteresis < right ? .bottom : .right
-        case .bottom: edge = right + edgeHysteresis < bottom ? .right : .bottom
-        }
+        // Dragging moves along the selected edge only. In particular, the
+        // bottom-right corner is a valid end position for the vertical rail;
+        // it must not unexpectedly rotate the widget onto the bottom edge.
+        let edge = previousEdge
         let position = edge == .bottom ? (point.x - visibleFrame.minX) / visibleFrame.width
             : (visibleFrame.maxY - point.y) / visibleFrame.height
         return .init(edge: edge, position: Double(position))
@@ -57,7 +64,9 @@ enum FloatingDockLayout {
         let card = EdgeLayout.panelSize(for: layer, taskCount: taskCount)
         let requested: CGSize
         switch layer {
-        case .idle: requested = CGSize(width: MBMetrics.edgeIdleHeight, height: MBMetrics.edgeIdleWidth)
+        case .idle:
+            requested = CGSize(width: max(MBMetrics.edgeIdleHeight, MBMetrics.edgeTargetSize),
+                               height: max(MBMetrics.edgeIdleWidth, MBMetrics.edgeTargetSize))
         case .rail:
             requested = CGSize(width: MBMetrics.edgeRailHeight + MBMetrics.edgeMotionVerticalSlack,
                                height: MBMetrics.edgeRailWidth + MBMetrics.edgeMotionHorizontalSlack)
@@ -71,42 +80,61 @@ enum FloatingDockLayout {
 
     static func frame(visibleFrame: CGRect, layer: FloatingLayer, anchor: FloatingDockAnchor,
                       taskCount: Int = 3) -> CGRect {
+        placement(visibleFrame: visibleFrame, layer: layer, anchor: anchor,
+                  taskCount: taskCount).frame
+    }
+
+    static func placement(visibleFrame: CGRect, layer: FloatingLayer, anchor: FloatingDockAnchor,
+                          taskCount: Int = 3) -> FloatingDockPlacement {
         let anchor = anchor.sanitized
         if anchor.edge == .right {
-            return EdgeLayout.frame(visibleFrame: visibleFrame, layer: layer,
-                                    normalizedFromTop: CGFloat(anchor.position), taskCount: taskCount)
+            let frame = EdgeLayout.frame(visibleFrame: visibleFrame, layer: layer,
+                                         normalizedFromTop: CGFloat(anchor.position), taskCount: taskCount)
+            let logo = CGPoint(x: frame.width - EdgeLayout.logoInset,
+                y: EdgeLayout.rightLogoY(frame: frame, visibleFrame: visibleFrame,
+                                         normalizedFromTop: CGFloat(anchor.position)))
+            let direction: FloatingRailDirection = logo.y <= frame.height / 2 ? .forward : .reverse
+            return FloatingDockPlacement(frame: frame, logo: logo, direction: direction)
         }
         let size = size(for: layer, visibleFrame: visibleFrame, taskCount: taskCount, edge: .bottom)
-        // Reserve horizontal room for the widest card, keeping the logo fixed
-        // when the rail/card opens. Bottom follows visibleFrame, above the Dock.
-        let maximumWidth = self.size(for: .taskDetail("anchor"), visibleFrame: visibleFrame, edge: .bottom).width
-        let railCenter = min(visibleFrame.maxX - maximumWidth / 2 - EdgeLayout.outerInset,
-                             max(visibleFrame.minX + maximumWidth / 2 + EdgeLayout.outerInset,
-                                 visibleFrame.minX + visibleFrame.width * anchor.position + EdgeLayout.railLogoOffset))
-        let center = railCenter - (layer == .idle ? EdgeLayout.railLogoOffset : 0)
+        let targetInset = min(visibleFrame.width / 2,
+                              EdgeLayout.outerInset + MBMetrics.edgeTargetSize / 2)
+        let usable = max(0, visibleFrame.width - targetInset * 2)
+        let desiredLogoX = visibleFrame.minX + targetInset + usable * anchor.position
+        let preferredLogoX = anchor.position <= 0.5
+            ? MBMetrics.edgeTargetSize / 2
+            : size.width - MBMetrics.edgeTargetSize / 2
         let inset = min(EdgeLayout.outerInset, max(0, (visibleFrame.width - size.width) / 2))
-        let x = min(visibleFrame.maxX - size.width - inset, max(visibleFrame.minX + inset, center - size.width / 2))
-        return CGRect(x: x, y: visibleFrame.minY, width: size.width, height: size.height)
+        let minimumX = visibleFrame.minX + inset
+        let maximumX = visibleFrame.maxX - size.width - inset
+        let x = min(maximumX, max(minimumX, desiredLogoX - preferredLogoX))
+        let frame = CGRect(x: x, y: visibleFrame.minY, width: size.width, height: size.height)
+        let logoX = min(size.width - MBMetrics.edgeTargetSize / 2,
+                        max(MBMetrics.edgeTargetSize / 2, desiredLogoX - frame.minX))
+        let logo = CGPoint(x: logoX, y: size.height - EdgeLayout.logoInset)
+        let direction: FloatingRailDirection = logoX <= size.width / 2 ? .forward : .reverse
+        return FloatingDockPlacement(frame: frame, logo: logo, direction: direction)
     }
 
-    static func logo(in size: CGSize, layer: FloatingLayer, edge: FloatingDockEdge) -> CGPoint {
-        let offset = layer == .idle ? 0 : EdgeLayout.railLogoOffset
-        return edge == .right
-            ? CGPoint(x: size.width - EdgeLayout.logoInset, y: size.height / 2 - offset)
-            : CGPoint(x: size.width / 2 - offset, y: size.height - EdgeLayout.logoInset)
-    }
-
-    static func actionCenter(index: Int, logo: CGPoint, edge: FloatingDockEdge) -> CGPoint {
-        let distance = CGFloat(index + 1) * (MBMetrics.edgeTargetSize + MBMetrics.edgeRailSpacing)
+    static func actionCenter(index: Int, logo: CGPoint, edge: FloatingDockEdge,
+                             direction: FloatingRailDirection = .forward) -> CGPoint {
+        let distance = direction.sign * CGFloat(index + 1)
+            * (MBMetrics.edgeTargetSize + MBMetrics.edgeRailSpacing)
         return edge == .right ? CGPoint(x: logo.x, y: logo.y + distance)
             : CGPoint(x: logo.x + distance, y: logo.y)
     }
 
-    // Align the first (logo) slot with the separately hosted drag control.
-    // A one-point mismatch would overlap the logo and Refresh click targets.
-    static var railContentOffset: CGFloat {
-        2 * (MBMetrics.edgeTargetSize + MBMetrics.edgeRailSpacing) - EdgeLayout.railLogoOffset
+    static func railActionPosition(index: Int, edge: FloatingDockEdge,
+                                   direction: FloatingRailDirection) -> CGPoint {
+        let alongLength = MBMetrics.edgeRailHeight + MBMetrics.edgeMotionVerticalSlack
+        let along = alongLength / 2 + direction.sign
+            * (CGFloat(index + 1) * (MBMetrics.edgeTargetSize + MBMetrics.edgeRailSpacing)
+               - EdgeLayout.railLogoOffset)
+        return edge == .right
+            ? CGPoint(x: MBMetrics.edgeTargetSize / 2, y: along)
+            : CGPoint(x: along, y: MBMetrics.edgeTargetSize / 2)
     }
+
 }
 
 /// A floating nonactivating panel must perform the first click, not consume it
@@ -120,13 +148,16 @@ final class FloatingFirstClickHostingView<Content: View>: NSHostingView<Content>
 struct DockedOrganicEdgeShape: Shape {
     let edge: FloatingDockEdge
     var expansion: CGFloat
+    var direction: FloatingRailDirection = .forward
     var animatableData: CGFloat {
         get { expansion }
         set { expansion = newValue }
     }
     func path(in rect: CGRect) -> Path {
-        if edge == .right { return AnchoredOrganicEdgeShape(expansion: expansion).path(in: rect) }
-        return AnchoredOrganicEdgeShape(expansion: expansion)
+        if edge == .right {
+            return AnchoredOrganicEdgeShape(expansion: expansion, direction: direction).path(in: rect)
+        }
+        return AnchoredOrganicEdgeShape(expansion: expansion, direction: direction)
             .path(in: CGRect(x: 0, y: 0, width: rect.height, height: rect.width))
             .applying(CGAffineTransform(a: 0, b: 1, c: 1, d: 0, tx: rect.minX, ty: rect.minY))
     }
@@ -138,19 +169,28 @@ struct FloatingLogoControl: NSViewRepresentable {
     let summary: CompactSummary
     let showCount: Bool
     let edge: FloatingDockEdge
+    let direction: FloatingRailDirection
     let controller: FloatingTabController
     @Environment(\.colorScheme) private var colorScheme
 
     func makeNSView(context: Context) -> LogoView { LogoView() }
     func updateNSView(_ view: LogoView, context: Context) {
         view.controller = controller
-        let identity = "\(summary.runningBadgeText)|\(summary.runningBadgeHelp)|\(showCount)|\(edge)|\(colorScheme)"
+        let identity = "\(summary.runningBadgeText)|\(summary.runningBadgeHelp)|\(showCount)|\(edge)|\(direction)|\(colorScheme)"
         guard view.renderedIdentity != identity else { return }
         view.renderedIdentity = identity
-        view.host.rootView = AnyView(CompactBrandBadge(summary: summary, showCount: showCount, horizontal: edge == .bottom)
-            .environment(\.colorScheme, colorScheme))
+        view.host.rootView = AnyView(
+            CompactBrandBadge(summary: summary, showCount: showCount, horizontal: edge == .bottom)
+                .offset(x: edge == .right
+                            ? EdgeLayout.logoInset - EdgeLayout.brandVisualInset
+                            : direction.sign * EdgeLayout.brandVisualAlongOffset,
+                        y: edge == .bottom
+                            ? EdgeLayout.logoInset - EdgeLayout.brandVisualInset
+                            : direction.sign * EdgeLayout.brandVisualAlongOffset)
+                .environment(\.colorScheme, colorScheme)
+        )
         view.setAccessibilityLabel("Open MacBridge Dashboard")
-        view.setAccessibilityHelp("Click to open. Drag the logo along the right or bottom edge. \(summary.runningBadgeHelp)")
+        view.setAccessibilityHelp("Click to open. Drag along the current screen edge; choose another edge in Settings. \(summary.runningBadgeHelp)")
         view.setAccessibilityValue(summary.runningBadgeHelp)
         view.setAccessibilityIdentifier("floating-running-count")
     }

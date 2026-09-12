@@ -41,7 +41,7 @@ check("canonical-icns", (ROOT / "Assets" / "Brand" / "MacBridge.icns").is_file()
 
 for name, value in {
     "edgeIdleWidth": "30", "edgeIdleHeight": "58", "edgeRailWidth": "36", "edgeRailHeight": "196",
-    "edgeLogoSize": "22", "edgeTargetSize": "32", "edgeRailSpacing": "3",
+    "edgeLogoSize": "22", "minimumHitTargetSize": "44", "edgeRailSpacing": "0",
     "hoverDelay": "0.10", "hoverExitGrace": "0.45", "openDuration": "0.64",
     "panelDuration": "0.72", "closeDuration": "0.64", "reducedMotionDuration": "0.10",
 }.items():
@@ -101,6 +101,14 @@ check("bounded-dock-preferences", "updated.count - 16" in DESIGN and "ui.floatin
 check("first-click-floating-host", "FloatingFirstClickHostingView(rootView:" in SURFACES
       and "override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }" in DOCKING)
 check("full-rect-action-targets", ".contentShape(Rectangle())" in SURFACES and "includeControls(in:" in DESIGN)
+check("minimum-44-point-targets", "edgeTargetSize: CGFloat = minimumHitTargetSize" in DESIGN
+      and "CompactIconButtonLabel" in SURFACES and "minimumHitTargetSize" in SURFACES)
+check("fixed-edge-endpoint-drag", "let edge = previousEdge" in DOCKING
+      and "bottom-right corner is a valid end position" in DOCKING
+      and "Choose another edge explicitly below" in SURFACES)
+check("native-scrollable-settings", "struct CompactPreferenceToggle" in SURFACES
+      and ".toggleStyle(.switch)" in SURFACES and ".controlSize(.small)" in SURFACES
+      and "ScrollView {" in SURFACES)
 compact_source = DESIGN + SURFACES + LIFECYCLE + APPEARANCE + MOTION + DOCKING
 for forbidden in ["repeatForever", "Timer.scheduledTimer", "CVDisplayLink", "CADisplayLink",
                   "DispatchSource.makeTimerSource", "URLSession", "NWConnection", "Process()"]:

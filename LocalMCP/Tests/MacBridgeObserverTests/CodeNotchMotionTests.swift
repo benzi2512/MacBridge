@@ -27,7 +27,7 @@ final class CodeNotchMotionTests: XCTestCase {
         let canvas = CGRect(origin: .zero, size: EdgeLayout.size(for: .rail, visibleFrame: screen))
         let logo = CGPoint(x: canvas.maxX - EdgeLayout.logoInset, y: canvas.midY - EdgeLayout.railLogoOffset)
         let rail = CGRect(x: canvas.maxX - MBMetrics.edgeRailWidth,
-                          y: canvas.midY - MBMetrics.edgeRailHeight / 2,
+                          y: logo.y + EdgeLayout.railLogoOffset - MBMetrics.edgeRailHeight / 2,
                           width: MBMetrics.edgeRailWidth, height: MBMetrics.edgeRailHeight)
         for step in -40...1040 {
             let t = CGFloat(step) / 1000
@@ -38,12 +38,14 @@ final class CodeNotchMotionTests: XCTestCase {
             XCTAssertLessThanOrEqual(path.boundingRect.maxX, canvas.maxX + 0.001)
             XCTAssertLessThanOrEqual(path.boundingRect.maxY, canvas.maxY)
             let hit = FloatingHitRegion(logoY: logo.y, expansion: t, panelSize: .zero).path(in: canvas)
-            var expected = path.boundingRect.union(CGRect(x: logo.x - 16, y: logo.y - 19,
-                                                          width: 32, height: 38).intersection(canvas))
+            let target = MBMetrics.minimumHitTargetSize
+            var expected = path.boundingRect.union(CGRect(x: logo.x - target / 2, y: logo.y - target / 2,
+                                                          width: target, height: target).intersection(canvas))
             if t > 0 {
-                for slot in 1...4 {
-                    expected = expected.union(CGRect(x: logo.x - 16, y: logo.y + CGFloat(slot) * 35 - 16,
-                                                     width: 32, height: 32).intersection(canvas))
+                for index in 0..<4 {
+                    let center = FloatingDockLayout.actionCenter(index: index, logo: logo, edge: .right)
+                    expected = expected.union(CGRect(x: center.x - target / 2, y: center.y - target / 2,
+                                                     width: target, height: target).intersection(canvas))
                 }
             }
             for (actual, expected) in zip([hit.boundingRect.minX, hit.boundingRect.minY, hit.boundingRect.maxX, hit.boundingRect.maxY],

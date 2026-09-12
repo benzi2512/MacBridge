@@ -4,6 +4,95 @@ import XCTest
 @testable import MacBridgeLocalCore
 
 final class CommandDispatchTests: XCTestCase {
+    func testOutstandingResponseBudgetIsFixedAndBalanced() {
+        let responses = PendingToolResponses()
+        for index in 0..<PendingToolResponses.maximumOutstanding {
+            XCTAssertTrue(responses.reserve(), "reservation \(index) should fit")
+        }
+        XCTAssertEqual(responses.outstandingCount, PendingToolResponses.maximumOutstanding)
+        XCTAssertFalse(responses.reserve(), "the first response beyond the fixed budget must fail fast")
+        for _ in 0..<PendingToolResponses.maximumOutstanding { responses.release() }
+        XCTAssertEqual(responses.outstandingCount, 0)
+        XCTAssertTrue(responses.reserve(), "the budget must recover after delivery")
+        responses.release()
+
+        let attempted = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let group = DispatchGroup()
+        let admissions = LockedTestCounter()
+        for _ in 0..<(PendingToolResponses.maximumOutstanding * 2) {
+            group.enter()
+            DispatchQueue.global().async {
+                if responses.reserve() {
+                    admissions.increment()
+                    attempted.signal()
+                    release.wait()
+                    responses.release()
+                } else {
+                    attempted.signal()
+                }
+                group.leave()
+            }
+        }
+        for _ in 0..<(PendingToolResponses.maximumOutstanding * 2) {
+            XCTAssertEqual(attempted.wait(timeout: .now() + 5), .success)
+        }
+        let concurrentAdmissions = admissions.value
+        XCTAssertEqual(concurrentAdmissions, PendingToolResponses.maximumOutstanding)
+        XCTAssertEqual(responses.outstandingCount, PendingToolResponses.maximumOutstanding)
+        for _ in 0..<concurrentAdmissions { release.signal() }
+        XCTAssertEqual(group.wait(timeout: .now() + 5), .success)
+        XCTAssertEqual(responses.outstandingCount, 0)
+    }
+
+    func testUndrainedOutputStopsAdmissionAtTheFixedResponseBudget() throws {
+        let f = try Fixture(); defer { f.remove() }
+        let entered = DispatchSemaphore(value: 0)
+        let server = try makeServer(f, developerInspectionStartForTesting: { entered.signal() })
+        let io = CommandDispatchConnection(server); defer { io.close() }
+        try io.initialize()
+        let fillerBytes = try io.saturateOutputPipe()
+        XCTAssertGreaterThan(fillerBytes, 0)
+
+        let requestCount = PendingToolResponses.maximumOutstanding + 1
+        for id in 0..<PendingToolResponses.maximumOutstanding {
+            try io.tool("backpressure/\(id)", "developer_inspect", [
+                "action": "inspect_repo", "workspace_id": f.workspaceID,
+            ])
+            XCTAssertEqual(entered.wait(timeout: .now() + 5), .success)
+            var executionLeaseReleased = false
+            for _ in 0..<2_000 {
+                let capabilities = try server.callTool(name: "bridge_capabilities", arguments: [:])
+                if capabilities["active_developer_inspections"] as? Int == 0 {
+                    executionLeaseReleased = true
+                    break
+                }
+                usleep(1_000)
+            }
+            XCTAssertTrue(executionLeaseReleased,
+                          "completed execution must release its family lease before stdout drains")
+        }
+        try io.tool("backpressure/overflow", "developer_inspect", [
+            "action": "inspect_repo", "workspace_id": f.workspaceID,
+        ])
+        XCTAssertEqual(entered.wait(timeout: .now() + 0.25), .timedOut,
+                       "a stalled adapter must not admit an unbounded reply backlog")
+
+        try io.drainOutputPrefix(byteCount: fillerBytes)
+        var replies: [JSONObject] = []
+        for _ in 0..<requestCount { replies.append(try io.receive()) }
+        XCTAssertEqual(Set(replies.compactMap { $0["id"] as? String }).count, requestCount)
+        XCTAssertTrue(replies.contains { response in
+            guard let result = response["result"] as? JSONObject,
+                  result["isError"] as? Bool == true,
+                  let structured = result["structuredContent"] as? JSONObject,
+                  let error = structured["error"] as? String else { return false }
+            return error.contains("awaiting delivery")
+        })
+        XCTAssertTrue(try io.finishAndDrain().isEmpty,
+                      "every admitted or rejected request must receive exactly one reply")
+    }
+
     func testParentWorkIsValidatedBeforeAsyncLaunchAndOwnsPendingJob() throws {
         let f = try Fixture(); defer { f.remove() }
         let server = try makeServer(f)
@@ -41,22 +130,22 @@ final class CommandDispatchTests: XCTestCase {
         XCTAssertTrue(try io.finishAndDrain().isEmpty)
     }
 
-    func testFourWaitingCommandsKeepStdioResponsiveAndRejectFifthLaunch() throws {
+    func testEightWaitingCommandsKeepStdioResponsiveAndRejectNinthLaunch() throws {
         let f = try Fixture(); defer { f.remove() }
         try Data("still-readable\n".utf8).write(to: f.workspace.appendingPathComponent("sample.txt"))
         let server = try makeServer(f)
         let io = CommandDispatchConnection(server); defer { io.close() }
         try io.initialize()
-        let commandIDs = ["command-run/one-\u{00E9}", "command-run/two", "command-run/three", "command-run/four"]
+        let commandIDs = (0..<8).map { "command-run/\($0)" }
         for id in commandIDs { try io.tool(id, "command_run", commandArguments(f)) }
         // Admission and launch happen in input order. Each cat waits on open
-        // stdin, so four occupied slots are deterministic rather than a race
+        // stdin, so eight occupied slots are deterministic rather than a race
         // against conveniently slow commands.
         try io.tool(2, "process_list", [:])
         let jobs = try XCTUnwrap(try structured(io.receive(id: 2))["processes"] as? [JSONObject])
-        XCTAssertEqual(jobs.count, 4)
+        XCTAssertEqual(jobs.count, 8)
         let taskIDs = jobs.compactMap { $0["task_id"] as? String }
-        XCTAssertEqual(taskIDs.count, 4)
+        XCTAssertEqual(taskIDs.count, 8)
         defer {
             for taskID in taskIDs {
                 _ = try? server.callTool(name: "process_cancel", arguments: ["task_id": taskID])
@@ -79,8 +168,8 @@ final class CommandDispatchTests: XCTestCase {
         let capabilities = try structured(io.receive(id: 5))
         XCTAssertEqual(capabilities["catalog_count"] as? Int, 72)
         XCTAssertEqual(capabilities["catalog_sha256"] as? String, catalog["catalogEpoch"] as? String)
-        XCTAssertEqual(capabilities["active_command_runs"] as? Int, 4)
-        XCTAssertEqual(capabilities["maximum_concurrent_command_runs"] as? Int, 4)
+        XCTAssertEqual(capabilities["active_command_runs"] as? Int, 8)
+        XCTAssertEqual(capabilities["maximum_concurrent_command_runs"] as? Int, 8)
         XCTAssertEqual(try structured(io.receive(id: 6))["running"] as? Bool, true)
         let readFile = try XCTUnwrap(try structured(io.receive(id: 7))["file"] as? JSONObject)
         XCTAssertEqual(readFile["content"] as? String, "still-readable\n")
@@ -102,21 +191,21 @@ final class CommandDispatchTests: XCTestCase {
         XCTAssertEqual(Set(observedJobs.filter { $0["running"] as? Bool == true }
             .compactMap { $0["task_id"] as? String }), Set(taskIDs))
 
-        // Release all four through the protocol. Command and input responses
+        // Release all eight through the protocol. Command and input responses
         // may interleave, but every request must receive exactly one response.
         for (index, taskID) in taskIDs.enumerated() {
             try io.tool(20 + index, "process_input", [
                 "task_id": taskID, "content": "run-\(index)\n", "close_stdin": true,
             ])
         }
-        let completions = try (0..<8).map { _ in try io.receive() }
+        let completions = try (0..<16).map { _ in try io.receive() }
         XCTAssertEqual(Set(completions.compactMap { $0["id"] as? String }), Set(commandIDs))
-        XCTAssertEqual(Set(completions.compactMap { $0["id"] as? Int }), Set(20..<24))
+        XCTAssertEqual(Set(completions.compactMap { $0["id"] as? Int }), Set(20..<28))
         for response in completions where response["id"] is Int {
             XCTAssertEqual(try structured(response)["input_complete"] as? Bool, true)
         }
         let commandResponses = completions.filter { $0["id"] is String }
-        XCTAssertEqual(commandResponses.count, 4)
+        XCTAssertEqual(commandResponses.count, 8)
         for response in commandResponses {
             let completed = try structured(response)
             XCTAssertTrue(taskIDs.contains(try XCTUnwrap(completed["task_id"] as? String)))
@@ -133,6 +222,150 @@ final class CommandDispatchTests: XCTestCase {
         try io.tool(31, "command_run", commandArguments(f, executable: "true"))
         XCTAssertEqual(try structured(io.receive(id: 31))["exit_code"] as? Int, 0)
         XCTAssertTrue(try io.finishAndDrain().isEmpty, "No duplicate command response or unsolicited notification")
+    }
+
+    func testEightStalledDeveloperInspectionsDoNotStarveOtherChatsOrQueueANinth() throws {
+        let f = try Fixture(); defer { f.remove() }
+        try Data("inspection-independent\n".utf8).write(
+            to: f.workspace.appendingPathComponent("sample.txt")
+        )
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let server = try makeServer(f, developerInspectionStartForTesting: {
+            entered.signal()
+            release.wait()
+        })
+        let io = CommandDispatchConnection(server)
+        defer {
+            for _ in 0..<8 { release.signal() }
+            io.close()
+        }
+        try io.initialize()
+        let inspectionIDs = (0..<8).map { "developer-inspect/\($0)" }
+        for id in inspectionIDs {
+            try io.tool(id, "developer_inspect", [
+                "action": "inspect_repo", "workspace_id": f.workspaceID,
+            ])
+        }
+        for _ in inspectionIDs {
+            XCTAssertEqual(entered.wait(timeout: .now() + 5), .success)
+        }
+
+        try io.send(["jsonrpc": "2.0", "id": 100, "method": "ping"])
+        try io.tool(101, "bridge_capabilities", [:])
+        try io.tool(102, "file_read", ["workspace_id": f.workspaceID, "path": "sample.txt"])
+        try io.tool(103, "workspace_reload", [:])
+        try io.tool(104, "developer_inspect", [
+            "action": "inspect_repo", "workspace_id": f.workspaceID,
+        ])
+        var quick: [Int: JSONObject] = [:]
+        for _ in 0..<5 {
+            let response = try io.receive()
+            quick[try XCTUnwrap(response["id"] as? Int)] = response
+        }
+        XCTAssertEqual(Set(quick.keys), Set(100...104))
+        XCTAssertNotNil(quick[100]?["result"])
+        let capabilities = try structured(XCTUnwrap(quick[101]))
+        XCTAssertEqual(capabilities["developer_inspect_nonblocking_dispatch"] as? Bool, true)
+        XCTAssertEqual(capabilities["active_developer_inspections"] as? Int, 8)
+        XCTAssertEqual(capabilities["maximum_concurrent_developer_inspections"] as? Int, 8)
+        XCTAssertEqual(
+            (try structured(XCTUnwrap(quick[102]))["file"] as? JSONObject)?["content"] as? String,
+            "inspection-independent\n"
+        )
+        XCTAssertEqual(try result(XCTUnwrap(quick[103]))["isError"] as? Bool, true)
+        let rejected = try XCTUnwrap(quick[104])
+        XCTAssertEqual(try result(rejected)["isError"] as? Bool, true)
+        XCTAssertTrue((try structured(rejected)["error"] as? String ?? "").contains("developer inspections"))
+
+        for _ in inspectionIDs { release.signal() }
+        let completions = try inspectionIDs.map { _ in try io.receive() }
+        XCTAssertEqual(Set(completions.compactMap { $0["id"] as? String }), Set(inspectionIDs))
+        for response in completions {
+            XCTAssertEqual(try result(response)["isError"] as? Bool, false)
+            XCTAssertEqual(try structured(response)["developer_action"] as? String, "inspect_repo")
+        }
+        try io.tool(105, "bridge_capabilities", [:])
+        XCTAssertEqual(try structured(io.receive(id: 105))["active_developer_inspections"] as? Int, 0)
+        try io.tool(106, "workspace_reload", [:])
+        XCTAssertEqual(try structured(io.receive(id: 106))["reloaded"] as? Bool, true)
+        XCTAssertTrue(try io.finishAndDrain().isEmpty)
+    }
+
+    func testEightStalledProcessWaitsDoNotStarvePingAndRejectANinth() throws {
+        let f = try Fixture(); defer { f.remove() }
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let server = try makeServer(f, surface: .webTunnel, processWaitStartForTesting: {
+            entered.signal()
+            release.wait()
+        })
+        let process = try server.callTool(name: "command_start", arguments: [
+            "workspace_id": f.workspaceID, "executable": "cat", "arguments": [] as [String],
+        ])
+        let taskID = try XCTUnwrap(process["task_id"] as? String)
+        let processToken = try XCTUnwrap(process["process_control_token"] as? String)
+        let io = CommandDispatchConnection(server)
+        defer {
+            for _ in 0..<8 { release.signal() }
+            _ = try? server.callTool(name: "process_cancel", arguments: [
+                "task_id": taskID, "process_control_token": processToken,
+            ])
+            io.close()
+        }
+        try io.initialize()
+        let waitIDs = (0..<8).map { "process-wait/\($0)" }
+        for id in waitIDs {
+            try io.tool(id, "process_wait", [
+                "task_id": taskID, "process_control_token": processToken,
+                "maximum_wait_milliseconds": 0,
+            ])
+        }
+        for _ in waitIDs {
+            XCTAssertEqual(entered.wait(timeout: .now() + 5), .success)
+        }
+
+        try io.send(["jsonrpc": "2.0", "id": 200, "method": "ping"])
+        try io.tool(201, "bridge_capabilities", [:])
+        try io.tool(202, "workspace_reload", [:])
+        try io.tool(203, "process_wait", [
+            "task_id": taskID, "process_control_token": processToken,
+            "maximum_wait_milliseconds": 0,
+        ])
+        var quick: [Int: JSONObject] = [:]
+        for _ in 0..<4 {
+            let response = try io.receive()
+            quick[try XCTUnwrap(response["id"] as? Int)] = response
+        }
+        XCTAssertEqual(Set(quick.keys), Set(200...203))
+        XCTAssertNotNil(quick[200]?["result"])
+        let capabilities = try structured(XCTUnwrap(quick[201]))
+        XCTAssertEqual(capabilities["process_wait_nonblocking_dispatch"] as? Bool, true)
+        XCTAssertEqual(capabilities["active_process_waits"] as? Int, 8)
+        XCTAssertEqual(capabilities["maximum_concurrent_process_waits"] as? Int, 8)
+        XCTAssertEqual(try result(XCTUnwrap(quick[202]))["isError"] as? Bool, true)
+        let rejected = try XCTUnwrap(quick[203])
+        XCTAssertEqual(try result(rejected)["isError"] as? Bool, true)
+        XCTAssertTrue((try structured(rejected)["error"] as? String ?? "").contains("process waits"))
+
+        for _ in waitIDs { release.signal() }
+        let completions = try waitIDs.map { _ in try io.receive() }
+        XCTAssertEqual(Set(completions.compactMap { $0["id"] as? String }), Set(waitIDs))
+        for response in completions {
+            let value = try structured(response)
+            XCTAssertEqual(try result(response)["isError"] as? Bool, false)
+            XCTAssertEqual(value["task_id"] as? String, taskID)
+            XCTAssertEqual(value["running"] as? Bool, true)
+            XCTAssertEqual(value["observation_timed_out"] as? Bool, true)
+        }
+        XCTAssertEqual(try server.callTool(name: "bridge_capabilities", arguments: [:])[
+            "active_process_waits"
+        ] as? Int, 0)
+        _ = try server.callTool(name: "process_cancel", arguments: [
+            "task_id": taskID, "process_control_token": processToken,
+        ])
+        XCTAssertNoThrow(try server.callTool(name: "workspace_reload", arguments: [:]))
+        XCTAssertTrue(try io.finishAndDrain().isEmpty)
     }
 
     func testStdioCancelCompletesOriginalRequestAndKeepsSingleResponse() throws {
@@ -256,15 +489,53 @@ final class CommandDispatchTests: XCTestCase {
         XCTAssertEqual(try service.processStatus(taskID: taskID)["status_only"] as? Bool, true)
     }
 
+    func testIdentifiedPreparedCommandReturnsItsOwnJobAmongAdjacentLaunches() throws {
+        let f = try Fixture(); defer { f.remove() }
+        let service = LocalProcessService(workspaceService: try f.service(), selfExecutable: executable)
+        let unrelated = try service.startCommand(
+            workspaceID: f.workspaceID, executableID: "cat", arguments: [], cwd: ".",
+            maximumOutputBytes: 1024
+        )
+        let unrelatedID = try XCTUnwrap(unrelated["task_id"] as? String)
+        let prepared = try service.prepareIdentifiedCommandRun(
+            workspaceID: f.workspaceID, executableID: "cat", arguments: [], cwd: ".",
+            timeoutMilliseconds: 2_000, maximumOutputBytes: 1024
+        )
+        defer {
+            _ = try? service.cancelProcess(taskID: unrelatedID)
+            _ = try? service.cancelProcess(taskID: prepared.taskID)
+        }
+        XCTAssertNotEqual(prepared.taskID, unrelatedID)
+        XCTAssertEqual(Set((service.processList()["processes"] as? [JSONObject] ?? [])
+            .compactMap { $0["task_id"] as? String }), Set([unrelatedID, prepared.taskID]))
+
+        _ = try service.processInput(
+            taskID: prepared.taskID, content: "owned\n", encoding: "utf8", closeStdin: true
+        )
+        let result = prepared.finish()
+        XCTAssertEqual(result["task_id"] as? String, prepared.taskID)
+        XCTAssertEqual(result["stdout"] as? String, "owned\n")
+        XCTAssertEqual(result["exit_code"] as? Int, 0)
+        XCTAssertEqual(try service.processStatus(taskID: unrelatedID)["running"] as? Bool, true)
+    }
+
     private var executable: URL {
         URL(fileURLWithPath: #filePath).deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent()
             .appendingPathComponent(".build/debug/macbridge-mcp")
     }
 
-    private func makeServer(_ f: Fixture, surface: MacBridgeConnectorSurface = .desktopLocal) throws -> LocalMCPServer {
-        try LocalMCPServer(configurationURL: f.config, selfExecutable: executable,
-                           connectorSurface: surface, observationEnabled: true)
+    private func makeServer(
+        _ f: Fixture, surface: MacBridgeConnectorSurface = .desktopLocal,
+        developerInspectionStartForTesting: (@Sendable () -> Void)? = nil,
+        processWaitStartForTesting: (@Sendable () -> Void)? = nil
+    ) throws -> LocalMCPServer {
+        try LocalMCPServer(
+            configurationURL: f.config, selfExecutable: executable,
+            connectorSurface: surface, observationEnabled: true, searchStartForTesting: nil,
+            developerInspectionStartForTesting: developerInspectionStartForTesting,
+            processWaitStartForTesting: processWaitStartForTesting
+        )
     }
 
     private func commandArguments(_ f: Fixture, executable: String = "cat", timeout: Int = 10_000) -> JSONObject {
@@ -286,6 +557,23 @@ final class CommandDispatchTests: XCTestCase {
             if result["running"] as? Bool == false { return }
         }
         throw LocalMCPError.operationFailed("synthetic cat did not exit after stdin closed")
+    }
+}
+
+private final class LockedTestCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    func increment() {
+        lock.lock()
+        count += 1
+        lock.unlock()
+    }
+
+    var value: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
     }
 }
 
@@ -322,6 +610,41 @@ private final class CommandDispatchConnection {
     func tool(_ id: Any, _ name: String, _ arguments: JSONObject) throws {
         try send(["jsonrpc": "2.0", "id": id, "method": "tools/call",
                   "params": ["name": name, "arguments": arguments] as JSONObject])
+    }
+
+    /// Fill the response pipe without adding a JSON frame, then restore normal
+    /// blocking writes. The server's next response is therefore known to stall
+    /// until drainOutputPrefix removes these exact bytes.
+    func saturateOutputPipe() throws -> Int {
+        let descriptor = output.fileHandleForWriting.fileDescriptor
+        let flags = fcntl(descriptor, F_GETFL)
+        guard flags >= 0, fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0 else {
+            throw LocalMCPError.operationFailed("could not configure the synthetic response pipe")
+        }
+        defer { _ = fcntl(descriptor, F_SETFL, flags) }
+        let chunk = [UInt8](repeating: 0x20, count: 4_096)
+        var total = 0
+        while true {
+            let written = chunk.withUnsafeBytes { bytes in
+                Darwin.write(descriptor, bytes.baseAddress, bytes.count)
+            }
+            if written > 0 { total += written; continue }
+            if written < 0, errno == EAGAIN || errno == EWOULDBLOCK { return total }
+            throw LocalMCPError.operationFailed("could not fill the synthetic response pipe")
+        }
+    }
+
+    func drainOutputPrefix(byteCount: Int) throws {
+        var remaining = byteCount
+        var chunk = [UInt8](repeating: 0, count: 4_096)
+        while remaining > 0 {
+            let requested = min(remaining, chunk.count)
+            let count = Darwin.read(output.fileHandleForReading.fileDescriptor, &chunk, requested)
+            guard count > 0 else {
+                throw LocalMCPError.operationFailed("synthetic response-pipe prefix ended early")
+            }
+            remaining -= count
+        }
     }
 
     func receive(id: Any? = nil) throws -> JSONObject {

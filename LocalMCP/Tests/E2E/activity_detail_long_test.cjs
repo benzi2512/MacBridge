@@ -75,7 +75,7 @@ async function tool(name, args = {}) {
     const catalog = await rpc('tools/list');
     assert.equal(catalog.tools.length, 72, 'combined desktop candidate catalog');
     // The detail gate must preserve this reviewed release candidate's catalog.
-    assert.equal(catalog.catalogEpoch, 'b059f5b4274ca7cf0f1ac0889084a5125e080c16d1c8442cf2436dc41a868fb3');
+    assert.equal(catalog.catalogEpoch, '0725dab73d8abb6739a6785f5af4a0e2e7e55807a86c7f7e23cd62f1aafb85ca');
     const caps = await tool('bridge_capabilities');
     assert.equal(caps.data.mcp_executable_sha256, expectedHash);
     assert(caps.text.includes('72 catalog tools'));

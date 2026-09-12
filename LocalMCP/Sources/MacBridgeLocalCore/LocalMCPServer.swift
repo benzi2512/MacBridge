@@ -83,8 +83,12 @@ public final class LocalMCPServer: @unchecked Sendable {
     private var transactionControlTokens: [String: String] = [:]
     private var workControlTokens: [String: String] = [:]
     private var searchInProgress = false
-    private static let maximumConcurrentCommandRuns = 4
+    private static let maximumConcurrentCommandRuns = 8
     private var activeCommandRuns = 0
+    private static let maximumConcurrentDeveloperInspections = 8
+    private var activeDeveloperInspections = 0
+    private static let maximumConcurrentProcessWaits = 8
+    private var activeProcessWaits = 0
     // One admitted Brevo operation across the whole family, including direct
     // callTool callers. Protected by operationLock, never held across HTTP.
     private var brevoInProgress = false
@@ -94,6 +98,8 @@ public final class LocalMCPServer: @unchecked Sendable {
     // Immutable test instrumentation; public/runtime initialization always uses
     // nil. There is no CLI, config, environment or MCP path that installs it.
     private let searchStartForTesting: (@Sendable () -> Void)?
+    private let developerInspectionStartForTesting: (@Sendable () -> Void)?
+    private let processWaitStartForTesting: (@Sendable () -> Void)?
     // Immutable offline-test dependency only; never configurable by MCP, CLI or environment.
     private let brevoTransportForTesting: BrevoOperations.Transport?
     private let desktopPresenterForTesting: DesktopOpen.Presenter?
@@ -127,10 +133,14 @@ public final class LocalMCPServer: @unchecked Sendable {
          desktopPresenterForTesting: DesktopOpen.Presenter? = nil,
          computerBackendForTesting: (any ComputerBackend)? = nil,
          mediaConfigurationURLForTesting: URL? = nil,
-         mediaTransportForTesting: MediaShareTransport.Perform? = nil) throws {
+         mediaTransportForTesting: MediaShareTransport.Perform? = nil,
+         developerInspectionStartForTesting: (@Sendable () -> Void)? = nil,
+         processWaitStartForTesting: (@Sendable () -> Void)? = nil) throws {
         self.mediaConfigurationURL = mediaConfigurationURLForTesting ?? MediaShareConfiguration.defaultURL
         self.mediaTransportForTesting = mediaTransportForTesting
         self.searchStartForTesting = searchStartForTesting
+        self.developerInspectionStartForTesting = developerInspectionStartForTesting
+        self.processWaitStartForTesting = processWaitStartForTesting
         self.brevoTransportForTesting = brevoTransportForTesting
         self.desktopPresenterForTesting = desktopPresenterForTesting
         self.computerControl = ComputerControl(backend: computerBackendForTesting ?? NativeComputerBackend())
@@ -687,7 +697,12 @@ public final class LocalMCPServer: @unchecked Sendable {
     }
 
     private func callPreparedTool(name: String, arguments: JSONObject, workID: String?) throws -> JSONObject {
-        if name == "developer_task" || name == "developer_inspect" {
+        if name == "developer_inspect" {
+            let lease = try beginDeveloperInspection()
+            defer { endDeveloperInspection() }
+            return try executeDeveloperInspection(arguments, lease: lease)
+        }
+        if name == "developer_task" {
             operationLock.lock()
             defer { operationLock.unlock() }
             let result = try DeveloperTask.execute(
@@ -706,6 +721,11 @@ public final class LocalMCPServer: @unchecked Sendable {
             let finish = try beginCommandRun(arguments, workID: workID)
             defer { endCommandRun() }
             return finish()
+        }
+        if name == "process_wait" {
+            let lease = try beginProcessWait()
+            defer { endProcessWait() }
+            return try executeProcessWait(arguments, lease: lease)
         }
         if Self.isBrevoTool(name) {
             try beginBrevo()
@@ -1054,6 +1074,12 @@ public final class LocalMCPServer: @unchecked Sendable {
                 "command_run_nonblocking_dispatch": true,
                 "active_command_runs": activeCommandRuns,
                 "maximum_concurrent_command_runs": Self.maximumConcurrentCommandRuns,
+                "developer_inspect_nonblocking_dispatch": true,
+                "active_developer_inspections": activeDeveloperInspections,
+                "maximum_concurrent_developer_inspections": Self.maximumConcurrentDeveloperInspections,
+                "process_wait_nonblocking_dispatch": true,
+                "active_process_waits": activeProcessWaits,
+                "maximum_concurrent_process_waits": Self.maximumConcurrentProcessWaits,
                 "active_brevo_calls": brevoInProgress ? 1 : 0,
                 "maximum_concurrent_brevo_calls": 1,
                 "active_media_calls": mediaInProgress ? 1 : 0,
@@ -1087,6 +1113,12 @@ public final class LocalMCPServer: @unchecked Sendable {
             }
             guard activeCommandRuns == 0 else {
                 throw LocalMCPError.conflict("one or more command_run responses are pending; workspace configuration was not reloaded")
+            }
+            guard activeDeveloperInspections == 0 else {
+                throw LocalMCPError.conflict("one or more developer inspections are active; workspace configuration was not reloaded")
+            }
+            guard activeProcessWaits == 0 else {
+                throw LocalMCPError.conflict("one or more process waits are active; workspace configuration was not reloaded")
             }
             guard !searchInProgress else {
                 throw LocalMCPError.conflict("a search is active; workspace configuration was not reloaded")
@@ -1391,14 +1423,13 @@ public final class LocalMCPServer: @unchecked Sendable {
         operationLock.lock()
         defer { operationLock.unlock() }
         guard activeCommandRuns < Self.maximumConcurrentCommandRuns else {
-            throw LocalMCPError.limitExceeded("four command_run responses are already pending; no additional command was started; use command_start for further concurrent jobs")
+            throw LocalMCPError.limitExceeded("\(Self.maximumConcurrentCommandRuns) command_run responses are already pending; no additional command was started; use command_start for further concurrent jobs")
         }
         try arguments.requireOnlyKeys([
             "workspace_id", "executable", "arguments", "cwd", "timeout_milliseconds",
             "maximum_output_bytes",
         ])
-        let before = Set((processService.processList()["processes"] as? [JSONObject] ?? []).compactMap { $0["task_id"] as? String })
-        let finish = try processService.prepareCommandRun(
+        let prepared = try processService.prepareIdentifiedCommandRun(
             workspaceID: arguments.requiredString("workspace_id", maximumBytes: 36),
             executableID: arguments.requiredString("executable", maximumBytes: 64),
             arguments: arguments.requiredStringArray("arguments"),
@@ -1407,19 +1438,84 @@ public final class LocalMCPServer: @unchecked Sendable {
                 "timeout_milliseconds", default: 300_000, range: 100...3_600_000),
             maximumOutputBytes: arguments.optionalInt(
                 "maximum_output_bytes", default: 1_048_576, range: 1...16_777_216))
-        // This lock serializes admission. Only this launch can add a new job;
-        // other jobs ending concurrently may disappear but cannot join the set.
-        for job in processService.processList()["processes"] as? [JSONObject] ?? [] {
-            if let id = job["task_id"] as? String, !before.contains(id) { workActivity.linkJob(job, workID: workID) }
-        }
+        // Link only the identity returned by this launch. Read-only developer
+        // inspections may create their own short Git jobs outside this lock.
+        workActivity.linkJob(["task_id": prepared.taskID, "running": true], workID: workID)
         activeCommandRuns += 1
-        return finish
+        return prepared.finish
     }
 
     private func endCommandRun() {
         operationLock.lock()
         activeCommandRuns = max(0, activeCommandRuns - 1)
         operationLock.unlock()
+    }
+
+    private struct DeveloperInspectionLease: Sendable {
+        let workspace: LocalWorkspaceService
+        let processes: LocalProcessService
+    }
+
+    private func beginDeveloperInspection() throws -> DeveloperInspectionLease {
+        operationLock.lock()
+        defer { operationLock.unlock() }
+        guard activeDeveloperInspections < Self.maximumConcurrentDeveloperInspections else {
+            throw LocalMCPError.limitExceeded(
+                "\(Self.maximumConcurrentDeveloperInspections) developer inspections are already active; no additional inspection was started or queued"
+            )
+        }
+        activeDeveloperInspections += 1
+        // Keep one coherent registry/process pair for the whole inspection.
+        // Reload is refused until every inspection lease is released.
+        return DeveloperInspectionLease(workspace: workspaceService, processes: processService)
+    }
+
+    private func endDeveloperInspection() {
+        operationLock.lock()
+        activeDeveloperInspections = max(0, activeDeveloperInspections - 1)
+        operationLock.unlock()
+    }
+
+    private func executeDeveloperInspection(
+        _ arguments: JSONObject, lease: DeveloperInspectionLease
+    ) throws -> JSONObject {
+        developerInspectionStartForTesting?()
+        return try DeveloperTask.execute(
+            surface: "developer_inspect", arguments, workID: nil, workActivity: workActivity,
+            workspace: lease.workspace, processes: lease.processes
+        )
+    }
+
+    private struct ProcessWaitLease: Sendable {
+        let workspace: LocalWorkspaceService
+        let processes: LocalProcessService
+    }
+
+    private func beginProcessWait() throws -> ProcessWaitLease {
+        operationLock.lock()
+        defer { operationLock.unlock() }
+        guard activeProcessWaits < Self.maximumConcurrentProcessWaits else {
+            throw LocalMCPError.limitExceeded(
+                "\(Self.maximumConcurrentProcessWaits) process waits are already active; no additional wait was started or queued"
+            )
+        }
+        activeProcessWaits += 1
+        return ProcessWaitLease(workspace: workspaceService, processes: processService)
+    }
+
+    private func endProcessWait() {
+        operationLock.lock()
+        activeProcessWaits = max(0, activeProcessWaits - 1)
+        operationLock.unlock()
+    }
+
+    private func executeProcessWait(
+        _ arguments: JSONObject, lease: ProcessWaitLease
+    ) throws -> JSONObject {
+        processWaitStartForTesting?()
+        return try ExpandedToolOperations.execute(
+            "process_wait", arguments, workspace: lease.workspace, processes: lease.processes
+        )
     }
 
     private func executeSearch(_ arguments: JSONObject,
@@ -1452,7 +1548,8 @@ public final class LocalMCPServer: @unchecked Sendable {
         guard message["method"] as? String == "tools/call",
               let params = message["params"] as? JSONObject,
               let name = params["name"] as? String,
-              name == "file_search" || name == "command_run" || Self.isBrevoTool(name) || Self.isMediaTool(name) else { return false }
+              name == "file_search" || name == "command_run" || name == "developer_inspect"
+                || name == "process_wait" || Self.isBrevoTool(name) || Self.isMediaTool(name) else { return false }
         // Validate protocol/session state on the input thread, in frame order.
         // Invalid envelopes retain handle()'s existing JSON-RPC error semantics.
         do {
@@ -1471,9 +1568,17 @@ public final class LocalMCPServer: @unchecked Sendable {
         activityArguments.removeValue(forKey: "transaction_control_token")
         activityArguments.removeValue(forKey: "transaction_control_tokens")
         var workID: String?
+        var responseReserved = false
         do {
-            let effective = try authorizeAndStripWorkControl(name: name, arguments: original)
+            var effective = try authorizeAndStripWorkControl(name: name, arguments: original)
+            effective = try authorizeAndStripProcessControl(name: name, arguments: effective)
             activityArguments = effective
+            guard responses.reserve() else {
+                throw LocalMCPError.limitExceeded(
+                    "32 completed or active tool responses are awaiting delivery; no additional operation was started"
+                )
+            }
+            responseReserved = true
             workID = try workActivity.beginCall(name: name, arguments: effective)
             var prepared = effective
             prepared.removeValue(forKey: "work_id")
@@ -1483,6 +1588,14 @@ public final class LocalMCPServer: @unchecked Sendable {
             } else if name == "command_run" {
                 let finish = try beginCommandRun(prepared, workID: workID)
                 execute = { _ in finish() }
+            } else if name == "developer_inspect" {
+                let lease = try beginDeveloperInspection()
+                execute = { [self] arguments in
+                    try executeDeveloperInspection(arguments, lease: lease)
+                }
+            } else if name == "process_wait" {
+                let lease = try beginProcessWait()
+                execute = { [self] arguments in try executeProcessWait(arguments, lease: lease) }
             } else if Self.isMediaTool(name) {
                 let workspace = try beginMedia(name, prepared)
                 execute = { [self] arguments in try executeMedia(name, arguments, workspace: workspace) }
@@ -1492,6 +1605,7 @@ public final class LocalMCPServer: @unchecked Sendable {
             }
         }
         catch {
+            if responseReserved { responses.release() }
             // Preserve Issues history even when admission fails before a worker
             // exists. This records only the same bounded metadata as other calls.
             _ = try? observedTool(name: name, arguments: activityArguments, workID: workID) {
@@ -1507,18 +1621,29 @@ public final class LocalMCPServer: @unchecked Sendable {
         // family. No unbounded queue, automatic retry or idle polling.
         // Immutable frame bytes cross the queue, not a shared Any dictionary.
         DispatchQueue.global(qos: .utility).async { [self] in
-            defer { responses.group.leave() }
+            defer {
+                // Hold the global response reservation until serialization has
+                // completed or failed. Per-family execution leases are released
+                // separately before the writer can block.
+                responses.release()
+                responses.group.leave()
+            }
             autoreleasepool {
-                let response: JSONObject?
+                let response: JSONObject
+                var responseID: Any = NSNull()
                 do {
                     let request = try LocalJSON.decodeObject(data)
+                    responseID = request["id"] ?? NSNull()
                     let params = try object(request["params"], label: "tool params")
                     let arguments = try object(params["arguments"] ?? [:], label: "tool arguments")
-                    let effective = try authorizeAndStripWorkControl(name: name, arguments: arguments)
-                    var prepared = effective
-                    prepared.removeValue(forKey: "work_id")
                     let payload: JSONObject
+                    var handedToObservation = false
                     do {
+                        var effective = try authorizeAndStripWorkControl(name: name, arguments: arguments)
+                        effective = try authorizeAndStripProcessControl(name: name, arguments: effective)
+                        var prepared = effective
+                        prepared.removeValue(forKey: "work_id")
+                        handedToObservation = true
                         let result = try observedTool(name: name, arguments: effective, workID: admittedWorkID) {
                             try execute(prepared)
                         }
@@ -1526,28 +1651,37 @@ public final class LocalMCPServer: @unchecked Sendable {
                             message: resultSummary(name: name, result: result, arguments: effective),
                             isError: result["isError"] as? Bool == true)
                     } catch {
+                        // observedTool balances the activity after execution has
+                        // begun. Authorization can fail before that boundary and
+                        // must still close the admitted activity exactly once.
+                        if !handedToObservation {
+                            workActivity.finishCall(admittedWorkID, name: name, result: [:], failed: true)
+                        }
                         payload = toolResult(["error": safeMessage(error)], message: safeMessage(error), isError: true)
                     }
-                    response = rpcSuccess(id: request["id"] ?? NSNull(), result: payload)
+                    response = rpcSuccess(id: responseID, result: payload)
                 } catch {
                     workActivity.finishCall(admittedWorkID, name: name, result: [:], failed: true)
-                    responses.recordWriteFailure()
-                    response = nil
+                    let message = safeMessage(error)
+                    response = rpcSuccess(id: responseID, result: toolResult(
+                        ["error": message], message: message, isError: true
+                    ))
                 }
-                // Publish completion with admission locked. A client that reads
-                // the response and immediately sends its next request must not
-                // race the previous worker's lease cleanup. The lock order is
-                // the same operation -> output order used by ordinary tools.
+                // Release the lease before publishing. A client cannot observe
+                // the response before cleanup, while an adapter that stops
+                // draining stdout cannot hold the global operation lock.
                 operationLock.lock()
-                defer { operationLock.unlock() }
                 if name == "file_search" { searchInProgress = false }
                 else if name == "command_run" { activeCommandRuns = max(0, activeCommandRuns - 1) }
+                else if name == "developer_inspect" {
+                    activeDeveloperInspections = max(0, activeDeveloperInspections - 1)
+                }
+                else if name == "process_wait" { activeProcessWaits = max(0, activeProcessWaits - 1) }
                 else if Self.isMediaTool(name) { mediaInProgress = false }
                 else { brevoInProgress = false }
-                if let response {
-                    do { try write(response, to: output) }
-                    catch { responses.recordWriteFailure() }
-                }
+                operationLock.unlock()
+                do { try write(response, to: output) }
+                catch { responses.recordWriteFailure() }
             }
         }
         return true
@@ -1898,7 +2032,7 @@ extension LocalMCPServer {
                 required: ["instance_id", "transaction_ids"], readOnly: false, destructiveHint: true),
             spec(
                 "command_run", "Run command",
-                "Run one short supported executable or headless shell command and return its final output with loopback-only networking and a hard timeout. Its wait does not block other MCP requests. Up to four command_run responses may be pending across chats; use command_start for builds, tests or further concurrent jobs.",
+                "Run one short supported executable or headless shell command and return its final output with loopback-only networking and a hard timeout. Its wait does not block other MCP requests. Up to eight command_run responses may be pending across chats; use command_start for builds, tests or further concurrent jobs.",
                 properties: [
                     "workspace_id": workspaceID, "executable": executable,
                     "arguments": arraySchema(maximumItems: 128), "cwd": path,

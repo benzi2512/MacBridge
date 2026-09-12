@@ -2,15 +2,20 @@ import AppKit
 import SwiftUI
 
 enum MBMetrics {
+    // Keep symbols compact while every interactive control receives the
+    // platform-standard 44 point target. The backing canvas is transparent;
+    // these values do not widen the painted 30/36 point edge material.
+    static let minimumHitTargetSize: CGFloat = 44
     static let edgeIdleWidth: CGFloat = 30
     static let edgeIdleHeight: CGFloat = 58
     static let edgeRailWidth: CGFloat = 36
     static let edgeRailHeight: CGFloat = 196
     static let edgeLogoSize: CGFloat = 22
     static let edgeBrandWidth: CGFloat = 28
-    static let edgeBrandHeight: CGFloat = 38
-    static let edgeTargetSize: CGFloat = 32
-    static let edgeRailSpacing: CGFloat = 3
+    static let edgeBrandHeight: CGFloat = 28
+    static let edgeBrandEndCapLength: CGFloat = 38
+    static let edgeTargetSize: CGFloat = minimumHitTargetSize
+    static let edgeRailSpacing: CGFloat = 0
     static let panelGap: CGFloat = 0
     static let panelWidth: CGFloat = 320
     static let taskDetailWidth: CGFloat = 360
@@ -26,8 +31,8 @@ enum MBMetrics {
     static let panelDuration: TimeInterval = 0.72
     static let closeDuration: TimeInterval = 0.64
     static let reducedMotionDuration: TimeInterval = 0.10
-    static let edgeMotionHorizontalSlack: CGFloat = 4
-    static let edgeMotionVerticalSlack: CGFloat = 16
+    static let edgeMotionHorizontalSlack: CGFloat = 8
+    static let edgeMotionVerticalSlack: CGFloat = 24
 }
 
 enum MBPalette {
@@ -308,7 +313,8 @@ struct EdgeLayout: Equatable, Sendable {
         let requested: CGSize
         switch layer {
         case .idle:
-            requested = CGSize(width: MBMetrics.edgeIdleWidth, height: MBMetrics.edgeIdleHeight)
+            requested = CGSize(width: max(MBMetrics.edgeIdleWidth, MBMetrics.edgeTargetSize),
+                               height: max(MBMetrics.edgeIdleHeight, MBMetrics.edgeTargetSize))
         case .rail:
             // Invisible slack contains the soft spring overshoot. The painted
             // rail and its hit targets keep their original narrow dimensions.
@@ -333,23 +339,44 @@ struct EdgeLayout: Equatable, Sendable {
                       taskCount: Int = 3) -> CGRect {
         let size = size(for: layer, visibleFrame: visibleFrame, taskCount: taskCount)
         let normalized = min(1, max(0, normalizedFromTop))
-        // Reserve vertical room for the deepest panel before opening anything.
-        // Thus neither a taller panel nor a new task row can shift the rail.
-        let maximumHeight = EdgeLayout.size(for: .taskDetail("anchor"), visibleFrame: visibleFrame).height
-        let railCenter = min(visibleFrame.maxY - maximumHeight / 2 - outerInset,
-                             max(visibleFrame.minY + maximumHeight / 2 + outerInset,
-                                 visibleFrame.maxY - visibleFrame.height * normalized - railLogoOffset))
-        let centerY = railCenter + (layer == .idle ? railLogoOffset : 0)
+        // The persisted position names the logo, not the panel center. Let the
+        // canvas grow toward the roomier half of the screen so position 0/1
+        // really reaches the top/bottom while the logo remains stationary.
+        let targetInset = min(visibleFrame.height / 2,
+                              outerInset + MBMetrics.edgeTargetSize / 2)
+        let usable = max(0, visibleFrame.height - targetInset * 2)
+        let desiredLogoY = visibleFrame.maxY - targetInset - usable * normalized
+        let preferredLogoFromTop = normalized <= 0.5
+            ? MBMetrics.edgeTargetSize / 2
+            : size.height - MBMetrics.edgeTargetSize / 2
         let verticalInset = min(outerInset, max(0, (visibleFrame.height - size.height) / 2))
         let minimumY = visibleFrame.minY + verticalInset
         let maximumY = visibleFrame.maxY - size.height - verticalInset
-        let y = min(maximumY, max(minimumY, centerY - size.height / 2))
+        let preferredY = desiredLogoY - (size.height - preferredLogoFromTop)
+        let y = min(maximumY, max(minimumY, preferredY))
         return CGRect(x: visibleFrame.maxX - size.width, y: y, width: size.width, height: size.height)
     }
 
+    static func rightLogoY(frame: CGRect, visibleFrame: CGRect, normalizedFromTop: CGFloat) -> CGFloat {
+        let normalized = min(1, max(0, normalizedFromTop))
+        let targetInset = min(visibleFrame.height / 2,
+                              outerInset + MBMetrics.edgeTargetSize / 2)
+        let usable = max(0, visibleFrame.height - targetInset * 2)
+        let desiredLogoY = visibleFrame.maxY - targetInset - usable * normalized
+        return min(frame.height - MBMetrics.edgeTargetSize / 2,
+                   max(MBMetrics.edgeTargetSize / 2, frame.maxY - desiredLogoY))
+    }
+
     // The logo never moves while the compact five-target rail opens around it.
-    static let railLogoOffset: CGFloat = 69
-    static let logoInset: CGFloat = 15
+    static let railLogoOffset: CGFloat = 88
+    static let logoInset: CGFloat = MBMetrics.edgeTargetSize / 2
+    // Move the visible mark inward just enough to sit inside the 30-point glass
+    // shoulder. Never move it along the rail: the painted logo/count must stay
+    // wholly owned by the same 44-point click/drag target.
+    static let brandVisualInset: CGFloat = 16
+    static let brandVisualAlongOffset: CGFloat = 1
+    static let idleShapeAlongOffset: CGFloat = 7
+    static let expandedShapeAlongAdjustment: CGFloat = 3
 
     static func isContained(_ frame: CGRect, in visibleFrame: CGRect, tolerance: CGFloat = 0.5) -> Bool {
         frame.minX >= visibleFrame.minX - tolerance && frame.maxX <= visibleFrame.maxX + tolerance
@@ -366,6 +393,7 @@ struct FloatingHitRegion: Shape {
     let panelSize: CGSize
     var dockEdge: FloatingDockEdge = .right
     var logoX: CGFloat = 0
+    var direction: FloatingRailDirection = .forward
 
     var animatableData: CGFloat {
         get { expansion }
@@ -378,26 +406,30 @@ struct FloatingHitRegion: Shape {
             // the silhouette reverses its winding, so appended rectangles can
             // subtract clickable holes instead of extending the hit region.
             return FloatingHitRegion(logoY: logoX, expansion: expansion,
-                panelSize: CGSize(width: panelSize.height, height: panelSize.width))
+                panelSize: CGSize(width: panelSize.height, height: panelSize.width),
+                direction: direction)
                 .path(in: CGRect(x: rect.minY, y: rect.minX, width: rect.height, height: rect.width))
                 .applying(CGAffineTransform(a: 0, b: 1, c: 1, d: 0, tx: 0, ty: 0))
         }
         let logo = CGPoint(x: rect.maxX - EdgeLayout.logoInset, y: logoY)
         func includeControls(in path: inout Path) {
-            let brandSize = CGSize(width: MBMetrics.edgeTargetSize, height: MBMetrics.edgeBrandHeight)
-            path.addRect(CGRect(x: logo.x - brandSize.width / 2, y: logo.y - brandSize.height / 2,
-                                width: brandSize.width, height: brandSize.height).intersection(rect))
+            let target = MBMetrics.edgeTargetSize
+            path.addRect(CGRect(x: logo.x - target / 2, y: logo.y - target / 2,
+                                width: target, height: target).intersection(rect))
             if expansion > 0 {
                 for index in 0..<4 {
-                    let center = FloatingDockLayout.actionCenter(index: index, logo: logo, edge: .right)
-                    path.addRect(CGRect(x: center.x - 16, y: center.y - 16, width: 32, height: 32).intersection(rect))
+                    let center = FloatingDockLayout.actionCenter(index: index, logo: logo,
+                                                                 edge: .right, direction: direction)
+                    path.addRect(CGRect(x: center.x - target / 2, y: center.y - target / 2,
+                                        width: target, height: target).intersection(rect))
                 }
             }
         }
         let rail = CGRect(x: rect.maxX - MBMetrics.edgeRailWidth,
-                          y: rect.minY + logoY + EdgeLayout.railLogoOffset - MBMetrics.edgeRailHeight / 2,
+                          y: rect.minY + logoY + direction.sign * EdgeLayout.railLogoOffset
+                              - MBMetrics.edgeRailHeight / 2,
                           width: MBMetrics.edgeRailWidth, height: MBMetrics.edgeRailHeight)
-        var path = AnchoredOrganicEdgeShape(expansion: expansion).path(in: rail)
+        var path = AnchoredOrganicEdgeShape(expansion: expansion, direction: direction).path(in: rail)
         if panelSize.width > 0, panelSize.height > 0 {
             let panel = CGRect(x: rect.maxX - MBMetrics.edgeRailWidth - panelSize.width,
                                y: rect.midY - panelSize.height / 2,
@@ -572,6 +604,7 @@ struct CompactReadingOrder {
 /// A constant canvas lets the silhouette morph without moving the logo or hit targets.
 struct AnchoredOrganicEdgeShape: Shape {
     var expansion: CGFloat
+    var direction: FloatingRailDirection = .forward
     var animatableData: CGFloat {
         get { expansion }
         set { expansion = newValue }
@@ -582,10 +615,24 @@ struct AnchoredOrganicEdgeShape: Shape {
         let t = min(1.04, max(0, expansion))
         let width = MBMetrics.edgeIdleWidth + (MBMetrics.edgeRailWidth - MBMetrics.edgeIdleWidth) * t
         let height = MBMetrics.edgeIdleHeight + (MBMetrics.edgeRailHeight - MBMetrics.edgeIdleHeight) * t
-        let logoY = rect.midY - EdgeLayout.railLogoOffset
-        let top = logoY - MBMetrics.edgeIdleHeight / 2 * (1 - t) - (MBMetrics.edgeRailHeight / 2 - EdgeLayout.railLogoOffset) * t
-        return OrganicEdgeShape(expansion: t).path(in: CGRect(x: 0, y: 0, width: width, height: height))
+        let targetLogoY = rect.midY - direction.sign * EdgeLayout.railLogoOffset
+        let restingTop = targetLogoY + direction.sign * EdgeLayout.idleShapeAlongOffset
+            - MBMetrics.edgeIdleHeight / 2
+        let expandedTop = targetLogoY + direction.sign * EdgeLayout.railLogoOffset
+            - MBMetrics.edgeRailHeight / 2
+            - direction.sign * EdgeLayout.expandedShapeAlongAdjustment
+        let top = restingTop * (1 - t) + expandedTop * t
+        var path = OrganicEdgeShape(expansion: t).path(in: CGRect(x: 0, y: 0, width: width, height: height))
             .applying(CGAffineTransform(translationX: rect.maxX - width, y: top))
+        // The rail's tapered shoulder is intentionally slimmer than the logo
+        // target. Keep a tiny end-cap under the actual 28-point brand paint so
+        // the count never floats outside the glass during the morph.
+        let badgeCenterY = targetLogoY + direction.sign * EdgeLayout.brandVisualAlongOffset
+        path.addRect(CGRect(x: rect.maxX - MBMetrics.edgeIdleWidth,
+                            y: badgeCenterY - MBMetrics.edgeBrandEndCapLength / 2,
+                            width: MBMetrics.edgeIdleWidth,
+                            height: MBMetrics.edgeBrandEndCapLength))
+        return path
     }
 }
 

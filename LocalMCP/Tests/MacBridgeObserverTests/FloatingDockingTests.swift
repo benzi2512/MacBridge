@@ -16,21 +16,25 @@ final class FloatingDockingTests: XCTestCase {
         XCTAssertTrue(drag.isDragging)
     }
 
-    func testNearestEdgeUsesHysteresisAtTheCorner() {
+    func testDragStaysOnTheSelectedEdgeIncludingCorners() {
         let screen = CGRect(x: -1920, y: 50, width: 1920, height: 1030)
-        XCTAssertEqual(FloatingDockLayout.anchor(at: CGPoint(x: -3, y: 600), visibleFrame: screen, previousEdge: .bottom).edge, .right)
-        XCTAssertEqual(FloatingDockLayout.anchor(at: CGPoint(x: -960, y: 53), visibleFrame: screen, previousEdge: .right).edge, .bottom)
-        for previous in FloatingDockEdge.allCases {
-            XCTAssertEqual(FloatingDockLayout.anchor(at: CGPoint(x: -30, y: 80), visibleFrame: screen, previousEdge: previous).edge, previous)
+        for point in [CGPoint(x: -3, y: 600), CGPoint(x: -960, y: 53),
+                      CGPoint(x: -30, y: 80), CGPoint(x: screen.maxX, y: screen.minY)] {
+            for previous in FloatingDockEdge.allCases {
+                XCTAssertEqual(FloatingDockLayout.anchor(at: point, visibleFrame: screen,
+                                                         previousEdge: previous).edge, previous)
+            }
         }
+        XCTAssertEqual(FloatingDockLayout.anchor(at: CGPoint(x: screen.maxX, y: screen.minY),
+            visibleFrame: screen, previousEdge: .right), .init(edge: .right, position: 1))
     }
 
     func testNormalizedCoordinatesUseEachDisplaysOrigin() {
         let screen = CGRect(x: -1500, y: 1000, width: 1500, height: 900)
-        let bottom = FloatingDockLayout.anchor(at: CGPoint(x: -1125, y: 1002), visibleFrame: screen, previousEdge: .right)
+        let bottom = FloatingDockLayout.anchor(at: CGPoint(x: -1125, y: 1002), visibleFrame: screen, previousEdge: .bottom)
         XCTAssertEqual(bottom.edge, .bottom)
         XCTAssertEqual(bottom.position, 0.25, accuracy: 0.00001)
-        let right = FloatingDockLayout.anchor(at: CGPoint(x: -2, y: 1450), visibleFrame: screen, previousEdge: .bottom)
+        let right = FloatingDockLayout.anchor(at: CGPoint(x: -2, y: 1450), visibleFrame: screen, previousEdge: .right)
         XCTAssertEqual(right.edge, .right)
         XCTAssertEqual(right.position, 0.5, accuracy: 0.00001)
     }
@@ -45,10 +49,12 @@ final class FloatingDockingTests: XCTestCase {
                     let anchor = FloatingDockAnchor(edge: edge, position: Double(index) / 100)
                     var firstLogo: CGPoint?
                     for layer in layers {
-                        let frame = FloatingDockLayout.frame(visibleFrame: screen, layer: layer, anchor: anchor, taskCount: 64)
+                        let placement = FloatingDockLayout.placement(visibleFrame: screen, layer: layer,
+                                                                    anchor: anchor, taskCount: 64)
+                        let frame = placement.frame
                         XCTAssertTrue(EdgeLayout.isContained(frame, in: screen), "\(edge) \(layer) \(frame)")
-                        let local = FloatingDockLayout.logo(in: frame.size, layer: layer, edge: edge)
-                        let logo = CGPoint(x: frame.minX + local.x, y: frame.maxY - local.y)
+                        let logo = CGPoint(x: frame.minX + placement.logo.x,
+                                           y: frame.maxY - placement.logo.y)
                         if let firstLogo {
                             XCTAssertEqual(logo.x, firstLogo.x, accuracy: 0.001)
                             XCTAssertEqual(logo.y, firstLogo.y, accuracy: 0.001)
@@ -63,39 +69,50 @@ final class FloatingDockingTests: XCTestCase {
     func testBottomIdleAndRailAreNarrowAndTaskViewportIsBounded() {
         let screen = CGRect(x: 0, y: 40, width: 1512, height: 920)
         let idle = FloatingDockLayout.size(for: .idle, visibleFrame: screen, edge: .bottom)
-        XCTAssertEqual(idle, CGSize(width: 58, height: 30))
+        XCTAssertEqual(idle, CGSize(width: 58, height: 44))
         let rail = FloatingDockLayout.size(for: .rail, visibleFrame: screen, edge: .bottom)
-        XCTAssertEqual(rail, CGSize(width: 212, height: 40))
+        XCTAssertEqual(rail, CGSize(width: 220, height: 44))
+        XCTAssertEqual(MBMetrics.edgeIdleWidth, 30, "The painted idle material did not grow")
+        XCTAssertEqual(MBMetrics.edgeRailWidth, 36, "The painted rail did not grow")
         XCTAssertEqual(FloatingDockLayout.size(for: .recentTasks, visibleFrame: screen, taskCount: 6, edge: .bottom),
                        FloatingDockLayout.size(for: .recentTasks, visibleFrame: screen, taskCount: 64, edge: .bottom))
     }
 
     func testBottomHitRegionHasUprightCardAndNoInvisibleLargeHotZone() {
-        let size = FloatingDockLayout.size(for: .recentTasks, visibleFrame: CGRect(x: 0, y: 0, width: 1512, height: 920), edge: .bottom)
-        let logo = FloatingDockLayout.logo(in: size, layer: .recentTasks, edge: .bottom)
+        let screen = CGRect(x: 0, y: 0, width: 1512, height: 920)
+        let placement = FloatingDockLayout.placement(visibleFrame: screen, layer: .recentTasks,
+            anchor: .init(edge: .bottom, position: 0.5), taskCount: 3)
+        let size = placement.frame.size
+        let logo = placement.logo
         let region = FloatingHitRegion(logoY: logo.y, expansion: 1,
-            panelSize: EdgeLayout.panelSize(for: .recentTasks, taskCount: 3), dockEdge: .bottom, logoX: logo.x)
+            panelSize: EdgeLayout.panelSize(for: .recentTasks, taskCount: 3), dockEdge: .bottom,
+            logoX: logo.x, direction: placement.direction)
             .path(in: CGRect(origin: .zero, size: size))
         XCTAssertTrue(region.contains(logo))
         XCTAssertTrue(region.contains(CGPoint(x: size.width / 2, y: 70)))
-        XCTAssertFalse(region.contains(CGPoint(x: 1, y: size.height - 1)))
+        XCTAssertFalse(region.contains(CGPoint(x: size.width - 1, y: size.height - 1)),
+                       "The transparent corner beyond the horizontal rail is not a hot zone")
     }
 
     func testFullControlTargetsRemainClickableInBothDockOrientations() {
         let screen = CGRect(x: 0, y: 0, width: 1512, height: 920)
         for edge in FloatingDockEdge.allCases {
             for layer: FloatingLayer in [.rail, .recentTasks, .settings] {
-                let size = FloatingDockLayout.size(for: layer, visibleFrame: screen, edge: edge)
+                let placement = FloatingDockLayout.placement(visibleFrame: screen, layer: layer,
+                    anchor: .init(edge: edge, position: 0.5), taskCount: 3)
+                let size = placement.frame.size
                 let canvas = CGRect(origin: .zero, size: size)
-                let logo = FloatingDockLayout.logo(in: size, layer: layer, edge: edge)
+                let logo = placement.logo
                 for expansion: CGFloat in [0.01, 0.5, 1] {
                     let region = FloatingHitRegion(logoY: logo.y, expansion: expansion,
-                        panelSize: EdgeLayout.panelSize(for: layer, taskCount: 3), dockEdge: edge, logoX: logo.x).path(in: canvas)
+                        panelSize: EdgeLayout.panelSize(for: layer, taskCount: 3), dockEdge: edge,
+                        logoX: logo.x, direction: placement.direction).path(in: canvas)
                     for index in 0..<4 {
-                        let center = FloatingDockLayout.actionCenter(index: index, logo: logo, edge: edge)
+                        let center = FloatingDockLayout.actionCenter(index: index, logo: logo, edge: edge,
+                                                                     direction: placement.direction)
                         // Test blank space around each symbol, not just its center.
-                        for dx: CGFloat in [-15.5, 0, 15.5] {
-                            for dy: CGFloat in [-15.5, 0, 15.5] {
+                        for dx: CGFloat in [-21.5, 0, 21.5] {
+                            for dy: CGFloat in [-21.5, 0, 21.5] {
                                 let point = CGPoint(x: center.x + dx, y: center.y + dy)
                                 if canvas.contains(point) {
                                     XCTAssertTrue(region.contains(point), "\(edge) \(layer) \(index) \(point)")
@@ -109,26 +126,26 @@ final class FloatingDockingTests: XCTestCase {
     }
 
     func testLargerTargetsKeepRailNarrowAndNeverOverlapTheLogoOrAnotherAction() {
-        XCTAssertEqual(MBMetrics.edgeTargetSize, 32)
+        XCTAssertEqual(MBMetrics.edgeTargetSize, 44)
         XCTAssertEqual(MBMetrics.edgeRailWidth, 36)
         for edge in FloatingDockEdge.allCases {
-            let logo = CGPoint(x: 200, y: 200)
-            let brandSize = edge == .right ? CGSize(width: 32, height: 38) : CGSize(width: 38, height: 32)
-            var previous = CGRect(x: logo.x - brandSize.width / 2, y: logo.y - brandSize.height / 2,
-                                  width: brandSize.width, height: brandSize.height)
-            for index in 0..<4 {
-                let center = FloatingDockLayout.actionCenter(index: index, logo: logo, edge: edge)
-                let target = CGRect(x: center.x - 16, y: center.y - 16, width: 32, height: 32)
-                let overlap = previous.intersection(target)
-                XCTAssertTrue(overlap.isNull || overlap.width * overlap.height == 0,
-                              "\(edge): neighboring controls must not compete for one click")
-                previous = target
+            for direction in [FloatingRailDirection.forward, .reverse] {
+                let logo = CGPoint(x: 200, y: 200)
+                var previous = CGRect(x: logo.x - 22, y: logo.y - 22, width: 44, height: 44)
+                for index in 0..<4 {
+                    let center = FloatingDockLayout.actionCenter(index: index, logo: logo, edge: edge,
+                                                                 direction: direction)
+                    let target = CGRect(x: center.x - 22, y: center.y - 22, width: 44, height: 44)
+                    let overlap = previous.intersection(target)
+                    XCTAssertTrue(overlap.isNull || overlap.width * overlap.height == 0,
+                                  "\(edge): neighboring controls must not compete for one click")
+                    previous = target
+                }
             }
         }
-        // The stack's logo placeholder matches the separately hosted logo.
-        let halfStack = (5 * MBMetrics.edgeTargetSize + 4 * MBMetrics.edgeRailSpacing) / 2
-        XCTAssertEqual(EdgeLayout.railLogoOffset - halfStack + MBMetrics.edgeTargetSize / 2
-                       + FloatingDockLayout.railContentOffset, 0, accuracy: 0.001)
+        XCTAssertEqual(EdgeLayout.railLogoOffset, 2 * MBMetrics.edgeTargetSize)
+        XCTAssertEqual(MBMetrics.edgeBrandWidth, 28)
+        XCTAssertEqual(MBMetrics.edgeBrandHeight, 28)
     }
 
     @MainActor
@@ -136,13 +153,13 @@ final class FloatingDockingTests: XCTestCase {
         let host = FloatingFirstClickHostingView(rootView: Text("Fixture"))
         XCTAssertTrue(host.acceptsFirstMouse(for: nil))
         XCTAssertNil(host.window, "This check must not show or focus a production window")
-        let logo = FloatingLogoControl.LogoView(frame: CGRect(x: 0, y: 0, width: 32, height: 38))
+        let logo = FloatingLogoControl.LogoView(frame: CGRect(x: 0, y: 0, width: 44, height: 44))
         XCTAssertTrue(logo.acceptsFirstMouse(for: nil))
-        for point in [CGPoint(x: 0.5, y: 0.5), CGPoint(x: 31.5, y: 37.5), CGPoint(x: 16, y: 19)] {
+        for point in [CGPoint(x: 0.5, y: 0.5), CGPoint(x: 43.5, y: 43.5), CGPoint(x: 22, y: 22)] {
             XCTAssertTrue(logo.hitTest(point) === logo, "The whole logo box must receive clicks and drags")
         }
-        XCTAssertNil(logo.hitTest(CGPoint(x: -1, y: 19)))
-        XCTAssertNil(logo.hitTest(CGPoint(x: 33, y: 19)))
+        XCTAssertNil(logo.hitTest(CGPoint(x: -1, y: 22)))
+        XCTAssertNil(logo.hitTest(CGPoint(x: 45, y: 22)))
     }
 
     @MainActor
@@ -199,14 +216,16 @@ final class FloatingDockingTests: XCTestCase {
         let bottom = CGPoint(x: screen.midX, y: screen.minY + 2)
         controller.logoDragged(to: bottom)
         XCTAssertTrue(preferences.dockAnchors.isEmpty, "Mouse moves must not write preferences")
-        XCTAssertEqual(controller.dockAnchor.edge, .bottom)
+        XCTAssertEqual(controller.dockAnchor.edge, .right)
+        XCTAssertEqual(controller.dockAnchor.position, 1, accuracy: 0.01)
         XCTAssertEqual(controller.layer, .idle)
         controller.pointerChanged(true)
         controller.preview(.recentTasks, inside: true)
         XCTAssertEqual(controller.pendingTransitionCount, 0, "Hover must not race a drag")
         controller.logoPressEnded(at: bottom)
         XCTAssertEqual(opened, 1)
-        XCTAssertEqual(preferences.dockAnchor(for: controller.displayID).edge, .bottom)
+        XCTAssertEqual(preferences.dockAnchor(for: controller.displayID).edge, .right)
+        XCTAssertEqual(preferences.dockAnchor(for: controller.displayID).position, 1, accuracy: 0.01)
         XCTAssertFalse(controller.isDraggingLogo)
         XCTAssertFalse(controller.hasCreatedPanel)
         XCTAssertEqual(model.directory, "")

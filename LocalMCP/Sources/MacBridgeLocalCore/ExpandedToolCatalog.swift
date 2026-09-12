@@ -68,7 +68,7 @@ enum ExpandedToolCatalog {
             spec("file_write_many", "Write 1-16 explicit UTF-8 files with per-file expected hashes and undo receipts, at most 1 MiB total content. NOT an atomic batch: successful earlier writes remain if another item fails. Never blindly replay uncertain batches; inspect each receipt and restore selected transactions if needed.",
                  ["workspace_id": ws, "files": array(write, 16)], ["workspace_id", "files"], write: true),
             spec("command_list", "List executable IDs actually supported and currently resolvable by this runtime without launching them. Use these IDs, not arbitrary absolute executable paths. No version probes or environment-variable values.", [:], []),
-            spec("process_wait", "Optional wait up to 1000 ms for one existing job; no kill or output consumption. Not a required step before output. Observation timeout is not job failure. Occupies the MCP request loop; do other work between checks instead of frequent polling.",
+            spec("process_wait", "Optional wait up to 1000 ms for one existing job; no kill or output consumption. Not a required step before output. Observation timeout is not job failure. Its bounded wait is dispatched off the MCP request loop so other chats remain responsive; do other work between checks instead of frequent polling.",
                  ["task_id": task, "process_control_token": control,
                   "maximum_wait_milliseconds": integer(0, 1000)], ["task_id"]),
             spec("process_status_many", "Read status for 1-32 existing task IDs with per-item errors. Does not consume output, cancel, or start work.", ["task_ids": array(task, 32)], ["task_ids"]),

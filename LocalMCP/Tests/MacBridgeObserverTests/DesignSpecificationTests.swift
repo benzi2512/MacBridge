@@ -54,7 +54,9 @@ final class DesignSpecificationTests: XCTestCase {
     }
 
     func testShapeHonorsCanvasOriginAndContainsStationaryLogoAcrossMorph() {
-        let canvas = CGRect(x: 0, y: 0, width: MBMetrics.edgeRailWidth, height: MBMetrics.edgeRailHeight)
+        let canvas = CGRect(origin: .zero,
+                            size: EdgeLayout.size(for: .rail,
+                                visibleFrame: CGRect(x: 0, y: 0, width: 1512, height: 982)))
         let logo = CGPoint(x: canvas.maxX - EdgeLayout.logoInset,
                            y: canvas.midY - EdgeLayout.railLogoOffset)
         for step in 0...100 {
@@ -68,7 +70,7 @@ final class DesignSpecificationTests: XCTestCase {
         }
         let idle = AnchoredOrganicEdgeShape(expansion: 0).path(in: canvas).boundingRect
         XCTAssertEqual(idle.height, MBMetrics.edgeIdleHeight, accuracy: 0.01)
-        XCTAssertEqual(idle.midY, logo.y, accuracy: 0.01)
+        XCTAssertEqual(idle.midY, logo.y + EdgeLayout.idleShapeAlongOffset, accuracy: 0.01)
     }
 
     @MainActor
@@ -200,33 +202,45 @@ final class DesignSpecificationTests: XCTestCase {
     }
 
     func testHoverRegionExcludesTransparentCornersButKeepsLogoAndPanelCrossing() {
-        let size = EdgeLayout.size(for: .recentTasks,
-                                   visibleFrame: CGRect(x: 0, y: 0, width: 1_512, height: 982), taskCount: 0)
+        let screen = CGRect(x: 0, y: 0, width: 1_512, height: 982)
+        let placement = FloatingDockLayout.placement(visibleFrame: screen, layer: .recentTasks,
+            anchor: .init(edge: .right, position: 0.5), taskCount: 0)
+        let size = placement.frame.size
         let canvas = CGRect(origin: .zero, size: size)
-        let logoY = canvas.midY - EdgeLayout.railLogoOffset
-        let logoX = canvas.maxX - EdgeLayout.logoInset
+        let logoY = placement.logo.y
+        let logoX = placement.logo.x
         let visible = FloatingHitRegion(logoY: logoY, expansion: 1,
-            panelSize: EdgeLayout.panelSize(for: .recentTasks, taskCount: 0)).path(in: canvas)
+            panelSize: EdgeLayout.panelSize(for: .recentTasks, taskCount: 0),
+            direction: placement.direction).path(in: canvas)
         XCTAssertFalse(visible.contains(CGPoint(x: 1, y: 1)), "Transparent canvas and rounded panel corners are not hover targets")
         XCTAssertTrue(visible.contains(CGPoint(x: logoX, y: logoY)), "The anchored logo remains reachable")
         for x in stride(from: canvas.maxX - MBMetrics.edgeRailWidth - 16, through: logoX, by: 2) {
             XCTAssertTrue(visible.contains(CGPoint(x: x, y: canvas.midY)), "No dead gap crossing from panel to rail at \(x)")
         }
-        let closing = FloatingHitRegion(logoY: logoY, expansion: 0, panelSize: .zero).path(in: canvas)
+        let closing = FloatingHitRegion(logoY: logoY, expansion: 0, panelSize: .zero,
+                                        direction: placement.direction).path(in: canvas)
         XCTAssertTrue(closing.contains(CGPoint(x: logoX, y: logoY)))
         XCTAssertFalse(closing.contains(CGPoint(x: logoX, y: canvas.maxY - 20)), "The closed rail does not keep its invisible canvas active")
         XCTAssertFalse(closing.contains(CGPoint(x: 100, y: canvas.midY)), "A removed panel is not a hover target")
         for step in 0...20 {
             let progress = CGFloat(step) / 20
-            let region = FloatingHitRegion(logoY: logoY, expansion: progress, panelSize: .zero).path(in: canvas)
-            let painted = AnchoredOrganicEdgeShape(expansion: progress)
+            let region = FloatingHitRegion(logoY: logoY, expansion: progress, panelSize: .zero,
+                                           direction: placement.direction).path(in: canvas)
+            let painted = AnchoredOrganicEdgeShape(expansion: progress, direction: placement.direction)
                 .path(in: CGRect(x: canvas.maxX - MBMetrics.edgeRailWidth,
-                                 y: canvas.midY - MBMetrics.edgeRailHeight / 2,
+                                 y: logoY + placement.direction.sign * EdgeLayout.railLogoOffset
+                                    - MBMetrics.edgeRailHeight / 2,
                                  width: MBMetrics.edgeRailWidth, height: MBMetrics.edgeRailHeight))
-            var boxes = [CGRect(x: logoX - 16, y: logoY - 19, width: 32, height: 38).intersection(canvas)]
+            let target = MBMetrics.minimumHitTargetSize
+            var boxes = [CGRect(x: logoX - target / 2, y: logoY - target / 2,
+                                width: target, height: target).intersection(canvas)]
             if progress > 0 {
-                boxes += (1...4).map { CGRect(x: logoX - 16, y: logoY + CGFloat($0) * 35 - 16,
-                                             width: 32, height: 32).intersection(canvas) }
+                boxes += (0..<4).map {
+                    let center = FloatingDockLayout.actionCenter(index: $0, logo: placement.logo,
+                        edge: .right, direction: placement.direction)
+                    return CGRect(x: center.x - target / 2, y: center.y - target / 2,
+                                  width: target, height: target).intersection(canvas)
+                }
             }
             // Buttons intentionally include blank space outside the painted
             // curve; no other invisible area should keep the widget open.

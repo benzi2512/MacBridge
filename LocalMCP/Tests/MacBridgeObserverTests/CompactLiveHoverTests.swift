@@ -31,13 +31,19 @@ final class CompactLiveHoverTests: XCTestCase {
         let screen = try XCTUnwrap(controller.currentScreen)
         let mainTop = try XCTUnwrap(NSScreen.screens.first).frame.maxY
         func pointerPoint(_ p: CGPoint) -> CGPoint { CGPoint(x: p.x, y: mainTop - p.y) }
-        let idle = EdgeLayout.frame(visibleFrame: screen.visibleFrame, layer: .idle,
-                                   normalizedFromTop: preferences.normalizedY(for: controller.displayID))
-        let outside = pointerPoint(CGPoint(x: idle.minX - 450, y: idle.midY))
-        let logo = pointerPoint(CGPoint(x: idle.maxX - EdgeLayout.logoInset, y: idle.midY))
-        let railStep = EdgeLayout.railLogoOffset / 2
-        let recent = CGPoint(x: logo.x, y: logo.y + 2 * railStep)
-        let settings = CGPoint(x: logo.x, y: logo.y + 3 * railStep)
+        let anchor = preferences.dockAnchor(for: controller.displayID)
+        let idle = FloatingDockLayout.placement(visibleFrame: screen.visibleFrame, layer: .idle, anchor: anchor)
+        let rail = FloatingDockLayout.placement(visibleFrame: screen.visibleFrame, layer: .rail, anchor: anchor)
+        let screenLogo = CGPoint(x: idle.frame.minX + idle.logo.x, y: idle.frame.maxY - idle.logo.y)
+        let outside = pointerPoint(CGPoint(x: idle.frame.minX - 450, y: screenLogo.y))
+        let logo = pointerPoint(screenLogo)
+        func action(_ index: Int) -> CGPoint {
+            let local = FloatingDockLayout.actionCenter(index: index, logo: rail.logo, edge: .right,
+                                                        direction: rail.direction)
+            return pointerPoint(CGPoint(x: rail.frame.minX + local.x, y: rail.frame.maxY - local.y))
+        }
+        let recent = action(1)
+        let settings = action(2)
         for _ in 0..<3 {
             move(outside)
             try await Task.sleep(nanoseconds: UInt64((MBMetrics.hoverExitGrace + MBMetrics.closeDuration + 0.12) * 1_000_000_000))

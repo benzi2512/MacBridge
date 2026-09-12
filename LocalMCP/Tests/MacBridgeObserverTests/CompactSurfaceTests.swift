@@ -92,16 +92,15 @@ final class CompactSurfaceTests: XCTestCase {
             }
         }
         XCTAssertEqual(EdgeLayout.size(for: .idle, visibleFrame: frames[0]),
-                       CGSize(width: MBMetrics.edgeIdleWidth, height: MBMetrics.edgeIdleHeight))
+                       CGSize(width: MBMetrics.minimumHitTargetSize, height: MBMetrics.edgeIdleHeight))
         XCTAssertEqual(EdgeLayout.size(for: .rail, visibleFrame: frames[0]),
                        CGSize(width: MBMetrics.edgeRailWidth + MBMetrics.edgeMotionHorizontalSlack,
                               height: MBMetrics.edgeRailHeight + MBMetrics.edgeMotionVerticalSlack),
                        "The backing canvas contains overshoot; the painted rail stays 36×196")
         XCTAssertLessThanOrEqual(MBMetrics.edgeIdleWidth, 30, "The idle handle must remain extremely narrow")
         XCTAssertLessThanOrEqual(MBMetrics.edgeRailWidth, 36, "Hover must not restore the old wide rail")
-        XCTAssertEqual(EdgeLayout.railLogoOffset,
-                       (MBMetrics.edgeRailHeight - MBMetrics.edgeIdleHeight) / 2,
-                       "The idle mark must remain anchored at the rail's first position")
+        XCTAssertEqual(EdgeLayout.railLogoOffset, 2 * MBMetrics.minimumHitTargetSize,
+                       "Five adjacent 44-point targets fit without competing hit regions")
         XCTAssertEqual(EdgeLayout.size(for: .recentTasks, visibleFrame: frames[0]).width,
                        MBMetrics.edgeRailWidth + MBMetrics.panelGap + MBMetrics.panelWidth)
         XCTAssertEqual(EdgeLayout.size(for: .taskDetail("task"), visibleFrame: frames[0]).width,
@@ -174,13 +173,16 @@ final class CompactSurfaceTests: XCTestCase {
         for visible in [CGRect(x: 0, y: 25, width: 1512, height: 957),
                         CGRect(x: -1920, y: 0, width: 1920, height: 1080)] {
             for anchor: CGFloat in [0.14, 0.40, 0.86] {
-                let idle = EdgeLayout.frame(visibleFrame: visible, layer: .idle, normalizedFromTop: anchor)
+                let idle = FloatingDockLayout.placement(visibleFrame: visible, layer: .idle,
+                    anchor: .init(edge: .right, position: Double(anchor)))
                 for layer: FloatingLayer in [.rail, .recentTasks, .settings, .taskDetail("a")] {
                     for count in [0, 1, 3, 6, 64] {
-                        let frame = EdgeLayout.frame(visibleFrame: visible, layer: layer,
-                                                     normalizedFromTop: anchor, taskCount: count)
-                        XCTAssertEqual(frame.midY + EdgeLayout.railLogoOffset, idle.midY, accuracy: 0.001)
-                        XCTAssertEqual(frame.maxX, idle.maxX, accuracy: 0.001)
+                        let placement = FloatingDockLayout.placement(visibleFrame: visible, layer: layer,
+                            anchor: .init(edge: .right, position: Double(anchor)), taskCount: count)
+                        let screenLogoY = placement.frame.maxY - placement.logo.y
+                        let idleScreenLogoY = idle.frame.maxY - idle.logo.y
+                        XCTAssertEqual(screenLogoY, idleScreenLogoY, accuracy: 0.001)
+                        XCTAssertEqual(placement.frame.maxX, idle.frame.maxX, accuracy: 0.001)
                     }
                 }
             }
