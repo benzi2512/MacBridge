@@ -17,8 +17,8 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 20
     env:
-      MB_SOURCE_SHA: 3f89746b44a3c1ed706b49de88af107ccd360def
-      MB_SOURCE_TREE: 8cab38bb6b07a8a5f449dc639842c2d059b609fa
+      MB_SOURCE_SHA: fa218baeffb1e7de962c242a10ede854f1d68d93
+      MB_SOURCE_TREE: b177a417c2acd8f600385541d56301d200cf478f
     steps:
       - name: Qualify reviewed source in a disposable GitHub Mac
         shell: bash
