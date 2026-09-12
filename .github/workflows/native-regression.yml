@@ -17,8 +17,8 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 20
     env:
-      MB_SOURCE_SHA: b64cefce7de37ee70603998faaee844492080b51
-      MB_SOURCE_TREE: 58cd16d8ebae6d6d01fc500e8cf63446cdcadfd3
+      MB_SOURCE_SHA: 3f89746b44a3c1ed706b49de88af107ccd360def
+      MB_SOURCE_TREE: 8cab38bb6b07a8a5f449dc639842c2d059b609fa
     steps:
       - name: Qualify reviewed source in a disposable GitHub Mac
         shell: bash
@@ -27,7 +27,10 @@ jobs:
           test "$RUNNER_ENVIRONMENT" = github-hosted
           test "$RUNNER_OS" = macOS
           test "$RUNNER_ARCH" = ARM64
-          test "$GITHUB_REPOSITORY" = benzi2512/MacBridge-Release
+          # Bind to the immutable repository identity so the reviewed workflow
+          # remains valid across the planned display-name rename.
+          test "$GITHUB_REPOSITORY_ID" = 1364622419
+          repo_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
           # Only preinstalled tools. Never install packages or modify the host's
           # security, certificates, login services or keychain.
           /usr/bin/sw_vers
@@ -40,7 +43,7 @@ jobs:
           /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
             /usr/bin/git -c init.templateDir= -c core.hooksPath=/dev/null init "$mb_ci_root/source"
           /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
-            /usr/bin/git -C "$mb_ci_root/source" -c credential.helper= -c core.hooksPath=/dev/null fetch --depth=1 https://github.com/benzi2512/MacBridge-Release.git "$MB_SOURCE_SHA"
+            /usr/bin/git -C "$mb_ci_root/source" -c credential.helper= -c core.hooksPath=/dev/null fetch --depth=1 "$repo_url" "$MB_SOURCE_SHA"
           test "$(/usr/bin/git -C "$mb_ci_root/source" rev-parse FETCH_HEAD)" = "$MB_SOURCE_SHA"
           test "$(/usr/bin/git -C "$mb_ci_root/source" rev-parse 'FETCH_HEAD^{tree}')" = "$MB_SOURCE_TREE"
           /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
