@@ -1392,16 +1392,28 @@ final class ServerAndProcessTests: XCTestCase {
         try Data("print(\"direct-build-ok\")\n".utf8).write(
             to: fixture.workspace.appendingPathComponent("Sources/Smoke/main.swift")
         )
+        let swiftInstallation = SwiftInstallation.select()
+        let supportsXCTest = swiftInstallation.developer == SwiftInstallation.xcode.developer
         try Data(
             """
             import Testing
             @Test func directTest() { #expect(2 + 2 == 4) }
-            import XCTest
-            final class XCTestSmoke: XCTestCase {
-                func testXCTestAlsoRuns() { XCTAssertEqual(2 + 2, 4) }
-            }
             """.utf8
         ).write(to: fixture.workspace.appendingPathComponent("Tests/SmokeTests/SmokeTests.swift"))
+        // A complete, trusted full-Xcode installation must also run XCTest.
+        // The secure CLT fallback intentionally validates Swift Testing only:
+        // current CLT releases do not ship XCTest, and importing it would test
+        // an unavailable framework rather than MacBridge's direct sandbox.
+        if supportsXCTest {
+            try Data(
+                """
+                import XCTest
+                final class XCTestSmoke: XCTestCase {
+                    func testXCTestAlsoRuns() { XCTAssertEqual(2 + 2, 4) }
+                }
+                """.utf8
+            ).write(to: fixture.workspace.appendingPathComponent("Tests/SmokeTests/XCTestSmoke.swift"))
+        }
 
         let processes = LocalProcessService(
             workspaceService: try fixture.service(),
@@ -1430,8 +1442,12 @@ final class ServerAndProcessTests: XCTestCase {
         XCTAssertEqual(test["exit_code"] as? Int, 0,
                        (test["stderr"] as? String ?? "") + "\nSTDOUT\n" + (test["stdout"] as? String ?? ""))
         XCTAssertTrue(((test["stdout"] as? String) ?? "").contains("Test run with 1 test"))
-        XCTAssertTrue(((test["stdout"] as? String) ?? "").contains("testXCTestAlsoRuns"),
-                      "STDOUT\n" + (test["stdout"] as? String ?? "") + "\nSTDERR\n" + (test["stderr"] as? String ?? ""))
+        if supportsXCTest {
+            XCTAssertTrue(((test["stdout"] as? String) ?? "").contains("testXCTestAlsoRuns"),
+                          "STDOUT\n" + (test["stdout"] as? String ?? "") + "\nSTDERR\n" + (test["stderr"] as? String ?? ""))
+        } else {
+            XCTAssertEqual(swiftInstallation.developer, SwiftInstallation.commandLineTools.developer)
+        }
         XCTAssertFalse(((test["stderr"] as? String) ?? "").contains("could not write dependency graph"))
         XCTAssertEqual(test["terminal_window_opened"] as? Bool, false)
         XCTAssertEqual(test["network"] as? String, "loopback_only")
