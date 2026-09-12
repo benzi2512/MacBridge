@@ -145,7 +145,7 @@ def build_payload(binary_directory, output, core_hash, ui_hash, markers):
     inputs["Contents/Resources/ThirdPartyNotices.txt"] = regular_read(SOURCE / "Observer/CODENOTCH-LICENSE.txt")
     plist = plistlib.loads(inputs["Contents/Info.plist"])
     if (plist.get("CFBundleIdentifier"), plist.get("CFBundleExecutable"), plist.get("CFBundleShortVersionString")) != (
-            "local.macbridge.observer", "macbridge-observer", "0.3.0"):
+            "local.macbridge.observer", "macbridge-observer", "0.3.1"):
         raise GateError("unexpected_bundle_identity")
     readme = regular_read(SOURCE / "Release/FIRST-RUN.md")
     gate = Gate(markers)
@@ -178,7 +178,7 @@ def image_create_arguments(payload, image):
 
 
 def build_and_verify_image(payload, output, manifest, markers):
-    image = output / "MacBridge-0.3.0-arm64-development.dmg"
+    image = output / "MacBridge-0.3.1-arm64-development.dmg"
     local_command(image_create_arguments(payload, image), timeout=180)
     local_command(["/usr/bin/hdiutil", "verify", image], timeout=120)
     mount = Path(tempfile.mkdtemp(prefix="mb-dmg-check-", dir="/private/tmp"))

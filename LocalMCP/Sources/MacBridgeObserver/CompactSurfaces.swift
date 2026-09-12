@@ -11,8 +11,14 @@ struct GlassSurface<S: Shape>: ViewModifier {
     @Environment(\.mbReduceTransparency) private var appReduceTransparency
     @Environment(\.mbGlassOpacity) private var requestedGlassOpacity
     @Environment(\.colorSchemeContrast) private var contrast
+    @Environment(\.colorScheme) private var colorScheme
 
     private var glassOpacity: Double { min(1, max(0.35, requestedGlassOpacity)) }
+    private var glassTint: Color {
+        colorScheme == .dark
+            ? Color.black.opacity(0.62)
+            : Color.white.opacity(0.08)
+    }
 
     @ViewBuilder
     func body(content: Content) -> some View {
@@ -26,19 +32,23 @@ struct GlassSurface<S: Shape>: ViewModifier {
                     if #available(macOS 26.0, *) {
                         // Clear/Tinted and light/dark belong to macOS, not to
                         // a colored overlay. Both layers retain shape identity.
-                        Color.clear.glassEffect(.regular, in: shape)
+                        Color.clear.glassEffect(.regular.tint(glassTint), in: shape)
                             .opacity(resting ? 0 : glassOpacity)
                     } else {
                         shape.fill(.regularMaterial).opacity(resting ? 0 : glassOpacity)
+                        shape.fill(glassTint).opacity(resting ? 0 : 1)
                     }
                     // A small idle surface does not need backdrop sampling.
                     // Keep MB's saved opacity and adaptive monochrome branding.
-                    shape.fill(Color(nsColor: .windowBackgroundColor))
-                        .opacity(resting ? glassOpacity : 0)
+                    shape.fill(colorScheme == .dark ? Color.black : Color.white)
+                        .opacity(resting ? (0.18 + glassOpacity * 0.52) : 0)
                 }.allowsHitTesting(false)
             }
             .overlay(shape.stroke(Color.primary.opacity(contrast == .increased ? 0.42 : min(borderOpacity, 0.08)),
                                   lineWidth: contrast == .increased ? 1 : 0.5).allowsHitTesting(false))
+            // Clip the complete composited surface before shadowing it. This
+            // prevents the glass backing layer from casting a square shadow.
+            .clipShape(shape)
             .shadow(color: .black.opacity((elevated ? 0.16 : 0.06) * glassOpacity),
                     radius: elevated ? 12 : 3, y: elevated ? 3 : 1)
         }
@@ -72,6 +82,8 @@ final class FloatingTabController: ObservableObject {
     private var hoverCloseTask: Task<Void, Never>?
     private var previewTask: Task<Void, Never>?
     private var shrinkTask: Task<Void, Never>?
+    private var globalOutsideClickMonitor: Any?
+    private var localOutsideClickMonitor: Any?
     private var previewLayer: FloatingLayer?
     private var anchoredScreen: NSScreen?
     private var readingOwner: String?
@@ -106,6 +118,35 @@ final class FloatingTabController: ObservableObject {
                                             anchor: dockAnchor, taskCount: readingOrder.ids.count)
     }
 
+    func acceptsInteractivePoint(_ point: CGPoint) -> Bool {
+        let placement = currentPlacement
+        let canvas = CGRect(origin: .zero, size: placement.frame.size)
+        let panelSize = EdgeLayout.panelSize(for: windowLayer, taskCount: readingOrder.ids.count)
+        return FloatingHitRegion(logoY: placement.logo.y,
+            // Interaction geometry is immediate and stable; only the paint
+            // morphs. This prevents hover animation from opening a click hole.
+            expansion: layer.isExpanded ? 1 : 0,
+            panelSize: panelSize, dockEdge: dockAnchor.edge,
+            logoX: placement.logo.x, direction: placement.direction)
+            .path(in: canvas).contains(point)
+    }
+
+    /// Outside-click monitors report AppKit screen coordinates (bottom-left
+    /// origin), while the SwiftUI hit path uses a top-left local origin.
+    /// Keeping this conversion pure makes the dismissal boundary testable and
+    /// prevents a valid rail or panel click from being mistaken for an outside
+    /// click and falling through to the application underneath.
+    nonisolated static func shouldDismissForOutsideClick(
+        at screenPoint: CGPoint,
+        panelFrame: CGRect,
+        acceptsInteractivePoint: (CGPoint) -> Bool
+    ) -> Bool {
+        guard panelFrame.contains(screenPoint) else { return true }
+        let local = CGPoint(x: screenPoint.x - panelFrame.minX,
+                            y: panelFrame.maxY - screenPoint.y)
+        return !acceptsInteractivePoint(local)
+    }
+
     init(model: ObserverModel, preferences: ObserverPreferences,
          presentsWindow: Bool = true,
          openDashboard: @escaping (String?) -> Void, openSettings: @escaping () -> Void) {
@@ -128,14 +169,24 @@ final class FloatingTabController: ObservableObject {
                 self.reposition(animated: false)
             }
         }.store(in: &subscriptions)
-        // FloatingTabView already observes the model. Do not forward every
-        // publication a second time or relayout a viewport whose IDs are held.
-        preferences.objectWillChange.sink { [weak self] _ in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.objectWillChange.send()
-                self.applyPreferences()
-            }
+        // FloatingTabView observes visual preferences itself. Only the four
+        // preferences that affect the AppKit panel are routed back through the
+        // controller; opacity slider samples must never reorder or reposition
+        // the window underneath the pointer.
+        preferences.$showFloatingTab.dropFirst().removeDuplicates().sink { [weak self] _ in
+            DispatchQueue.main.async { self?.applyPreferences() }
+        }.store(in: &subscriptions)
+        preferences.$showInFullscreen.dropFirst().removeDuplicates().sink { [weak self] _ in
+            DispatchQueue.main.async { self?.applyCollectionBehavior() }
+        }.store(in: &subscriptions)
+        preferences.$appearance.dropFirst().removeDuplicates().sink { [weak self] appearance in
+            DispatchQueue.main.async { self?.edgePanel?.appearance = appearance.nativeAppearance }
+        }.store(in: &subscriptions)
+        preferences.$dockAnchors.dropFirst().removeDuplicates().sink { [weak self] _ in
+            DispatchQueue.main.async { self?.reposition(animated: false) }
+        }.store(in: &subscriptions)
+        preferences.$verticalAnchors.dropFirst().removeDuplicates().sink { [weak self] _ in
+            DispatchQueue.main.async { self?.reposition(animated: false) }
         }.store(in: &subscriptions)
         NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)
             .receive(on: DispatchQueue.main)
@@ -157,6 +208,7 @@ final class FloatingTabController: ObservableObject {
         hoverCloseTask?.cancel(); hoverCloseTask = nil
         cancelPreview()
         shrinkTask?.cancel(); shrinkTask = nil
+        removeOutsideClickMonitors()
         if presentsWindow { edgePanel?.orderOut(nil) }
     }
 
@@ -348,8 +400,8 @@ final class FloatingTabController: ObservableObject {
         // Compare full canvas dimensions so no leaving panel gets clipped.
         let shrinkingPanelCanvas = windowLayer.hasPanel &&
             (nextWindowSize.width < currentWindowSize.width || nextWindowSize.height < currentWindowSize.height)
-        machine = next
         if closing || shrinkingPanelCanvas {
+            machine = next
             // Keep the canvas until the visible content closes. Reopening
             // cancels this shrink; the hosting window itself never animates.
             let reduced = preferences.reduceMacBridgeMotion || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
@@ -363,9 +415,51 @@ final class FloatingTabController: ObservableObject {
                 self.shrinkTask = nil
             }
         } else {
+            // Grow the backing canvas before publishing content for a larger
+            // panel. Publishing content first renders one clipped frame and is
+            // visible as a white flash on translucent Settings transitions.
             windowLayer = next.layer
             reposition(animated: false)
+            machine = next
         }
+        updateOutsideClickMonitors()
+    }
+
+    private func updateOutsideClickMonitors() {
+        guard presentsWindow, layer.isExpanded else {
+            removeOutsideClickMonitors()
+            return
+        }
+        if globalOutsideClickMonitor == nil {
+            globalOutsideClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) {
+                [weak self] _ in
+                let point = NSEvent.mouseLocation
+                Task { @MainActor [weak self] in self?.dismissForOutsideClick(at: point) }
+            }
+        }
+        if localOutsideClickMonitor == nil {
+            localOutsideClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) {
+                [weak self] event in
+                let point = NSEvent.mouseLocation
+                Task { @MainActor [weak self] in self?.dismissForOutsideClick(at: point) }
+                return event
+            }
+        }
+    }
+
+    private func removeOutsideClickMonitors() {
+        if let monitor = globalOutsideClickMonitor { NSEvent.removeMonitor(monitor) }
+        if let monitor = localOutsideClickMonitor { NSEvent.removeMonitor(monitor) }
+        globalOutsideClickMonitor = nil
+        localOutsideClickMonitor = nil
+    }
+
+    private func dismissForOutsideClick(at screenPoint: CGPoint) {
+        guard layer.isExpanded else { return }
+        let frame = panel.frame
+        guard Self.shouldDismissForOutsideClick(at: screenPoint, panelFrame: frame,
+                                                acceptsInteractivePoint: acceptsInteractivePoint) else { return }
+        show(.idle, locked: false)
     }
 
     private func applyPreferences() {
@@ -378,12 +472,17 @@ final class FloatingTabController: ObservableObject {
             if !readingOrder.ids.isEmpty { readingOrder = CompactReadingOrder() }
             return
         }
-        panel.collectionBehavior = preferences.showInFullscreen
-            ? [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
-            : [.canJoinAllSpaces, .stationary]
+        applyCollectionBehavior()
         panel.appearance = preferences.appearance.nativeAppearance
         reposition(animated: false)
         panel.orderFrontRegardless()
+    }
+
+    private func applyCollectionBehavior() {
+        guard presentsWindow, preferences.showFloatingTab else { return }
+        panel.collectionBehavior = preferences.showInFullscreen
+            ? [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+            : [.canJoinAllSpaces, .stationary]
     }
 
     private func reposition(animated: Bool) {
@@ -402,6 +501,8 @@ final class FloatingTabController: ObservableObject {
         panel.appearance = preferences.appearance.nativeAppearance
         panel.isOpaque = false
         panel.hasShadow = false
+        panel.ignoresMouseEvents = false
+        panel.acceptsMouseMovedEvents = true
         panel.level = .floating
         panel.isFloatingPanel = true
         panel.hidesOnDeactivate = false
@@ -412,6 +513,9 @@ final class FloatingTabController: ObservableObject {
         // AppKit owns the canvas. Do not let GeometryReader's 10pt ideal size
         // feed a second, competing resize back into the borderless window.
         hosting.sizingOptions = []
+        hosting.acceptsInteractivePoint = { [weak self] point in
+            self?.acceptsInteractivePoint(point) == true
+        }
         panel.contentView = hosting
         panel.setAccessibilityLabel("MacBridge floating task tab")
         return panel
@@ -489,7 +593,9 @@ struct FloatingTabView: View {
             }
             .frame(width: geometry.size.width, height: geometry.size.height)
             .contentShape(FloatingHitRegion(logoY: logo.y,
-                expansion: reducedMotion ? (controller.windowLayer.isExpanded ? 1 : 0) : expansion,
+                // Never animate input geometry. As soon as the rail is shown,
+                // every complete 44-point target must receive the first click.
+                expansion: controller.layer.isExpanded ? 1 : 0,
                 panelSize: canvasPanelSize, dockEdge: controller.dockAnchor.edge, logoX: logo.x,
                 direction: placement.direction))
             .onHover(perform: controller.pointerChanged)
@@ -503,6 +609,7 @@ struct FloatingTabView: View {
         .environment(\.mbReduceTransparency, systemReduceTransparency || preferences.reduceTransparency)
         .environment(\.mbGlassOpacity, preferences.glassOpacity)
         .environment(\.mbReduceMotion, preferences.reduceMacBridgeMotion)
+        .modifier(FloatingWindowActivationEvents())
         .onAppear { expansion = controller.layer.isExpanded ? 1 : 0 }
         .onChange(of: controller.layer.isExpanded) { expanded in
             let reduced = systemReduceMotion || preferences.reduceMacBridgeMotion
@@ -550,14 +657,14 @@ struct FloatingTabView: View {
                         .glassSurface(DockedOrganicEdgeShape(edge: controller.dockAnchor.edge,
                                                             expansion: controller.layer.isExpanded ? 1 : 0,
                                                             direction: controller.currentPlacement.direction),
-                                      borderOpacity: 0.16, resting: !controller.layer.isExpanded)
+                                      borderOpacity: 0, resting: !controller.layer.isExpanded)
                         .id(controller.layer.isExpanded)
                         .transition(.opacity)
                 }
                 .animation(.easeOut(duration: MBMetrics.reducedMotionDuration), value: controller.layer.isExpanded)
             } else {
                 handleContent.glassSurface(DockedOrganicEdgeShape(edge: controller.dockAnchor.edge, expansion: expansion,
-                                                                  direction: controller.currentPlacement.direction), borderOpacity: 0.16,
+                                                                  direction: controller.currentPlacement.direction), borderOpacity: 0,
                                           resting: !controller.layer.isExpanded)
             }
         }
@@ -779,6 +886,20 @@ struct FloatingTabView: View {
     }
 }
 
+/// SwiftUI buttons in a nonactivating panel still need to accept the event that
+/// arrives while another application's window is active. The panel remains a
+/// `.nonactivatingPanel`; this only prevents that first click from being handed
+/// to the window underneath. Older macOS versions keep their AppKit behavior.
+private struct FloatingWindowActivationEvents: ViewModifier {
+    @ViewBuilder func body(content: Content) -> some View {
+        if #available(macOS 15.0, *) {
+            content.allowsWindowActivationEvents()
+        } else {
+            content
+        }
+    }
+}
+
 /// One narrow, transparent brand target in both idle and expanded states.
 /// Count changes do not resize/move the window or add polling/animation work.
 struct CompactBrandBadge: View {
@@ -807,9 +928,9 @@ struct CompactBrandBadge: View {
                 }
                 .frame(width: 38, height: 28)
             } else {
-                ZStack(alignment: .bottomTrailing) {
-                    MacBridgeMark(size: MBMetrics.edgeLogoSize, style: .monochrome)
-                    count.offset(x: 2, y: 2)
+                VStack(spacing: 1) {
+                    MacBridgeMark(size: showCount ? 20 : MBMetrics.edgeLogoSize, style: .monochrome)
+                    count
                 }
                 .frame(width: MBMetrics.edgeBrandWidth, height: MBMetrics.edgeBrandHeight)
             }
@@ -841,21 +962,55 @@ struct CompactIconButtonLabel: View {
     }
 }
 
-/// Explicit trailing alignment prevents the system switch from inheriting an
-/// ambiguous compressed width inside translucent panels. It remains a native
-/// Toggle, with a full-height label target and no custom drawing or timer.
+private struct CompactSwitchToggleStyle: ToggleStyle {
+    let reducedMotion: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        Button {
+            configuration.isOn.toggle()
+        } label: {
+            HStack(spacing: 12) {
+                configuration.label
+                Spacer(minLength: 12)
+                ZStack {
+                    Capsule(style: .continuous)
+                        .fill(configuration.isOn ? MBPalette.brandBlue : Color.primary.opacity(0.18))
+                    Circle()
+                        // Apple switches retain a bright, unmistakable thumb
+                        // in both appearances. `controlBackgroundColor` turns
+                        // nearly black in Dark Mode and recreated the user's
+                        // original "solid blue pill" failure.
+                        .fill(Color.white.opacity(configuration.isOn ? 0.96 : 0.84))
+                        .shadow(color: .black.opacity(0.18), radius: 1.5, y: 1)
+                        .padding(3)
+                        .offset(x: configuration.isOn ? 8 : -8)
+                }
+                .frame(width: 40, height: 24)
+                .overlay(Capsule(style: .continuous).stroke(Color.primary.opacity(0.12), lineWidth: 0.5))
+                .animation(reducedMotion ? nil : .spring(duration: 0.20, bounce: 0.18),
+                           value: configuration.isOn)
+            }
+            .frame(maxWidth: .infinity, minHeight: MBMetrics.minimumHitTargetSize)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// A fixed track and thumb remain legible inside both native Liquid Glass and
+/// the fallback material. The complete 44-point row is the input target.
 struct CompactPreferenceToggle: View {
     let title: String
     @Binding var isOn: Bool
     var isEnabled = true
+    @Environment(\.accessibilityReduceMotion) private var systemReduceMotion
+    @Environment(\.mbReduceMotion) private var appReduceMotion
 
     var body: some View {
         Toggle(isOn: $isOn) {
             Text(title).frame(maxWidth: .infinity, alignment: .leading)
         }
-        .toggleStyle(.switch)
-        .controlSize(.small)
-        .tint(MBPalette.brandBlue)
+        .toggleStyle(CompactSwitchToggleStyle(reducedMotion: systemReduceMotion || appReduceMotion))
         .frame(maxWidth: .infinity, minHeight: MBMetrics.minimumHitTargetSize,
                alignment: .leading)
         .contentShape(Rectangle())

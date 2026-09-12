@@ -89,7 +89,7 @@ final class MonochromeBadgeTests: XCTestCase {
     @MainActor
     func testMonochromeMarkIsCachedTemplateWithTransparentCorners() throws {
         _ = NSApplication.shared
-        for size: CGFloat in [18, 22, 28] {
+        for size: CGFloat in [18, 20, 22, 28] {
             let image = MacBridgeMarkRenderer.image(size: size, style: .monochrome)
             XCTAssertTrue(image.isTemplate)
             for _ in 0..<100 {
@@ -142,6 +142,8 @@ final class MonochromeBadgeTests: XCTestCase {
         }
         XCTAssertLessThanOrEqual(MBMetrics.edgeLogoSize, 22)
         XCTAssertEqual(MBMetrics.edgeIdleWidth, 30, "Count must not widen the user's compact widget")
+        XCTAssertGreaterThan(MBMetrics.edgeBrandHeight, MBMetrics.edgeLogoSize,
+                             "The count needs its own row instead of overlapping the logo")
     }
 
     @MainActor
@@ -167,8 +169,9 @@ final class MonochromeBadgeTests: XCTestCase {
                     ? CGPoint(x: logo.x + visualInset - MBMetrics.edgeBrandWidth / 2,
                               y: logo.y + direction.sign * EdgeLayout.brandVisualAlongOffset
                                 - MBMetrics.edgeBrandHeight / 2)
-                    : CGPoint(x: logo.x + direction.sign * EdgeLayout.brandVisualAlongOffset - 19,
-                              y: logo.y + visualInset - 14)
+                    : CGPoint(x: logo.x + direction.sign * EdgeLayout.horizontalBrandVisualAlongOffset
+                                - MBMetrics.edgeHorizontalBrandWidth / 2,
+                              y: logo.y + visualInset - MBMetrics.edgeBrandWidth / 2)
                 let clickTarget = CGRect(x: logo.x - MBMetrics.edgeTargetSize / 2,
                                          y: logo.y - MBMetrics.edgeTargetSize / 2,
                                          width: MBMetrics.edgeTargetSize,

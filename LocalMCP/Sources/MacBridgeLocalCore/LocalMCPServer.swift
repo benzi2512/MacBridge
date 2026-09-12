@@ -51,7 +51,7 @@ public enum MacBridgeConnectorSurface: String, Sendable {
 }
 
 public final class LocalMCPServer: @unchecked Sendable {
-    public static let version = "0.3.0-functional-first"
+    public static let version = "0.3.1-functional-first"
     public static let maximumFrameBytes = 24 * 1_024 * 1_024
     public static let supportedProtocolVersions = [
         "2026-07-28", "2025-11-25", "2025-06-18",

@@ -102,9 +102,11 @@ final class CompactSurfaceTests: XCTestCase {
         XCTAssertEqual(EdgeLayout.railLogoOffset, 2 * MBMetrics.minimumHitTargetSize,
                        "Five adjacent 44-point targets fit without competing hit regions")
         XCTAssertEqual(EdgeLayout.size(for: .recentTasks, visibleFrame: frames[0]).width,
-                       MBMetrics.edgeRailWidth + MBMetrics.panelGap + MBMetrics.panelWidth)
+                       MBMetrics.edgeRailWidth + MBMetrics.panelGap + MBMetrics.panelWidth
+                           + MBMetrics.panelShadowMargin)
         XCTAssertEqual(EdgeLayout.size(for: .taskDetail("task"), visibleFrame: frames[0]).width,
-                       MBMetrics.edgeRailWidth + MBMetrics.panelGap + MBMetrics.taskDetailWidth)
+                       MBMetrics.edgeRailWidth + MBMetrics.panelGap + MBMetrics.taskDetailWidth
+                           + MBMetrics.panelShadowMargin)
         XCTAssertGreaterThan(EdgeLayout.recentTasksHeight(taskCount: 0), 0)
         XCTAssertEqual(EdgeLayout.recentTasksHeight(taskCount: 0), 224)
         XCTAssertEqual(EdgeLayout.recentTasksHeight(taskCount: 2), EdgeLayout.recentTasksHeight(taskCount: 1))

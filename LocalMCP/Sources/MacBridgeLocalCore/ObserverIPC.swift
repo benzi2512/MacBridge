@@ -339,7 +339,10 @@ public final class LocalObserverEndpoint: @unchecked Sendable {
                 lock.lock(); let shouldStop = stopped; lock.unlock()
                 if shouldStop { break }
                 var item = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
-                if poll(&item, 1, 250) <= 0 { continue }
+                // Readable sockets wake poll immediately. A one-second idle
+                // timeout keeps shutdown bounded while cutting idle wakeups by
+                // roughly 75% compared with the former 250 ms heartbeat.
+                if poll(&item, 1, 1_000) <= 0 { continue }
                 let peer = accept(fd, nil, nil)
                 if peer < 0 { continue }
                 ObserverSocket.configure(peer)

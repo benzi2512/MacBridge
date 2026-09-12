@@ -136,7 +136,7 @@ def main():
     require(display_name.returncode == 0 and display_name.stdout.strip() == "MacBridge",
             "Raw package still exposes a preview-only app name")
     version = run(["/usr/libexec/PlistBuddy", "-c", "Print :CFBundleShortVersionString", raw_app / "Contents/Info.plist"])
-    require(version.returncode == 0 and version.stdout.strip() == "0.3.0",
+    require(version.returncode == 0 and version.stdout.strip() == "0.3.1",
             "Observer app version is not aligned with the 0.3 runtime")
 
     # This is a full copy of a signed app, not its extracted, bundle-bound UI binary.

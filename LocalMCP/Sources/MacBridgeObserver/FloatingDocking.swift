@@ -71,8 +71,10 @@ enum FloatingDockLayout {
             requested = CGSize(width: MBMetrics.edgeRailHeight + MBMetrics.edgeMotionVerticalSlack,
                                height: MBMetrics.edgeRailWidth + MBMetrics.edgeMotionHorizontalSlack)
         default:
-            requested = CGSize(width: max(MBMetrics.edgeRailHeight, card.width),
-                               height: card.height + MBMetrics.panelGap + MBMetrics.edgeRailWidth)
+            requested = CGSize(width: max(MBMetrics.edgeRailHeight,
+                                          card.width + MBMetrics.panelShadowMargin * 2),
+                               height: card.height + MBMetrics.panelGap + MBMetrics.edgeRailWidth
+                                   + MBMetrics.panelShadowMargin)
         }
         return CGSize(width: min(requested.width, max(1, visibleFrame.width - 16)),
                       height: min(requested.height, max(1, visibleFrame.height - 16)))
@@ -140,7 +142,23 @@ enum FloatingDockLayout {
 /// A floating nonactivating panel must perform the first click, not consume it
 /// just to focus the hosting view. This does not activate any other application.
 final class FloatingFirstClickHostingView<Content: View>: NSHostingView<Content> {
+    /// SwiftUI can temporarily report no hit while its visual content shape is
+    /// morphing. Fall back only for the controller's explicit interactive path
+    /// so a visible button never clicks through to the app behind the panel.
+    var acceptsInteractivePoint: ((CGPoint) -> Bool)?
+
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        if let hit = super.hitTest(point) { return hit }
+        // AppKit supplies `point` in the receiver's superview coordinates.
+        // Convert it exactly once before comparing it with the controller's
+        // canvas path. Otherwise a non-zero frame origin shifts the hot region
+        // and the click can fall through to the app underneath.
+        let localPoint = superview.map { convert(point, from: $0) } ?? point
+        guard bounds.contains(localPoint), acceptsInteractivePoint?(localPoint) == true else { return nil }
+        return self
+    }
 }
 
 /// Transpose only the surface silhouette. Text, badge and action icons remain
@@ -155,9 +173,11 @@ struct DockedOrganicEdgeShape: Shape {
     }
     func path(in rect: CGRect) -> Path {
         if edge == .right {
-            return AnchoredOrganicEdgeShape(expansion: expansion, direction: direction).path(in: rect)
+            return AnchoredOrganicEdgeShape(expansion: expansion, direction: direction,
+                                            endCapShoulder: MBMetrics.verticalEndCapShoulder).path(in: rect)
         }
-        return AnchoredOrganicEdgeShape(expansion: expansion, direction: direction)
+        return AnchoredOrganicEdgeShape(expansion: expansion, direction: direction,
+                                        endCapShoulder: MBMetrics.horizontalEndCapShoulder)
             .path(in: CGRect(x: 0, y: 0, width: rect.height, height: rect.width))
             .applying(CGAffineTransform(a: 0, b: 1, c: 1, d: 0, tx: rect.minX, ty: rect.minY))
     }
@@ -183,7 +203,7 @@ struct FloatingLogoControl: NSViewRepresentable {
             CompactBrandBadge(summary: summary, showCount: showCount, horizontal: edge == .bottom)
                 .offset(x: edge == .right
                             ? EdgeLayout.logoInset - EdgeLayout.brandVisualInset
-                            : direction.sign * EdgeLayout.brandVisualAlongOffset,
+                            : direction.sign * EdgeLayout.horizontalBrandVisualAlongOffset,
                         y: edge == .bottom
                             ? EdgeLayout.logoInset - EdgeLayout.brandVisualInset
                             : direction.sign * EdgeLayout.brandVisualAlongOffset)
@@ -209,7 +229,10 @@ struct FloatingLogoControl: NSViewRepresentable {
         }
         convenience init() { self.init(frame: .zero) }
         required init?(coder: NSCoder) { nil }
-        override func hitTest(_ point: NSPoint) -> NSView? { bounds.contains(convert(point, from: superview)) ? self : nil }
+        override func hitTest(_ point: NSPoint) -> NSView? {
+            let localPoint = superview.map { convert(point, from: $0) } ?? point
+            return bounds.contains(localPoint) ? self : nil
+        }
         override var acceptsFirstResponder: Bool { true }
         override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
         override func resetCursorRects() { addCursorRect(bounds, cursor: .openHand) }

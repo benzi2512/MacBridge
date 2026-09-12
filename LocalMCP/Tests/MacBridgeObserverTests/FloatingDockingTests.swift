@@ -7,6 +7,26 @@ import XCTest
 /// Pure geometry/local controller tests; no pointer injection, live owner,
 /// production preferences, commands, file transactions or new OS permission.
 final class FloatingDockingTests: XCTestCase {
+    func testOutsideClickDismissalFlipsScreenCoordinatesAndKeepsInteractiveClicksOpen() {
+        let frame = CGRect(x: 100, y: 200, width: 300, height: 400)
+        let acceptsTopLeftTarget: (CGPoint) -> Bool = {
+            CGRect(x: 0, y: 0, width: 44, height: 44).contains($0)
+        }
+
+        XCTAssertFalse(FloatingTabController.shouldDismissForOutsideClick(
+            at: CGPoint(x: 122, y: 578), panelFrame: frame,
+            acceptsInteractivePoint: acceptsTopLeftTarget),
+            "A click on the visible control must stay inside the MacBridge widget")
+        XCTAssertTrue(FloatingTabController.shouldDismissForOutsideClick(
+            at: CGPoint(x: 122, y: 222), panelFrame: frame,
+            acceptsInteractivePoint: acceptsTopLeftTarget),
+            "Transparent canvas inside the NSWindow is still outside the painted widget")
+        XCTAssertTrue(FloatingTabController.shouldDismissForOutsideClick(
+            at: CGPoint(x: 80, y: 578), panelFrame: frame,
+            acceptsInteractivePoint: acceptsTopLeftTarget),
+            "A click outside the panel frame must dismiss the open widget")
+    }
+
     func testClickToleranceAndDragLatch() {
         var drag = FloatingLogoDrag(start: CGPoint(x: 100, y: 200))
         XCTAssertFalse(drag.move(to: CGPoint(x: 103, y: 202)))
@@ -66,12 +86,61 @@ final class FloatingDockingTests: XCTestCase {
         }
     }
 
+    func testRightEdgeEndpointsKeepTheCompleteLogoTargetInsideTheVerticalSafeArea() {
+        let screen = CGRect(x: 0, y: 40, width: 1512, height: 920)
+        for position in [0.0, 1.0] {
+            for layer: FloatingLayer in [.idle, .rail, .recentTasks, .settings, .taskDetail("fixture")] {
+                let placement = FloatingDockLayout.placement(visibleFrame: screen, layer: layer,
+                    anchor: .init(edge: .right, position: position), taskCount: 64)
+                let screenLogoY = placement.frame.maxY - placement.logo.y
+                let target = CGRect(x: 0,
+                    y: screenLogoY - MBMetrics.edgeTargetSize / 2,
+                    width: MBMetrics.edgeTargetSize,
+                    height: MBMetrics.edgeTargetSize)
+                XCTAssertGreaterThanOrEqual(target.minY, screen.minY + EdgeLayout.outerInset - 0.001)
+                XCTAssertLessThanOrEqual(target.maxY, screen.maxY - EdgeLayout.outerInset + 0.001)
+            }
+        }
+    }
+
+    func testSettledRailKeepsEveryActionGlyphOnGlassInBothDirections() {
+        let canvas = CGRect(x: 0, y: 0,
+            width: MBMetrics.edgeTargetSize,
+            height: MBMetrics.edgeRailHeight + MBMetrics.edgeMotionVerticalSlack)
+        for direction in [FloatingRailDirection.forward, .reverse] {
+            let glass = DockedOrganicEdgeShape(edge: .right, expansion: 1, direction: direction)
+                .path(in: canvas)
+            for index in 0..<4 {
+                let center = FloatingDockLayout.railActionPosition(index: index, edge: .right,
+                                                                   direction: direction)
+                for dx: CGFloat in [-8, 0, 8] {
+                    for dy: CGFloat in [-8, 0, 8] {
+                        XCTAssertTrue(glass.contains(CGPoint(x: center.x + dx, y: center.y + dy)),
+                                      "\(direction) action \(index) escaped the painted glass")
+                    }
+                }
+            }
+        }
+    }
+
+    func testPanelCanvasIncludesARealShadowGutter() {
+        let screen = CGRect(x: 0, y: 40, width: 1512, height: 920)
+        let panel = EdgeLayout.panelSize(for: .recentTasks, taskCount: 6)
+        let canvas = FloatingDockLayout.size(for: .recentTasks, visibleFrame: screen,
+                                             taskCount: 6, edge: .right)
+        XCTAssertEqual(canvas.width - MBMetrics.edgeRailWidth - panel.width,
+                       MBMetrics.panelShadowMargin, accuracy: 0.001)
+        XCTAssertEqual(canvas.height - panel.height,
+                       MBMetrics.panelShadowMargin * 2, accuracy: 0.001)
+    }
+
     func testBottomIdleAndRailAreNarrowAndTaskViewportIsBounded() {
         let screen = CGRect(x: 0, y: 40, width: 1512, height: 920)
         let idle = FloatingDockLayout.size(for: .idle, visibleFrame: screen, edge: .bottom)
         XCTAssertEqual(idle, CGSize(width: 58, height: 44))
         let rail = FloatingDockLayout.size(for: .rail, visibleFrame: screen, edge: .bottom)
-        XCTAssertEqual(rail, CGSize(width: 220, height: 44))
+        XCTAssertEqual(rail, CGSize(width: MBMetrics.edgeRailHeight + MBMetrics.edgeMotionVerticalSlack,
+                                    height: 44))
         XCTAssertEqual(MBMetrics.edgeIdleWidth, 30, "The painted idle material did not grow")
         XCTAssertEqual(MBMetrics.edgeRailWidth, 36, "The painted rail did not grow")
         XCTAssertEqual(FloatingDockLayout.size(for: .recentTasks, visibleFrame: screen, taskCount: 6, edge: .bottom),
@@ -145,7 +214,7 @@ final class FloatingDockingTests: XCTestCase {
         }
         XCTAssertEqual(EdgeLayout.railLogoOffset, 2 * MBMetrics.edgeTargetSize)
         XCTAssertEqual(MBMetrics.edgeBrandWidth, 28)
-        XCTAssertEqual(MBMetrics.edgeBrandHeight, 28)
+        XCTAssertEqual(MBMetrics.edgeBrandHeight, 34)
     }
 
     @MainActor
@@ -160,6 +229,18 @@ final class FloatingDockingTests: XCTestCase {
         }
         XCTAssertNil(logo.hitTest(CGPoint(x: -1, y: 22)))
         XCTAssertNil(logo.hitTest(CGPoint(x: 45, y: 22)))
+    }
+
+    @MainActor
+    func testLogoHitTestingConvertsFromSuperviewCoordinatesExactlyOnce() {
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 300))
+        let logo = FloatingLogoControl.LogoView(frame: NSRect(x: 120, y: 80, width: 44, height: 44))
+        container.addSubview(logo)
+
+        XCTAssertTrue(logo.hitTest(NSPoint(x: 142, y: 102)) === logo,
+                      "A click at the visual center must reach the logo when its frame origin is non-zero")
+        XCTAssertNil(logo.hitTest(NSPoint(x: 60, y: 60)),
+                     "A point outside the visual target must not become an invisible hot zone")
     }
 
     @MainActor

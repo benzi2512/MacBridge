@@ -12,9 +12,13 @@ enum MBMetrics {
     static let edgeRailHeight: CGFloat = 196
     static let edgeLogoSize: CGFloat = 22
     static let edgeBrandWidth: CGFloat = 28
-    static let edgeBrandHeight: CGFloat = 28
-    static let edgeBrandEndCapLength: CGFloat = 38
+    static let edgeBrandHeight: CGFloat = 34
+    static let edgeHorizontalBrandWidth: CGFloat = 38
+    static let edgeBrandEndCapLength: CGFloat = 44
     static let edgeTargetSize: CGFloat = minimumHitTargetSize
+    // Five 44-point targets share one continuous painted rail. The larger
+    // transparent canvas below is animation headroom, not visible material.
+    static let edgePaintedRailHeight: CGFloat = edgeTargetSize * 5
     static let edgeRailSpacing: CGFloat = 0
     static let panelGap: CGFloat = 0
     static let panelWidth: CGFloat = 320
@@ -22,6 +26,9 @@ enum MBMetrics {
     static let settingsHeight: CGFloat = 520
     static let taskDetailHeight: CGFloat = 520
     static let panelRadius: CGFloat = 16
+    // Native shadows must have real backing-store room. Without this gutter,
+    // the compositor clips the soft shadow to the rectangular NSPanel edge.
+    static let panelShadowMargin: CGFloat = 16
     static let tooltipRadius: CGFloat = 11
     static let hoverDelay: TimeInterval = 0.10
     static let hoverExitGrace: TimeInterval = 0.45
@@ -32,7 +39,9 @@ enum MBMetrics {
     static let closeDuration: TimeInterval = 0.64
     static let reducedMotionDuration: TimeInterval = 0.10
     static let edgeMotionHorizontalSlack: CGFloat = 8
-    static let edgeMotionVerticalSlack: CGFloat = 24
+    static let edgeMotionVerticalSlack: CGFloat = 38
+    static let verticalEndCapShoulder: CGFloat = 9
+    static let horizontalEndCapShoulder: CGFloat = 3
 }
 
 enum MBPalette {
@@ -293,7 +302,9 @@ struct FloatingInteractionStateMachine: Equatable, Sendable {
 }
 
 struct EdgeLayout: Equatable, Sendable {
-    static let outerInset: CGFloat = 8
+    // Along-edge endpoints stay reachable while retaining enough breathing
+    // room for the complete 44-point logo target and its glass silhouette.
+    static let outerInset: CGFloat = 12
 
     static func panelSize(for layer: FloatingLayer, taskCount: Int) -> CGSize {
         switch layer {
@@ -321,14 +332,20 @@ struct EdgeLayout: Equatable, Sendable {
             requested = CGSize(width: MBMetrics.edgeRailWidth + MBMetrics.edgeMotionHorizontalSlack,
                                height: MBMetrics.edgeRailHeight + MBMetrics.edgeMotionVerticalSlack)
         case .recentTasks:
-            requested = CGSize(width: MBMetrics.edgeRailWidth + MBMetrics.panelGap + MBMetrics.panelWidth,
-                               height: max(MBMetrics.edgeRailHeight, recentTasksHeight(taskCount: taskCount)))
+            requested = CGSize(width: MBMetrics.edgeRailWidth + MBMetrics.panelGap + MBMetrics.panelWidth
+                                + MBMetrics.panelShadowMargin,
+                               height: max(MBMetrics.edgeRailHeight,
+                                           recentTasksHeight(taskCount: taskCount) + MBMetrics.panelShadowMargin * 2))
         case .settings:
-            requested = CGSize(width: MBMetrics.edgeRailWidth + MBMetrics.panelGap + MBMetrics.panelWidth,
-                               height: max(MBMetrics.edgeRailHeight, MBMetrics.settingsHeight))
+            requested = CGSize(width: MBMetrics.edgeRailWidth + MBMetrics.panelGap + MBMetrics.panelWidth
+                                + MBMetrics.panelShadowMargin,
+                               height: max(MBMetrics.edgeRailHeight,
+                                           MBMetrics.settingsHeight + MBMetrics.panelShadowMargin * 2))
         case .taskDetail:
-            requested = CGSize(width: MBMetrics.edgeRailWidth + MBMetrics.panelGap + MBMetrics.taskDetailWidth,
-                               height: max(MBMetrics.edgeRailHeight, MBMetrics.taskDetailHeight))
+            requested = CGSize(width: MBMetrics.edgeRailWidth + MBMetrics.panelGap + MBMetrics.taskDetailWidth
+                                + MBMetrics.panelShadowMargin,
+                               height: max(MBMetrics.edgeRailHeight,
+                                           MBMetrics.taskDetailHeight + MBMetrics.panelShadowMargin * 2))
         }
         let availableWidth = max(1, visibleFrame.width - min(outerInset * 2, max(0, visibleFrame.width - 1)))
         let availableHeight = max(1, visibleFrame.height - min(outerInset * 2, max(0, visibleFrame.height - 1)))
@@ -374,8 +391,9 @@ struct EdgeLayout: Equatable, Sendable {
     // shoulder. Never move it along the rail: the painted logo/count must stay
     // wholly owned by the same 44-point click/drag target.
     static let brandVisualInset: CGFloat = 16
-    static let brandVisualAlongOffset: CGFloat = 1
-    static let idleShapeAlongOffset: CGFloat = 7
+    static let brandVisualAlongOffset: CGFloat = 5
+    static let horizontalBrandVisualAlongOffset: CGFloat = 1
+    static let idleShapeAlongOffset: CGFloat = 5
     static let expandedShapeAlongAdjustment: CGFloat = 3
 
     static func isContained(_ frame: CGRect, in visibleFrame: CGRect, tolerance: CGFloat = 0.5) -> Bool {
@@ -605,6 +623,7 @@ struct CompactReadingOrder {
 struct AnchoredOrganicEdgeShape: Shape {
     var expansion: CGFloat
     var direction: FloatingRailDirection = .forward
+    var endCapShoulder: CGFloat = MBMetrics.verticalEndCapShoulder
     var animatableData: CGFloat {
         get { expansion }
         set { expansion = newValue }
@@ -614,30 +633,26 @@ struct AnchoredOrganicEdgeShape: Shape {
         // one into a hard stop. AppKit's rail canvas reserves room for this.
         let t = min(1.04, max(0, expansion))
         let width = MBMetrics.edgeIdleWidth + (MBMetrics.edgeRailWidth - MBMetrics.edgeIdleWidth) * t
-        let height = MBMetrics.edgeIdleHeight + (MBMetrics.edgeRailHeight - MBMetrics.edgeIdleHeight) * t
+        let expandedHeight = MBMetrics.edgePaintedRailHeight
+        let height = MBMetrics.edgeIdleHeight + (expandedHeight - MBMetrics.edgeIdleHeight) * t
         let targetLogoY = rect.midY - direction.sign * EdgeLayout.railLogoOffset
         let restingTop = targetLogoY + direction.sign * EdgeLayout.idleShapeAlongOffset
             - MBMetrics.edgeIdleHeight / 2
-        let expandedTop = targetLogoY + direction.sign * EdgeLayout.railLogoOffset
-            - MBMetrics.edgeRailHeight / 2
-            - direction.sign * EdgeLayout.expandedShapeAlongAdjustment
+        let farthestActionY = targetLogoY + direction.sign * 4 * MBMetrics.edgeTargetSize
+        // One continuous path covers the complete five-target stack. Keeping
+        // the endpoint room inside the organic outline avoids the detached
+        // capsule/seam that a second overlapping glass subpath creates.
+        let expandedTop = min(targetLogoY, farthestActionY) - MBMetrics.edgeTargetSize / 2
         let top = restingTop * (1 - t) + expandedTop * t
-        var path = OrganicEdgeShape(expansion: t).path(in: CGRect(x: 0, y: 0, width: width, height: height))
+        return OrganicEdgeShape(expansion: t, endCapShoulder: endCapShoulder)
+            .path(in: CGRect(x: 0, y: 0, width: width, height: height))
             .applying(CGAffineTransform(translationX: rect.maxX - width, y: top))
-        // The rail's tapered shoulder is intentionally slimmer than the logo
-        // target. Keep a tiny end-cap under the actual 28-point brand paint so
-        // the count never floats outside the glass during the morph.
-        let badgeCenterY = targetLogoY + direction.sign * EdgeLayout.brandVisualAlongOffset
-        path.addRect(CGRect(x: rect.maxX - MBMetrics.edgeIdleWidth,
-                            y: badgeCenterY - MBMetrics.edgeBrandEndCapLength / 2,
-                            width: MBMetrics.edgeIdleWidth,
-                            height: MBMetrics.edgeBrandEndCapLength))
-        return path
     }
 }
 
 struct OrganicEdgeShape: Shape {
     var expansion: CGFloat
+    var endCapShoulder: CGFloat = MBMetrics.verticalEndCapShoulder
     var animatableData: CGFloat {
         get { expansion }
         set { expansion = newValue }
@@ -652,7 +667,10 @@ struct OrganicEdgeShape: Shape {
         let inner: CGFloat = 0
         // The rail grows below the fixed brand target. Scaling the shoulder
         // with the whole rail height cuts into that target when expanded.
-        let upperShoulder = min(h * (0.28 - 0.08 * amount), MBMetrics.edgeIdleHeight * 0.28)
+        // Reach the straight inner edge before the first painted brand pixel.
+        // This keeps the monochrome mark and its count inside the same organic
+        // path without adding a detached overlapping capsule.
+        let upperShoulder = min(h * (0.28 - 0.08 * amount), max(2, endCapShoulder))
         let lowerShoulder = h - upperShoulder
         var path = Path()
         path.move(to: CGPoint(x: w, y: 0))
@@ -675,7 +693,7 @@ enum MacBridgeMarkRenderer {
     // Keep the original pixel representations. Cache only the finite UI sizes;
     // a new model publication must not allocate another logo image each time.
     @MainActor private static var images: [CacheKey: NSImage] = [:]
-    private static let cachedSizes: Set<CGFloat> = [18, 22, 24, 26, 28, 32, 40, 48, 64, 96]
+    private static let cachedSizes: Set<CGFloat> = [18, 20, 22, 24, 26, 28, 32, 40, 48, 64, 96]
     private static let canonicalImage: NSImage? = {
         guard let url = Bundle.main.url(forResource: "MacBridge", withExtension: "png") else { return nil }
         return NSImage(contentsOf: url)

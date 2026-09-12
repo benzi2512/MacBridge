@@ -148,6 +148,13 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 
 @MainActor
 final class MenuBarController: NSObject, NSMenuDelegate {
+    private struct RenderState: Equatable {
+        let statusText: String
+        let badgeText: String
+        let badgeHelp: String
+        let showsCount: Bool
+    }
+
     private let model: ObserverModel
     private let preferences: ObserverPreferences
     private let openDashboard: (String?) -> Void
@@ -156,6 +163,8 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private let openSetup: (() -> Void)?
     private var statusItem: NSStatusItem?
     private var subscriptions = Set<AnyCancellable>()
+    private var lastRenderedState: RenderState?
+    private var updateScheduled = false
 
     init(model: ObserverModel, preferences: ObserverPreferences,
          openDashboard: @escaping (String?) -> Void,
@@ -169,13 +178,13 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         self.openSetup = openSetup
         super.init()
         model.objectWillChange.sink { [weak self] _ in
-            DispatchQueue.main.async { self?.update() }
+            self?.scheduleUpdate()
         }.store(in: &subscriptions)
         preferences.$showMenuBar.removeDuplicates().sink { [weak self] _ in
             DispatchQueue.main.async { self?.applyVisibility() }
         }.store(in: &subscriptions)
         preferences.$showTaskCount.removeDuplicates().sink { [weak self] _ in
-            DispatchQueue.main.async { self?.update() }
+            self?.scheduleUpdate()
         }.store(in: &subscriptions)
     }
 
@@ -185,6 +194,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         model.menuBarVisible = false
         if let statusItem { NSStatusBar.system.removeStatusItem(statusItem) }
         statusItem = nil
+        lastRenderedState = nil
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
@@ -207,19 +217,36 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             menu.delegate = self
             item.menu = menu
             statusItem = item
+            lastRenderedState = nil
         }
         update()
+    }
+
+    private func scheduleUpdate() {
+        guard !updateScheduled else { return }
+        updateScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.updateScheduled = false
+            self.update()
+        }
     }
 
     private func update() {
         guard let button = statusItem?.button else { return }
         let summary = model.compactSummary
+        let state = RenderState(statusText: summary.statusText,
+                                badgeText: summary.runningBadgeText,
+                                badgeHelp: summary.runningBadgeHelp,
+                                showsCount: preferences.showTaskCount)
+        guard state != lastRenderedState else { return }
+        lastRenderedState = state
         let image = MacBridgeMarkRenderer.image(size: 18, style: .monochrome)
         image.size = NSSize(width: 18, height: 18)
         button.image = image
         button.imagePosition = .imageLeading
         button.font = .systemFont(ofSize: 12, weight: .medium)
-        button.title = preferences.showTaskCount ? " " + summary.runningBadgeText : ""
+        button.title = state.showsCount ? " " + state.badgeText : ""
         button.toolTip = "MacBridge — \(summary.statusText). \(summary.runningBadgeHelp)"
         button.setAccessibilityLabel("MacBridge, \(summary.statusText). \(summary.runningBadgeHelp)")
     }

@@ -135,6 +135,5 @@ struct FullObserverSettingsView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)) { _ in
             position.refreshDisplay()
         }
-        .onReceive(preferences.objectWillChange) { _ in position.refreshDisplay() }
     }
 }
