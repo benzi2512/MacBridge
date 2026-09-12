@@ -84,3 +84,10 @@ Local protocol success, a tunnel connection and host-side tool enablement are
 different observations. A cached, disabled ChatGPT conversation is not proven
 recovered by a local capability response. Do not replay an uncertain write or
 claim a task complete without its actual result.
+
+In `bridge_capabilities`, `active_command_runs` counts active `command_run`
+execution leases, not background jobs or acknowledgement of response delivery.
+`process_activity` separately reports running processes, completed-but-retained
+handles, starting reservations and the shared handle limit. These are runtime-wide
+snapshots, not per-chat identity or permission to restart. A zero running count
+does not mean every output handle or undo transaction has been released.

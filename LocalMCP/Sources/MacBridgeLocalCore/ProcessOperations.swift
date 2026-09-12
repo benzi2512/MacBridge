@@ -151,6 +151,14 @@ private final class RunningCommand: @unchecked Sendable {
     private var timedOut = false
     private var cancelled = false
 
+    // Status-only observation must not copy output or expose another job's
+    // identity. Use the same completion state as process_status/output.
+    var isRunning: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return running
+    }
+
     init(
         taskID: String,
         activityContext: String?,
@@ -510,6 +518,25 @@ public final class LocalProcessService: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return processes.count + startingProcesses
+    }
+
+    func activityCounts() -> JSONObject {
+        lock.lock()
+        let commands = Array(processes.values)
+        let starting = startingProcesses
+        lock.unlock()
+        // Release the collection lock before observing individual commands.
+        // Like process_list, this is a snapshot, not a reservation or a grant
+        // to restart. Completed handles still reserve output until drained.
+        let running = commands.reduce(0) { $0 + ($1.isRunning ? 1 : 0) }
+        return [
+            "running": running,
+            "retained_handles": commands.count,
+            "completed_retained_handles": commands.count - running,
+            "starting": starting,
+            "retained_handle_limit": Self.maximumTrackedProcesses,
+            "scope": "runtime_wide_snapshot_not_restart_authorization",
+        ]
     }
 
     deinit {

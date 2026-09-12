@@ -170,6 +170,10 @@ final class CommandDispatchTests: XCTestCase {
         XCTAssertEqual(capabilities["catalog_sha256"] as? String, catalog["catalogEpoch"] as? String)
         XCTAssertEqual(capabilities["active_command_runs"] as? Int, 8)
         XCTAssertEqual(capabilities["maximum_concurrent_command_runs"] as? Int, 8)
+        let processActivity = try XCTUnwrap(capabilities["process_activity"] as? JSONObject)
+        XCTAssertEqual(processActivity["running"] as? Int, 8)
+        XCTAssertEqual(processActivity["retained_handles"] as? Int, 8)
+        XCTAssertEqual(processActivity["completed_retained_handles"] as? Int, 0)
         XCTAssertEqual(try structured(io.receive(id: 6))["running"] as? Bool, true)
         let readFile = try XCTUnwrap(try structured(io.receive(id: 7))["file"] as? JSONObject)
         XCTAssertEqual(readFile["content"] as? String, "still-readable\n")
@@ -663,7 +667,11 @@ private final class CommandDispatchConnection {
         let frame = Data(received.prefix(upTo: newline))
         received.removeSubrange(...newline)
         let response = try LocalJSON.decodeObject(frame)
-        if let id = id as? Int { XCTAssertEqual(response["id"] as? Int, id) }
+        if let id = id as? Int {
+            let actualID = response["id"]
+            XCTAssertEqual(actualID as? Int, id,
+                           "received response id \(String(describing: actualID))")
+        }
         if let id = id as? String { XCTAssertEqual(response["id"] as? String, id) }
         return response
     }

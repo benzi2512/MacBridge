@@ -164,4 +164,81 @@ final class ExpandedToolsTests: XCTestCase {
         XCTAssertEqual(status["status_only"] as? Bool, true)
         XCTAssertThrowsError(try s.callTool(name: "process_wait", arguments: ["task_id": id, "maximum_wait_milliseconds": 1001]))
     }
+
+    func testCapabilitiesCountBackgroundAndCompletedUndrainedHandlesSeparately() throws {
+        let f = try Fixture(); defer { f.remove() }
+        let s = try server(f)
+        func counts() throws -> JSONObject {
+            let capabilities = try s.callTool(name: "bridge_capabilities", arguments: [:])
+            XCTAssertEqual(capabilities["active_command_runs"] as? Int, 0)
+            XCTAssertEqual(capabilities["active_command_runs_scope"] as? String,
+                           "active_command_run_execution_leases_not_background_jobs_or_delivery_ack")
+            let result = try XCTUnwrap(capabilities["process_activity"] as? JSONObject)
+            XCTAssertEqual(Set(result.keys), Set([
+                "running", "retained_handles", "completed_retained_handles", "starting",
+                "retained_handle_limit", "scope",
+            ]))
+            XCTAssertEqual(result["starting"] as? Int, 0)
+            XCTAssertEqual(result["retained_handle_limit"] as? Int, 32)
+            XCTAssertEqual(result["scope"] as? String, "runtime_wide_snapshot_not_restart_authorization")
+            return result
+        }
+        XCTAssertEqual(try counts()["retained_handles"] as? Int, 0)
+        var ids: [String] = []
+        defer {
+            for id in ids { _ = try? s.callTool(name: "process_cancel", arguments: ["task_id": id]) }
+        }
+        for _ in 0..<8 {
+            let start = try s.callTool(name: "command_start", arguments: [
+                "workspace_id": f.workspaceID, "executable": "cat", "arguments": [],
+                "maximum_output_bytes": 4096,
+            ])
+            ids.append(try XCTUnwrap(start["task_id"] as? String))
+        }
+        let running = try counts()
+        XCTAssertEqual(running["running"] as? Int, 8)
+        XCTAssertEqual(running["retained_handles"] as? Int, 8)
+        XCTAssertEqual(running["completed_retained_handles"] as? Int, 0)
+        // Invalid starts must not leave a reservation in the activity count.
+        XCTAssertThrowsError(try s.callTool(name: "command_start", arguments: [
+            "workspace_id": f.workspaceID, "executable": "unavailable-fixture-command", "arguments": [],
+        ]))
+        XCTAssertEqual(try counts()["retained_handles"] as? Int, 8)
+        for id in ids {
+            do {
+                _ = try s.callTool(name: "process_input", arguments: [
+                    "task_id": id, "content": "private-output-marker\n", "close_stdin": true,
+                ])
+            } catch {
+                let detail = try? s.callTool(name: "process_output_tail", arguments: ["task_id": id])
+                let stderr = detail?["stderr"] as? String ?? "unavailable"
+                XCTFail("cat fixture closed before input; stderr: \(stderr)")
+                throw error
+            }
+            let finished = try s.callTool(name: "process_wait", arguments: ["task_id": id])
+            XCTAssertEqual(finished["running"] as? Bool, false)
+        }
+        let completed = try counts()
+        XCTAssertEqual(completed["running"] as? Int, 0)
+        XCTAssertEqual(completed["retained_handles"] as? Int, 8)
+        XCTAssertEqual(completed["completed_retained_handles"] as? Int, 8)
+        let encoded = try LocalJSON.encode(completed)
+        let text = String(decoding: encoded, as: UTF8.self)
+        XCTAssertFalse(text.contains("private-output-marker"))
+        for id in ids { XCTAssertFalse(text.contains(id)) }
+        let drain = try s.callTool(name: "process_output_many", arguments: [
+            "jobs": ids.map { ["task_id": $0] },
+        ])
+        let results = try XCTUnwrap(drain["results"] as? [JSONObject])
+        XCTAssertEqual(results.count, 8)
+        for row in results {
+            let result = try XCTUnwrap(row["result"] as? JSONObject)
+            XCTAssertEqual(result["session_retained"] as? Bool, false)
+            XCTAssertEqual(result["exit_code"] as? Int, 0)
+        }
+        let empty = try counts()
+        XCTAssertEqual(empty["running"] as? Int, 0)
+        XCTAssertEqual(empty["retained_handles"] as? Int, 0)
+        XCTAssertEqual(empty["completed_retained_handles"] as? Int, 0)
+    }
 }
