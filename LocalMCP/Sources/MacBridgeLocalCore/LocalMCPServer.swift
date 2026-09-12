@@ -75,8 +75,16 @@ public final class LocalMCPServer: @unchecked Sendable {
     private var negotiatedProtocol = "2025-06-18"
     private let operationLock = NSRecursiveLock()
     private let outputLock = NSLock()
+    // Web-tunnel conversations intentionally share one runtime, but a public
+    // UUID is only a locator. These bearer capabilities are returned only to
+    // the creator and are never retained in activity/list responses.
+    private let capabilityLock = NSLock()
+    private var processControlTokens: [String: String] = [:]
+    private var transactionControlTokens: [String: String] = [:]
+    private var workControlTokens: [String: String] = [:]
     private var searchInProgress = false
-    private var commandRunInProgress = false
+    private static let maximumConcurrentCommandRuns = 4
+    private var activeCommandRuns = 0
     // One admitted Brevo operation across the whole family, including direct
     // callTool callers. Protected by operationLock, never held across HTTP.
     private var brevoInProgress = false
@@ -136,10 +144,10 @@ public final class LocalMCPServer: @unchecked Sendable {
         self.workspaceService = workspaceService
         processService = LocalProcessService(
             workspaceService: workspaceService,
-            selfExecutable: selfExecutable
+            selfExecutable: canonicalExecutable
         )
         self.configurationURL = configurationURL
-        self.selfExecutable = selfExecutable
+        self.selfExecutable = canonicalExecutable
         self.connectorSurface = connectorSurface
     }
 
@@ -349,32 +357,39 @@ public final class LocalMCPServer: @unchecked Sendable {
             if name == "bridge_activity_view" {
                 try arguments.requireOnlyKeys([])
             } else {
-                try arguments.requireOnlyKeys(["instance_id", "task_id"])
+                try arguments.requireOnlyKeys(["instance_id", "task_id", "process_control_token"])
                 guard try arguments.requiredString("instance_id", maximumBytes: 36) == instanceID else {
                     throw LocalMCPError.conflict("activity owner changed; open a new activity view")
+                }
+                if let taskID = try arguments.optionalString("task_id", maximumBytes: 36) {
+                    let supplied = try arguments.optionalString("process_control_token", maximumBytes: 96)
+                    try requireCapability(supplied, for: taskID, kind: .process, label: "process")
+                } else if arguments["process_control_token"] != nil {
+                    throw LocalMCPError.invalidRequest(
+                        "process_control_token requires task_id"
+                    )
                 }
             }
             return try activitySnapshot(taskID: arguments.optionalString("task_id", maximumBytes: 36))
         }
         if name == "work_task" {
-            operationLock.lock()
-            defer { operationLock.unlock() }
-            return try workActivity.manage(arguments,
-                validWorkspaces: Set(workspaceService.registry.workspaces.map { $0.id.lowercased() }),
-                jobs: processService.processList()["processes"] as? [JSONObject] ?? [])
+            return try manageWorkTask(arguments)
         }
-        var effectiveArguments = arguments
+        var effectiveArguments = try authorizeAndStripTransactionControl(
+            name: name, arguments: arguments
+        )
         var createdDeveloperWorkID: String?
+        var createdDeveloperWorkToken: String?
         if name == "developer_task" {
-            let action = try arguments.requiredString("action", maximumBytes: 32)
+            let action = try effectiveArguments.requiredString("action", maximumBytes: 32)
             if action == "execute_task" || action == "run_tests" {
-                let title = try arguments.optionalString("title", maximumBytes: 640)
+                let title = try effectiveArguments.optionalString("title", maximumBytes: 640)
                     ?? (action == "run_tests" ? "Run project tests" : "Execute developer task")
                 var begin: JSONObject = [
                     "action": "begin", "title": title,
-                    "workspace_id": try arguments.requiredString("workspace_id", maximumBytes: 36),
+                    "workspace_id": try effectiveArguments.requiredString("workspace_id", maximumBytes: 36),
                 ]
-                if let label = try arguments.optionalString("chat_label", maximumBytes: 640) {
+                if let label = try effectiveArguments.optionalString("chat_label", maximumBytes: 640) {
                     begin["chat_label"] = label
                 }
                 let started: JSONObject = try {
@@ -390,21 +405,42 @@ public final class LocalMCPServer: @unchecked Sendable {
                     throw LocalMCPError.operationFailed("developer parent was not retained")
                 }
                 effectiveArguments["work_id"] = id
+                let token = registerCapability(for: id, kind: .work)
+                effectiveArguments["work_control_token"] = token
                 createdDeveloperWorkID = id
+                createdDeveloperWorkToken = token
             } else if action == "continue_task" {
-                effectiveArguments["work_id"] = try arguments.requiredString(
+                effectiveArguments["work_id"] = try effectiveArguments.requiredString(
                     "workflow_id", maximumBytes: 36
                 ).lowercased()
             }
         }
+        effectiveArguments = try authorizeAndStripWorkControl(
+            name: name, arguments: effectiveArguments
+        )
+        effectiveArguments = try authorizeAndStripProcessControl(
+            name: name, arguments: effectiveArguments
+        )
         let workID = try workActivity.beginCall(name: name, arguments: effectiveArguments)
         var prepared = effectiveArguments
         prepared.removeValue(forKey: "work_id")
         do {
-            let result = try observedTool(
+            var result = try observedTool(
                 name: name, arguments: effectiveArguments, workID: workID
             ) {
                 try callPreparedTool(name: name, arguments: prepared, workID: workID)
+            }
+            if createsControllableProcess(name: name, arguments: prepared),
+               let taskID = result["task_id"] as? String {
+                result["process_control_token"] = registerCapability(
+                    for: taskID, kind: .process
+                )
+            }
+            if Self.transactionCreatingTools.contains(name) {
+                result = protectNewTransactions(in: result)
+            }
+            if let createdDeveloperWorkToken {
+                result["work_control_token"] = createdDeveloperWorkToken
             }
             if name == "developer_task", result["workflow_terminal"] as? Bool == true,
                let id = workID, let status = result["workflow_terminal_status"] as? String {
@@ -415,6 +451,13 @@ public final class LocalMCPServer: @unchecked Sendable {
                     validWorkspaces: Set(workspaceService.registry.workspaces.map { $0.id.lowercased() }),
                     jobs: processService.processList()["processes"] as? [JSONObject] ?? []
                 )
+                removeCapability(for: id, kind: .work)
+            }
+            if name == "transaction_restore", let id = effectiveArguments["transaction_id"] as? String {
+                removeCapability(for: id, kind: .transaction)
+            } else if name == "transaction_accept",
+                      let ids = effectiveArguments["transaction_ids"] as? [String] {
+                for id in ids { removeCapability(for: id, kind: .transaction) }
             }
             return result
         } catch {
@@ -426,9 +469,221 @@ public final class LocalMCPServer: @unchecked Sendable {
                     validWorkspaces: Set(workspaceService.registry.workspaces.map { $0.id.lowercased() }),
                     jobs: processService.processList()["processes"] as? [JSONObject] ?? []
                 )
+                removeCapability(for: id, kind: .work)
             }
             throw error
         }
+    }
+
+    private static let transactionCreatingTools: Set<String> = [
+        "file_write", "file_patch", "file_append", "directory_create",
+        "path_copy", "path_move", "path_remove", "file_apply_edits", "file_write_many",
+    ]
+
+    private func newControlToken() -> String {
+        UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+            + UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+    }
+
+    private enum CapabilityKind { case process, transaction, work }
+
+    private func registerCapability(for rawID: String, kind: CapabilityKind) -> String {
+        let id = rawID.lowercased()
+        let retainedProcessIDs: Set<String>?
+        switch kind {
+        case .process:
+            retainedProcessIDs = Set(
+                (processService.processList()["processes"] as? [JSONObject] ?? [])
+                    .compactMap { ($0["task_id"] as? String)?.lowercased() }
+            )
+        case .transaction, .work:
+            retainedProcessIDs = nil
+        }
+        capabilityLock.lock()
+        defer { capabilityLock.unlock() }
+        if let retainedProcessIDs {
+            processControlTokens = processControlTokens.filter {
+                retainedProcessIDs.contains($0.key) || $0.key == id
+            }
+        }
+        let existing: String?
+        switch kind {
+        case .process: existing = processControlTokens[id]
+        case .transaction: existing = transactionControlTokens[id]
+        case .work: existing = workControlTokens[id]
+        }
+        if let existing { return existing }
+        let token = newControlToken()
+        switch kind {
+        case .process: processControlTokens[id] = token
+        case .transaction: transactionControlTokens[id] = token
+        case .work: workControlTokens[id] = token
+        }
+        return token
+    }
+
+    private func removeCapability(for rawID: String, kind: CapabilityKind) {
+        capabilityLock.lock()
+        switch kind {
+        case .process: processControlTokens.removeValue(forKey: rawID.lowercased())
+        case .transaction: transactionControlTokens.removeValue(forKey: rawID.lowercased())
+        case .work: workControlTokens.removeValue(forKey: rawID.lowercased())
+        }
+        capabilityLock.unlock()
+    }
+
+    private func requireCapability(
+        _ supplied: String?, for rawID: String, kind: CapabilityKind, label: String
+    ) throws {
+        guard connectorSurface == .webTunnel else { return }
+        capabilityLock.lock()
+        let id = rawID.lowercased()
+        let expected: String?
+        switch kind {
+        case .process: expected = processControlTokens[id]
+        case .transaction: expected = transactionControlTokens[id]
+        case .work: expected = workControlTokens[id]
+        }
+        capabilityLock.unlock()
+        guard let expected, let supplied, timingSafeEqual(expected, supplied) else {
+            throw LocalMCPError.conflict(
+                "\(label) control capability is missing or invalid; no action performed"
+            )
+        }
+    }
+
+    private func timingSafeEqual(_ lhs: String, _ rhs: String) -> Bool {
+        let a = Array(lhs.utf8), b = Array(rhs.utf8)
+        var difference = UInt8(truncatingIfNeeded: a.count ^ b.count)
+        let count = max(a.count, b.count)
+        for index in 0..<count {
+            difference |= (index < a.count ? a[index] : 0) ^ (index < b.count ? b[index] : 0)
+        }
+        return difference == 0
+    }
+
+    private func manageWorkTask(_ arguments: JSONObject) throws -> JSONObject {
+        let action = try arguments.requiredString("action", maximumBytes: 16)
+        var prepared = arguments
+        let supplied = try prepared.optionalString("work_control_token", maximumBytes: 96)
+        prepared.removeValue(forKey: "work_control_token")
+        if action == "update" || action == "finish" {
+            let id = try prepared.requiredString("work_id", maximumBytes: 36)
+            try requireCapability(supplied, for: id, kind: .work, label: "work")
+        }
+        operationLock.lock()
+        defer { operationLock.unlock() }
+        var result = try workActivity.manage(prepared,
+            validWorkspaces: Set(workspaceService.registry.workspaces.map { $0.id.lowercased() }),
+            jobs: processService.processList()["processes"] as? [JSONObject] ?? [])
+        if action == "begin", let id = result["work_id"] as? String,
+           connectorSurface == .webTunnel {
+            result["work_control_token"] = registerCapability(for: id, kind: .work)
+        } else if action == "finish", let id = prepared["work_id"] as? String {
+            removeCapability(for: id, kind: .work)
+        }
+        return result
+    }
+
+    private func authorizeAndStripWorkControl(
+        name: String, arguments: JSONObject
+    ) throws -> JSONObject {
+        var prepared = arguments
+        let supplied = try prepared.optionalString("work_control_token", maximumBytes: 96)
+        prepared.removeValue(forKey: "work_control_token")
+        if let id = prepared["work_id"] as? String {
+            try requireCapability(supplied, for: id, kind: .work, label: "work")
+        }
+        return prepared
+    }
+
+    private func authorizeAndStripProcessControl(
+        name: String, arguments: JSONObject
+    ) throws -> JSONObject {
+        var prepared = arguments
+        let protectedSingles: Set<String> = [
+            "process_wait", "process_output", "process_output_tail", "process_input", "process_cancel",
+        ]
+        if protectedSingles.contains(name) {
+            let id = try prepared.requiredString("task_id", maximumBytes: 36)
+            let supplied = try prepared.optionalString("process_control_token", maximumBytes: 96)
+            try requireCapability(supplied, for: id, kind: .process, label: "process")
+            prepared.removeValue(forKey: "process_control_token")
+        } else if name == "process_output_many" {
+            guard let jobs = prepared["jobs"] as? [JSONObject], !jobs.isEmpty, jobs.count <= 8 else {
+                throw LocalMCPError.invalidRequest("jobs must contain 1-8 objects")
+            }
+            prepared["jobs"] = try jobs.map { job -> JSONObject in
+                var item = job
+                let id = try item.requiredString("task_id", maximumBytes: 36)
+                let supplied = try item.optionalString("process_control_token", maximumBytes: 96)
+                try requireCapability(supplied, for: id, kind: .process, label: "process")
+                item.removeValue(forKey: "process_control_token")
+                return item
+            }
+        } else if name == "developer_task",
+                  prepared["action"] as? String == "continue_task",
+                  let workID = prepared["work_id"] as? String {
+            let taskID = try workActivity.latestJobID(workID)
+            let supplied = try prepared.optionalString("process_control_token", maximumBytes: 96)
+            try requireCapability(supplied, for: taskID, kind: .process, label: "process")
+            prepared.removeValue(forKey: "process_control_token")
+        }
+        return prepared
+    }
+
+    private func authorizeAndStripTransactionControl(
+        name: String, arguments: JSONObject
+    ) throws -> JSONObject {
+        var prepared = arguments
+        if name == "transaction_restore" {
+            let id = try prepared.requiredString("transaction_id", maximumBytes: 36)
+            let supplied = try prepared.optionalString("transaction_control_token", maximumBytes: 96)
+            try requireCapability(supplied, for: id, kind: .transaction, label: "transaction")
+            prepared.removeValue(forKey: "transaction_control_token")
+        } else if name == "transaction_accept" {
+            let ids = try prepared.requiredStringArray(
+                "transaction_ids", maximumItems: 128, maximumItemBytes: 36
+            )
+            if connectorSurface == .webTunnel {
+                let tokens = try prepared.requiredStringArray(
+                    "transaction_control_tokens", maximumItems: 128, maximumItemBytes: 96
+                )
+                guard ids.count == tokens.count else {
+                    throw LocalMCPError.invalidRequest(
+                        "transaction IDs and control capabilities must have matching counts"
+                    )
+                }
+                for (id, token) in zip(ids, tokens) {
+                    try requireCapability(token, for: id, kind: .transaction, label: "transaction")
+                }
+            }
+            prepared.removeValue(forKey: "transaction_control_tokens")
+        }
+        return prepared
+    }
+
+    private func createsControllableProcess(name: String, arguments: JSONObject) -> Bool {
+        if name == "command_start" || name == "network_command" { return true }
+        guard name == "developer_task", let action = arguments["action"] as? String else { return false }
+        return action == "execute_task" || action == "run_tests"
+    }
+
+    private func protectNewTransactions(in object: JSONObject) -> JSONObject {
+        func protect(_ value: Any) -> Any {
+            if var child = value as? JSONObject {
+                for (key, nested) in child { child[key] = protect(nested) }
+                if let id = child["transaction_id"] as? String, UUID(uuidString: id) != nil {
+                    child["transaction_control_token"] = registerCapability(
+                        for: id, kind: .transaction
+                    )
+                }
+                return child
+            }
+            if let array = value as? [Any] { return array.map(protect) }
+            return value
+        }
+        return protect(object) as? JSONObject ?? object
     }
 
     private func callPreparedTool(name: String, arguments: JSONObject, workID: String?) throws -> JSONObject {
@@ -723,15 +978,19 @@ public final class LocalMCPServer: @unchecked Sendable {
                     maximumBytesPerStream: 8192, consumeCompletedHandle: false
                 )
             }
-            return try callTool(name: "process_cancel", arguments: ["task_id": id])
+            // Owner IPC is instance-bound and never exposed through the Web
+            // tool schema, so it deliberately bypasses per-chat bearer tokens.
+            return try processService.cancelProcess(taskID: id)
         }
         let id = try request.requiredString("transaction_id", maximumBytes: 36)
         let workspace = try request.requiredString("workspace_id", maximumBytes: 36)
         let detail = try workspaceService.observerTransaction(id: id, workspaceID: workspace)
         if action == "transaction" { return detail }
-        return try workspaceService.observerRestore(id: id, workspaceID: workspace) {
-            try callTool(name: "transaction_restore", arguments: ["transaction_id": id])
+        let result = try workspaceService.observerRestore(id: id, workspaceID: workspace) {
+            try workspaceService.restoreTransaction(id)
         }
+        removeCapability(for: id, kind: .transaction)
+        return result
     }
 
     // Caller holds observerLock. A prepared response is NOT host receipt/render
@@ -793,8 +1052,8 @@ public final class LocalMCPServer: @unchecked Sendable {
                 "active_searches": searchInProgress ? 1 : 0,
                 "maximum_concurrent_searches": 1,
                 "command_run_nonblocking_dispatch": true,
-                "active_command_runs": commandRunInProgress ? 1 : 0,
-                "maximum_concurrent_command_runs": 1,
+                "active_command_runs": activeCommandRuns,
+                "maximum_concurrent_command_runs": Self.maximumConcurrentCommandRuns,
                 "active_brevo_calls": brevoInProgress ? 1 : 0,
                 "maximum_concurrent_brevo_calls": 1,
                 "active_media_calls": mediaInProgress ? 1 : 0,
@@ -826,8 +1085,8 @@ public final class LocalMCPServer: @unchecked Sendable {
             guard !mediaInProgress else {
                 throw LocalMCPError.conflict("a media operation is active; workspace configuration was not reloaded")
             }
-            guard !commandRunInProgress else {
-                throw LocalMCPError.conflict("a command_run response is pending; workspace configuration was not reloaded")
+            guard activeCommandRuns == 0 else {
+                throw LocalMCPError.conflict("one or more command_run responses are pending; workspace configuration was not reloaded")
             }
             guard !searchInProgress else {
                 throw LocalMCPError.conflict("a search is active; workspace configuration was not reloaded")
@@ -850,6 +1109,9 @@ public final class LocalMCPServer: @unchecked Sendable {
                 workspaceService: replacementWorkspaceService,
                 selfExecutable: selfExecutable
             )
+            capabilityLock.lock()
+            processControlTokens.removeAll(keepingCapacity: true)
+            capabilityLock.unlock()
             var result = replacementWorkspaceService.workspaceOverview()
             result["reloaded"] = true
             return result
@@ -1128,8 +1390,8 @@ public final class LocalMCPServer: @unchecked Sendable {
     private func beginCommandRun(_ arguments: JSONObject, workID: String?) throws -> @Sendable () -> JSONObject {
         operationLock.lock()
         defer { operationLock.unlock() }
-        guard !commandRunInProgress else {
-            throw LocalMCPError.limitExceeded("a command_run is already pending; no additional command was started; use command_start for concurrent jobs")
+        guard activeCommandRuns < Self.maximumConcurrentCommandRuns else {
+            throw LocalMCPError.limitExceeded("four command_run responses are already pending; no additional command was started; use command_start for further concurrent jobs")
         }
         try arguments.requireOnlyKeys([
             "workspace_id", "executable", "arguments", "cwd", "timeout_milliseconds",
@@ -1150,13 +1412,13 @@ public final class LocalMCPServer: @unchecked Sendable {
         for job in processService.processList()["processes"] as? [JSONObject] ?? [] {
             if let id = job["task_id"] as? String, !before.contains(id) { workActivity.linkJob(job, workID: workID) }
         }
-        commandRunInProgress = true
+        activeCommandRuns += 1
         return finish
     }
 
     private func endCommandRun() {
         operationLock.lock()
-        commandRunInProgress = false
+        activeCommandRuns = max(0, activeCommandRuns - 1)
         operationLock.unlock()
     }
 
@@ -1203,10 +1465,17 @@ public final class LocalMCPServer: @unchecked Sendable {
         observeRequestIdentity(name: name, metadata: params["_meta"])
         let execute: @Sendable (JSONObject) throws -> JSONObject
         let original = params["arguments"] as? JSONObject ?? [:]
+        var activityArguments = original
+        activityArguments.removeValue(forKey: "work_control_token")
+        activityArguments.removeValue(forKey: "process_control_token")
+        activityArguments.removeValue(forKey: "transaction_control_token")
+        activityArguments.removeValue(forKey: "transaction_control_tokens")
         var workID: String?
         do {
-            workID = try workActivity.beginCall(name: name, arguments: original)
-            var prepared = original
+            let effective = try authorizeAndStripWorkControl(name: name, arguments: original)
+            activityArguments = effective
+            workID = try workActivity.beginCall(name: name, arguments: effective)
+            var prepared = effective
             prepared.removeValue(forKey: "work_id")
             if name == "file_search" {
                 let workspace = try beginSearch()
@@ -1225,7 +1494,7 @@ public final class LocalMCPServer: @unchecked Sendable {
         catch {
             // Preserve Issues history even when admission fails before a worker
             // exists. This records only the same bounded metadata as other calls.
-            _ = try? observedTool(name: name, arguments: original, workID: workID) {
+            _ = try? observedTool(name: name, arguments: activityArguments, workID: workID) {
                 throw error
             }
             try write(rpcSuccess(id: message["id"] ?? NSNull(), result: toolResult(
@@ -1245,15 +1514,16 @@ public final class LocalMCPServer: @unchecked Sendable {
                     let request = try LocalJSON.decodeObject(data)
                     let params = try object(request["params"], label: "tool params")
                     let arguments = try object(params["arguments"] ?? [:], label: "tool arguments")
-                    var prepared = arguments
+                    let effective = try authorizeAndStripWorkControl(name: name, arguments: arguments)
+                    var prepared = effective
                     prepared.removeValue(forKey: "work_id")
                     let payload: JSONObject
                     do {
-                        let result = try observedTool(name: name, arguments: arguments, workID: admittedWorkID) {
+                        let result = try observedTool(name: name, arguments: effective, workID: admittedWorkID) {
                             try execute(prepared)
                         }
                         payload = toolResult(result,
-                            message: resultSummary(name: name, result: result, arguments: arguments),
+                            message: resultSummary(name: name, result: result, arguments: effective),
                             isError: result["isError"] as? Bool == true)
                     } catch {
                         payload = toolResult(["error": safeMessage(error)], message: safeMessage(error), isError: true)
@@ -1271,7 +1541,7 @@ public final class LocalMCPServer: @unchecked Sendable {
                 operationLock.lock()
                 defer { operationLock.unlock() }
                 if name == "file_search" { searchInProgress = false }
-                else if name == "command_run" { commandRunInProgress = false }
+                else if name == "command_run" { activeCommandRuns = max(0, activeCommandRuns - 1) }
                 else if Self.isMediaTool(name) { mediaInProgress = false }
                 else { brevoInProgress = false }
                 if let response {
@@ -1367,8 +1637,8 @@ extension LocalMCPServer {
                 var spec = original
                 var schema = spec["inputSchema"] as! JSONObject
                 var properties = schema["properties"] as! JSONObject
-                properties["work_id"] = ["type": "string", "format": "uuid", "maxLength": 36,
-                    "description": "Parent work_task ID; grouping only, not authority."] as JSONObject
+                properties["work_id"] = ["type": "string", "format": "uuid", "maxLength": 36] as JSONObject
+                properties["work_control_token"] = ["type": "string", "maxLength": 96] as JSONObject
                 schema["properties"] = properties
                 spec["inputSchema"] = schema
                 return spec
@@ -1438,7 +1708,7 @@ extension LocalMCPServer {
     static var catalogSHA256: String { builtInCatalog.digest }
 
     public static var discoveryGuide: String {
-        "Reviewing a tool is not permission to execute it; never replay commands from earlier tasks. Reuse already-loaded schemas; host discovers missing ones. tool_catalog: 13 starters; query/category<=5; names return exact schemas; limit=current catalog count for full index; it cannot load host tools. developer_inspect is read-only; developer_task adds no model/authority. Operator loop: define acceptance, inspect, act, verify tests/diff/errors, repair from evidence, finish when accepted. Multi-step: developer_task starts/returns its parent; otherwise begin work_task and carry work_id. Never nest parents; grouping/chat_label is not identity or permission. waiting_user pauses; set active to continue. Finish only after jobs stop; silence is not completion. Long/paused work checkpoint: IDs/cursors, transactions, verified results, next step; revalidate handles after restart. Evidence names actions, tests/diff/errors, log refs, truncation and unknowns. command_run has timeout_milliseconds; command_start has none and returns task_id. process_output returns status/cursors. Batch paths/jobs; inspect each result. Reconcile uncertain writes before retry. Respect host approvals and Work-mode gates."
+        "Reviewing a tool is not permission to execute it; never replay commands from earlier tasks. Reuse already-loaded schemas; host discovers missing ones. tool_catalog: starters, query/category<=5, names return exact schemas, limit=current catalog count for full index; it cannot load host tools. developer_inspect is read-only; developer_task adds no authority. Operator loop: define acceptance, inspect, act, verify tests/diff/errors, repair from evidence, finish when accepted. Multi-step: developer_task returns its parent; otherwise begin work_task and carry its ID plus creator token. Keep returned process/transaction tokens in their chat; lists omit them. Never nest parents; labels grant no identity or permission. Resume waiting_user as active. Finish after jobs stop; silence is not completion. Long-work checkpoint: IDs/cursors, transactions, verified results and next step; revalidate after restart. Evidence includes actions, tests/diff/errors, log refs, truncation and unknowns. command_run has a timeout; command_start returns task_id. process_output returns status/cursors. Inspect every batch result. Reconcile uncertain writes before retry. Respect host approvals and Work-mode gates."
     }
 
     private static func makeToolSpecs() -> [JSONObject] {
@@ -1447,13 +1717,15 @@ extension LocalMCPServer {
         let content = stringSchema(maximumLength: LocalWorkspaceService.maximumFileBytes)
         let sha = stringSchema(maximumLength: 64)
         let taskID = stringSchema(maximumLength: 36)
+        let controlToken: JSONObject = ["type": "string", "maxLength": 96]
         var executable = stringSchema(maximumLength: 64)
         executable["description"] = "Supported command ID such as sh, python3, swift or git; not an absolute path such as /bin/sh. Pass argv separately in arguments. If unsure, consult command_list once for available IDs and reuse the result."
         return [
             spec("work_task", "Track a parent task",
-                "Group a multi-step task; labels grant no access or authenticated identity. begin requires title; returns work_id. update accepts status active/waiting_user and optional title/chat_label. Resume waiting_user with update status active before related calls. finish accepts completed/failed after jobs stop (default completed). update/finish may repeat workspace_id only if it matches the original scope. list returns up to 32 tasks, optionally filtered by registered workspace_id.",
+                "Group a multi-step task; labels grant no access or authenticated identity. begin requires title and returns work_id plus a creator-only work_control_token on the shared Web tunnel. Carry both for related calls and update/finish; tokens are never listed in activity. Resume waiting_user with update status active before related calls. finish accepts completed/failed after jobs stop (default completed). update/finish may repeat workspace_id only if it matches the original scope. list returns up to 32 tasks, optionally filtered by registered workspace_id.",
                 properties: ["action": ["type": "string", "enum": ["begin", "update", "finish", "list"]],
                              "work_id": ["type": "string", "format": "uuid", "maxLength": 36],
+                             "work_control_token": controlToken,
                              "title": stringSchema(maximumLength: 160), "chat_label": stringSchema(maximumLength: 160),
                              "workspace_id": workspaceID,
                              "status": ["type": "string", "enum": ["active", "waiting_user", "completed", "failed"]]],
@@ -1603,8 +1875,9 @@ extension LocalMCPServer {
                 required: ["workspace_id", "path"], readOnly: false),
             spec(
                 "transaction_restore", "Restore transaction",
-                "Restore one in-process file or path transaction after verifying current state.",
-                properties: ["transaction_id": stringSchema(maximumLength: 36)],
+                "Restore one in-process file or path transaction after verifying current state. On the shared Web tunnel, requires the transaction_control_token returned with the original mutation receipt; transaction_list never reveals it.",
+                properties: ["transaction_id": stringSchema(maximumLength: 36),
+                             "transaction_control_token": controlToken],
                 required: ["transaction_id"], readOnly: false, destructiveHint: false),
             spec(
                 "transaction_list", "List retained undo",
@@ -1614,15 +1887,18 @@ extension LocalMCPServer {
                 required: [], readOnly: true),
             spec(
                 "transaction_accept", "Keep changes and release selected undo",
-                "Irreversibly release only 1-128 named in-memory undo transactions when the user wants to keep the changes. Requires instance_id from this owner. All IDs are checked before any release; no accept-all, no file changes, no disk recovery deletion. Removal receipts include preserved recovery paths for manual recovery. Does not validate current files or prove task success; do not retry after uncertain delivery or accept merely to make a quota test pass.",
+                "Irreversibly release only 1-128 named in-memory undo transactions when the user wants to keep the changes. Requires instance_id from this owner and, on the shared Web tunnel, one creator transaction_control_token per transaction ID in matching order. All IDs and capabilities are checked before any release; no accept-all, no file changes, no disk recovery deletion. Removal receipts include preserved recovery paths for manual recovery. Does not validate current files or prove task success; do not retry after uncertain delivery or accept merely to make a quota test pass.",
                 properties: ["instance_id": stringSchema(maximumLength: 36),
                              "transaction_ids": ["type": "array", "minItems": 1,
                                                  "maxItems": 128, "uniqueItems": true,
-                                                 "items": stringSchema(maximumLength: 36)]],
+                                                 "items": stringSchema(maximumLength: 36)],
+                             "transaction_control_tokens": ["type": "array", "minItems": 1,
+                                                 "maxItems": 128,
+                                                 "items": controlToken]],
                 required: ["instance_id", "transaction_ids"], readOnly: false, destructiveHint: true),
             spec(
                 "command_run", "Run command",
-                "Run one short supported executable or headless shell command and return its final output with loopback-only networking and a hard timeout. Its wait does not block other MCP requests. Only one command_run may be pending; use command_start for builds, tests or concurrent jobs.",
+                "Run one short supported executable or headless shell command and return its final output with loopback-only networking and a hard timeout. Its wait does not block other MCP requests. Up to four command_run responses may be pending across chats; use command_start for builds, tests or further concurrent jobs.",
                 properties: [
                     "workspace_id": workspaceID, "executable": executable,
                     "arguments": arraySchema(maximumItems: 128), "cwd": path,
@@ -1630,14 +1906,14 @@ extension LocalMCPServer {
                     "maximum_output_bytes": integerSchema(minimum: 1, maximum: 16_777_216),
                 ], required: ["workspace_id", "executable", "arguments"], readOnly: false),
             spec("network_command", "Run with an owner-approved network grant",
-                "Start a shell/project job with an existing owner-authored network grant ID. Grant fixes cwd, one IPv4 TCP port and expiry (max one hour). Child direct network is blocked except its authenticated ephemeral loopback CONNECT proxy; HTTPS_PROXY/ALL_PROXY are injected only into this job. Client must CONNECT to the exact granted IP:port; curl can use --connect-to to preserve the approved hostname and TLS checks. This is IP-level access, not hostname filtering; no DNS or system proxy change. Return task_id; existing process tools handle output/cancel. Proxy closes on job exit/cancel/expiry. Cannot create/extend grants, change destinations/cwd, access credentials or elevate. Ordinary command_run/start remain loopback-only. Never print proxy environment credentials.",
+                "Start a shell/project job with an existing owner-authored network grant ID. Grant fixes cwd, one IPv4 TCP port and expiry (max one hour). Child direct network is blocked except its authenticated ephemeral loopback CONNECT proxy; HTTPS_PROXY/ALL_PROXY are injected only into this job. Client must CONNECT to the exact granted IP:port; curl can use --connect-to to preserve the approved hostname and TLS checks. This is IP-level access, not hostname filtering; no DNS or system proxy change. Returns task_id plus a creator-only process_control_token on the shared Web tunnel; carry both to output/input/cancel tools. Proxy closes on job exit/cancel/expiry. Cannot create/extend grants, change destinations/cwd, access credentials or elevate. Ordinary command_run/start remain loopback-only. Never print proxy environment credentials.",
                 properties: ["workspace_id": workspaceID, "grant_id": taskID,
                     "executable": executable, "arguments": arraySchema(maximumItems: 128),
                     "maximum_output_bytes": integerSchema(minimum: 1, maximum: 1_048_576)],
                 required: ["workspace_id", "grant_id", "executable", "arguments"], readOnly: false, openWorldHint: true),
             spec(
                 "command_start", "Start command",
-                "Start builds, tests, long-running commands, or a persistent headless shell with a pollable handle and no Terminal window. No timeout_milliseconds: start once and retain task_id. process_output includes status and cursors; use process_status only when logs are not needed. process_cancel stops the job.",
+                "Start builds, tests, long-running commands, or a persistent headless shell with a pollable handle and no Terminal window. No timeout_milliseconds: start once and retain task_id. On the shared Web tunnel it also returns a creator-only process_control_token; carry both to output/input/cancel/wait. process_output includes status and cursors; use process_status only when logs are not needed. process_cancel stops the job.",
                 properties: [
                     "workspace_id": workspaceID, "executable": executable,
                     "arguments": arraySchema(maximumItems: 128), "cwd": path,
@@ -1649,10 +1925,11 @@ extension LocalMCPServer {
                 properties: ["task_id": taskID], required: ["task_id"], readOnly: true),
             spec(
                 "process_output", "Process output",
-                "Read status plus bounded incremental stdout/stderr and next cursors for one job. Includes running, exit_code, drop/truncation and session_retained; avoid a separate status call when sufficient. Fully draining completed output releases the handle unless its original command_run response is pending; check session_retained. Do not replay an uncertain consumed read blindly.",
+                "Read status plus bounded incremental stdout/stderr and next cursors for one job. Shared Web-tunnel jobs require the process_control_token returned by their start call. Includes running, exit_code, drop/truncation and session_retained; avoid a separate status call when sufficient. Fully draining completed output releases the handle unless its original command_run response is pending; check session_retained. Do not replay an uncertain consumed read blindly.",
                 properties: [
                     "task_id": taskID, "stdout_cursor": integerSchema(minimum: 0, maximum: Int.max),
                     "stderr_cursor": integerSchema(minimum: 0, maximum: Int.max),
+                    "process_control_token": controlToken,
                     "maximum_bytes_per_stream": integerSchema(minimum: 1, maximum: 1_048_576),
                 ], required: ["task_id"], readOnly: true, idempotentHint: false),
             spec(
@@ -1664,13 +1941,15 @@ extension LocalMCPServer {
                 "Non-blockingly write bounded UTF-8 or base64 input; retry only the reported remaining suffix after a partial write.",
                 properties: [
                     "task_id": taskID, "content": stringSchema(maximumLength: 65_536),
+                    "process_control_token": controlToken,
                     "encoding": ["type": "string", "enum": ["utf8", "base64"]],
                     "close_stdin": booleanSchema(),
                 ], required: ["task_id", "content"], readOnly: false),
             spec(
                 "process_cancel", "Cancel process",
                 "Terminate one process group started by this MCP instance.",
-                properties: ["task_id": taskID], required: ["task_id"], readOnly: false),
+                properties: ["task_id": taskID, "process_control_token": controlToken],
+                required: ["task_id"], readOnly: false),
         ] + ExpandedToolCatalog.specs() + ActivityWidget.toolSpecs
     }
 }

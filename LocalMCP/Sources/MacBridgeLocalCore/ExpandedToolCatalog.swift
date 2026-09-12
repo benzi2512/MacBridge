@@ -19,14 +19,16 @@ enum ExpandedToolCatalog {
              "annotations": ["readOnlyHint": !write, "destructiveHint": write,
                              "idempotentHint": !write && name != "process_output_many", "openWorldHint": openWorld]]
         }
-        let ws = text(36), path = text(), task = text(36), flag: JSONObject = ["type": "boolean"]
+        let ws = text(36), path = text(), task = text(36), control = text(96)
+        let flag: JSONObject = ["type": "boolean"]
         let file: JSONObject = ["workspace_id": ws, "path": path]
         func extend(_ base: JSONObject, _ more: JSONObject) -> JSONObject {
             base.merging(more) { _, rhs in rhs }
         }
         let edit = object(["old_text": text(262144), "new_text": text(262144)], ["old_text", "new_text"])
         let write = object(["path": path, "content": text(262144), "expected_sha256": text(64)], ["path", "content"])
-        let output = object(["task_id": task, "stdout_cursor": integer(0, Int.max),
+        let output = object(["task_id": task, "process_control_token": control,
+                             "stdout_cursor": integer(0, Int.max),
                              "stderr_cursor": integer(0, Int.max)], ["task_id"])
         let git: JSONObject = ["workspace_id": ws, "cwd": path,
                                "maximum_output_bytes": integer(1024, 262144)]
@@ -41,6 +43,7 @@ enum ExpandedToolCatalog {
             spec("developer_task", "Codex Developer command gateway. execute_task requires workspace_id, executable and arguments; run_tests requires workspace_id; continue_task requires workflow_id. Starts one bounded background command under one retained parent. No added permission, network access or embedded model.",
                  ["action": choice(DeveloperTask.taskActions), "workspace_id": ws, "cwd": path,
                   "title": text(640), "chat_label": text(640), "workflow_id": task,
+                  "process_control_token": control,
                   "executable": text(64),
                   "arguments": ["type": "array", "maxItems": 128, "items": text(16384)],
                   "test_kind": choice(["auto", "swift", "make", "custom"]),
@@ -66,10 +69,12 @@ enum ExpandedToolCatalog {
                  ["workspace_id": ws, "files": array(write, 16)], ["workspace_id", "files"], write: true),
             spec("command_list", "List executable IDs actually supported and currently resolvable by this runtime without launching them. Use these IDs, not arbitrary absolute executable paths. No version probes or environment-variable values.", [:], []),
             spec("process_wait", "Optional wait up to 1000 ms for one existing job; no kill or output consumption. Not a required step before output. Observation timeout is not job failure. Occupies the MCP request loop; do other work between checks instead of frequent polling.",
-                 ["task_id": task, "maximum_wait_milliseconds": integer(0, 1000)], ["task_id"]),
+                 ["task_id": task, "process_control_token": control,
+                  "maximum_wait_milliseconds": integer(0, 1000)], ["task_id"]),
             spec("process_status_many", "Read status for 1-32 existing task IDs with per-item errors. Does not consume output, cancel, or start work.", ["task_ids": array(task, 32)], ["task_ids"]),
             spec("process_output_tail", "Peek at the newest bounded stdout/stderr from one retained job without releasing its handle. Reports skipped-prefix bytes and actual UTF-8-aligned cursors; use process_output for a full drain.",
-                 ["task_id": task, "maximum_bytes_per_stream": integer(4, 65536)], ["task_id"]),
+                 ["task_id": task, "process_control_token": control,
+                  "maximum_bytes_per_stream": integer(4, 65536)], ["task_id"]),
             spec("process_output_many", "Read status plus incremental output for 1-8 jobs with per-job cursors, up to 32 KiB per stream. No separate status call needed when these results suffice. Fully draining a completed job releases its handle unless its original command_run response is pending; check session_retained. Per-item errors do not erase other results. Never replay a consumed batch blindly.",
                  ["jobs": array(output, 8), "maximum_bytes_per_stream": integer(4, 32768)], ["jobs"]),
             spec("brevo_read", "Read the owner's locally configured Brevo account, verified against its explicit account binding. Actions: account, campaigns, campaign, senders, lists. Campaign HTML is excluded unless explicitly requested. The Brevo API key is never returned.",

@@ -15,10 +15,6 @@ final class ProcessSecurityBoundaryTests: XCTestCase {
         return URL(fileURLWithPath: path)
     }
 
-    private func shellQuote(_ value: String) -> String {
-        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
-    }
-
     private func run(_ p: LocalProcessService, _ f: Fixture, _ script: String,
                      _ arguments: [String] = []) throws -> JSONObject {
         try p.runCommand(workspaceID: f.workspaceID, executableID: "sh",
@@ -26,24 +22,37 @@ final class ProcessSecurityBoundaryTests: XCTestCase {
             timeoutMilliseconds: 5_000, maximumOutputBytes: 8_192)
     }
 
-    func testFreshRunnerIgnoresReplacedDiagnosticProfile() throws {
+    func testDiagnosticProfileCannotRelaxLiveSandbox() throws {
         let f = try Fixture(); defer { f.remove() }
         let outside = f.root.appendingPathComponent("outside.txt")
         try Data("outside-synthetic-sentinel".utf8).write(to: outside)
-        // A trusted test shim substitutes the file exactly after owner creation
-        // and before runner consumption, without relying on a probabilistic race.
-        let shim = f.root.appendingPathComponent("replace-profile.sh")
-        let script = "#!/bin/sh\nprintf '(version 1)\\n(allow default)\\n' > \"$HOME/../command.sb\"\nexec "
-            + shellQuote(try binary().path) + " \"$@\"\n"
-        try Data(script.utf8).write(to: shim)
-        XCTAssertEqual(chmod(shim.path, 0o700), 0)
-        let p = LocalProcessService(workspaceService: try f.service(), selfExecutable: shim)
-        let denied = try run(p, f, "/bin/cat \"$1\"", [outside.path])
+        let p = LocalProcessService(workspaceService: try f.service(), selfExecutable: try binary())
+        let denied = try run(p, f, "printf '(version 1)\\n(allow default)\\n' > \"$HOME/../command.sb\" || true; /bin/cat \"$1\"", [outside.path])
         XCTAssertNotEqual(denied["exit_code"] as? Int, 0)
         XCTAssertFalse((denied["stdout"] as? String ?? "").contains("outside-synthetic-sentinel"))
         let control = try run(p, f, "printf workspace-ok > control.txt; /bin/cat control.txt")
         XCTAssertEqual(control["exit_code"] as? Int, 0, control["stderr"] as? String ?? "")
         XCTAssertEqual(control["stdout"] as? String, "workspace-ok")
+    }
+
+    func testSandboxedCommandCannotReplaceActiveRunner() throws {
+        let f = try Fixture(); defer { f.remove() }
+        let runner = f.workspace.appendingPathComponent("macbridge-runner")
+        try FileManager.default.copyItem(at: try binary(), to: runner)
+        XCTAssertEqual(chmod(runner.path, 0o700), 0)
+        let before = try Data(contentsOf: runner)
+        let p = LocalProcessService(workspaceService: try f.service(), selfExecutable: runner)
+        let result = try run(p, f, """
+            if printf attacker > "$1"; then exit 41; fi
+            if /bin/rm "$1"; then exit 42; fi
+            if /bin/mv "$1" replaced-runner; then exit 43; fi
+            /bin/cat "$1" >/dev/null
+            printf protected
+            """, [runner.path])
+        XCTAssertEqual(result["exit_code"] as? Int, 0, result["stderr"] as? String ?? "")
+        XCTAssertEqual(result["stdout"] as? String, "protected")
+        XCTAssertEqual(try Data(contentsOf: runner), before)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.workspace.appendingPathComponent("replaced-runner").path))
     }
 
     func testChildCannotRewriteSiblingProfileOrRecoveryButCanUseItsOwnData() throws {

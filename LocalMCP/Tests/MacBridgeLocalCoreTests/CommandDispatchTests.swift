@@ -41,27 +41,33 @@ final class CommandDispatchTests: XCTestCase {
         XCTAssertTrue(try io.finishAndDrain().isEmpty)
     }
 
-    func testWaitingCommandKeepsStdioResponsiveAndRejectsSecondLaunch() throws {
+    func testFourWaitingCommandsKeepStdioResponsiveAndRejectFifthLaunch() throws {
         let f = try Fixture(); defer { f.remove() }
         try Data("still-readable\n".utf8).write(to: f.workspace.appendingPathComponent("sample.txt"))
         let server = try makeServer(f)
         let io = CommandDispatchConnection(server); defer { io.close() }
         try io.initialize()
-        let originalID = "command-run/one-\u{00E9}"
-        try io.tool(originalID, "command_run", commandArguments(f))
-        // Admission and launch must precede the next input frame. cat waits on
-        // open stdin, so this is not a race against a conveniently slow command.
+        let commandIDs = ["command-run/one-\u{00E9}", "command-run/two", "command-run/three", "command-run/four"]
+        for id in commandIDs { try io.tool(id, "command_run", commandArguments(f)) }
+        // Admission and launch happen in input order. Each cat waits on open
+        // stdin, so four occupied slots are deterministic rather than a race
+        // against conveniently slow commands.
         try io.tool(2, "process_list", [:])
         let jobs = try XCTUnwrap(try structured(io.receive(id: 2))["processes"] as? [JSONObject])
-        XCTAssertEqual(jobs.count, 1)
-        let taskID = try XCTUnwrap(jobs.first?["task_id"] as? String)
-        defer { _ = try? server.callTool(name: "process_cancel", arguments: ["task_id": taskID]) }
-        XCTAssertEqual(jobs.first?["running"] as? Bool, true)
+        XCTAssertEqual(jobs.count, 4)
+        let taskIDs = jobs.compactMap { $0["task_id"] as? String }
+        XCTAssertEqual(taskIDs.count, 4)
+        defer {
+            for taskID in taskIDs {
+                _ = try? server.callTool(name: "process_cancel", arguments: ["task_id": taskID])
+            }
+        }
+        XCTAssertTrue(jobs.allSatisfy { $0["running"] as? Bool == true })
 
         try io.send(["jsonrpc": "2.0", "id": 3, "method": "ping"])
         try io.send(["jsonrpc": "2.0", "id": 4, "method": "tools/list"])
         try io.tool(5, "bridge_capabilities", [:])
-        try io.tool(6, "process_status", ["task_id": taskID])
+        try io.tool(6, "process_status", ["task_id": taskIDs[0]])
         try io.tool(7, "file_read", ["workspace_id": f.workspaceID, "path": "sample.txt"])
         try io.tool(8, "workspace_reload", [:])
         try io.tool(9, "command_run", commandArguments(f, executable: "true"))
@@ -73,6 +79,8 @@ final class CommandDispatchTests: XCTestCase {
         let capabilities = try structured(io.receive(id: 5))
         XCTAssertEqual(capabilities["catalog_count"] as? Int, 72)
         XCTAssertEqual(capabilities["catalog_sha256"] as? String, catalog["catalogEpoch"] as? String)
+        XCTAssertEqual(capabilities["active_command_runs"] as? Int, 4)
+        XCTAssertEqual(capabilities["maximum_concurrent_command_runs"] as? Int, 4)
         XCTAssertEqual(try structured(io.receive(id: 6))["running"] as? Bool, true)
         let readFile = try XCTUnwrap(try structured(io.receive(id: 7))["file"] as? JSONObject)
         XCTAssertEqual(readFile["content"] as? String, "still-readable\n")
@@ -82,7 +90,7 @@ final class CommandDispatchTests: XCTestCase {
         XCTAssertTrue((try structured(rejected)["error"] as? String ?? "").contains("command_run"))
         try io.tool(10, "process_list", [:])
         let afterRejection = try XCTUnwrap(try structured(io.receive(id: 10))["processes"] as? [JSONObject])
-        XCTAssertEqual(afterRejection.compactMap { $0["task_id"] as? String }, [taskID])
+        XCTAssertEqual(Set(afterRejection.compactMap { $0["task_id"] as? String }), Set(taskIDs))
 
         let snapshot = try server.observerRequest(["action": "snapshot"])
         XCTAssertEqual(snapshot["busy"] as? Bool, false)
@@ -91,28 +99,39 @@ final class CommandDispatchTests: XCTestCase {
             $0["tool"] as? String == "command_run" && $0["state"] as? String == "failed"
         }, "Admission rejection remains visible in Issues history")
         let observedJobs = try XCTUnwrap(snapshot["jobs"] as? [JSONObject])
-        XCTAssertTrue(observedJobs.contains { $0["task_id"] as? String == taskID && $0["running"] as? Bool == true })
+        XCTAssertEqual(Set(observedJobs.filter { $0["running"] as? Bool == true }
+            .compactMap { $0["task_id"] as? String }), Set(taskIDs))
 
-        // Release the same command through the protocol. The final response
-        // may race the process_input receipt, but neither may be lost/replayed.
-        try io.tool(11, "process_input", ["task_id": taskID, "content": "one real run\n", "close_stdin": true])
-        let pair = try [io.receive(), io.receive()]
-        let commandResponse = try XCTUnwrap(pair.first { $0["id"] as? String == originalID })
-        let inputResponse = try XCTUnwrap(pair.first { $0["id"] as? Int == 11 })
-        XCTAssertEqual(try structured(inputResponse)["input_complete"] as? Bool, true)
-        let completed = try structured(commandResponse)
-        XCTAssertEqual(completed["task_id"] as? String, taskID)
-        XCTAssertEqual(completed["stdout"] as? String, "one real run\n")
-        XCTAssertEqual(completed["stderr"] as? String, "")
-        XCTAssertEqual(completed["exit_code"] as? Int, 0)
-        XCTAssertEqual(completed["running"] as? Bool, false)
-        XCTAssertEqual(completed["timed_out"] as? Bool, false)
-        XCTAssertEqual(completed["cancelled"] as? Bool, false)
-        XCTAssertEqual(completed["backend_called"] as? Bool, true)
-        try io.tool(12, "workspace_reload", [:])
-        XCTAssertEqual(try structured(io.receive(id: 12))["reloaded"] as? Bool, true)
-        try io.tool(13, "command_run", commandArguments(f, executable: "true"))
-        XCTAssertEqual(try structured(io.receive(id: 13))["exit_code"] as? Int, 0)
+        // Release all four through the protocol. Command and input responses
+        // may interleave, but every request must receive exactly one response.
+        for (index, taskID) in taskIDs.enumerated() {
+            try io.tool(20 + index, "process_input", [
+                "task_id": taskID, "content": "run-\(index)\n", "close_stdin": true,
+            ])
+        }
+        let completions = try (0..<8).map { _ in try io.receive() }
+        XCTAssertEqual(Set(completions.compactMap { $0["id"] as? String }), Set(commandIDs))
+        XCTAssertEqual(Set(completions.compactMap { $0["id"] as? Int }), Set(20..<24))
+        for response in completions where response["id"] is Int {
+            XCTAssertEqual(try structured(response)["input_complete"] as? Bool, true)
+        }
+        let commandResponses = completions.filter { $0["id"] is String }
+        XCTAssertEqual(commandResponses.count, 4)
+        for response in commandResponses {
+            let completed = try structured(response)
+            XCTAssertTrue(taskIDs.contains(try XCTUnwrap(completed["task_id"] as? String)))
+            XCTAssertTrue((completed["stdout"] as? String ?? "").hasPrefix("run-"))
+            XCTAssertEqual(completed["stderr"] as? String, "")
+            XCTAssertEqual(completed["exit_code"] as? Int, 0)
+            XCTAssertEqual(completed["running"] as? Bool, false)
+            XCTAssertEqual(completed["timed_out"] as? Bool, false)
+            XCTAssertEqual(completed["cancelled"] as? Bool, false)
+            XCTAssertEqual(completed["backend_called"] as? Bool, true)
+        }
+        try io.tool(30, "workspace_reload", [:])
+        XCTAssertEqual(try structured(io.receive(id: 30))["reloaded"] as? Bool, true)
+        try io.tool(31, "command_run", commandArguments(f, executable: "true"))
+        XCTAssertEqual(try structured(io.receive(id: 31))["exit_code"] as? Int, 0)
         XCTAssertTrue(try io.finishAndDrain().isEmpty, "No duplicate command response or unsolicited notification")
     }
 

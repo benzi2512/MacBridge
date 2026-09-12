@@ -40,6 +40,17 @@ FORBIDDEN_NAMES = {".DS_Store", ".env", "credentials.json", "workspaces.json", "
 FORBIDDEN_DIRS = {".git", ".build", ".swiftpm", "__pycache__", "node_modules", ".macbridge", "local-secrets"}
 FORBIDDEN_SUFFIXES = {".pem", ".key", ".p12", ".mobileprovision", ".sock"}
 ARCHIVE_SUFFIXES = {".zip", ".dmg", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar"}
+# This immutable historical blob contains only the fixed credential and signed
+# URL examples published in AWS's Signature V4 documentation. The exception is
+# deliberately bound to both its Git object ID and an independent content hash,
+# and can suppress only these two generic shape rules. Marker, path, email,
+# private-key, filename and tree checks still apply normally.
+REVIEWED_PUBLIC_GIT_BLOB_RULES = {
+    (
+        "9f7db0c52bb7eb5ce2e48c273b6cf5bf77596db2",
+        "eee3ef91672c51df52ef6c7620c1074849908fbcf385e1d26ae1ea83c3838717",
+    ): frozenset({"provider_credential", "signed_url"}),
+}
 
 
 class GateError(Exception):
@@ -71,6 +82,7 @@ class Gate:
         self._issue_limit_reached = False
         self._last_redaction_key = None
         self._last_redacted_location = None
+        self.reviewed_public_exceptions = []
         self.items = 0
         self.bytes = 0
         self.inventory = hashlib.sha256()
@@ -119,7 +131,7 @@ class Gate:
         self._issue_keys.add(key)
         self.issues.append(item)
 
-    def inspect(self, data, location, *, account=True):
+    def inspect(self, data, location, *, account=True, ignored_rules=frozenset()):
         if self._issue_limit_reached:
             raise GateError("issue_budget_exceeded")
         if account:
@@ -150,6 +162,8 @@ class Gate:
                 if match:
                     record_matches("private_marker", (match.start(),))
             for rule, pattern in RULES.items():
+                if rule in ignored_rules:
+                    continue
                 record_matches(rule, (match.start() for match in pattern.finditer(content)))
             record_matches("machine_home_path", (match.start() for match in HOME_PATH.finditer(content)
                 if match.group(1).lower() not in SYNTHETIC_USERS))
@@ -244,8 +258,22 @@ class Gate:
                 data = process.stdout.read(size)
                 if len(data) != size or process.stdout.read(1) != b"\n":
                     raise GateError("truncated_git_object")
-                location = "git-object/" + oid.decode("ascii")
-                self.inspect(data, location)
+                object_id = oid.decode("ascii")
+                location = "git-object/" + object_id
+                ignored_rules = frozenset()
+                if header[1] == b"blob":
+                    content_hash = hashlib.sha256(data).hexdigest()
+                    ignored_rules = REVIEWED_PUBLIC_GIT_BLOB_RULES.get(
+                        (object_id, content_hash), frozenset()
+                    )
+                    for rule in sorted(ignored_rules):
+                        if rule in RULES and RULES[rule].search(data):
+                            self.reviewed_public_exceptions.append({
+                                "rule": rule,
+                                "location": location,
+                                "basis": "exact_published_test_vector",
+                            })
+                self.inspect(data, location, ignored_rules=ignored_rules)
                 if header[1] == b"tree":
                     offset = 0
                     hash_bytes = len(oid) // 2
@@ -269,7 +297,8 @@ class Gate:
         return {"schema_version": 1, "status": "clear_within_rules" if complete and not self.issues else "blocked", "complete": complete,
                 "items_checked": self.items, "bytes_checked": self.bytes, "inventory_sha256": self.inventory.hexdigest(),
                 "issues_truncated": self._issue_limit_reached, "issue_limit": MAX_ISSUES,
-                "issues": self.issues, "limitations": ["Rule-based checks do not prove absence of all private or encoded information.", "Compressed artifacts need independent inspection; source, history and built payloads are separate gates.", "No publication or execution approval is granted by this report."]}
+                "issues": self.issues, "reviewed_public_exceptions": self.reviewed_public_exceptions,
+                "limitations": ["Rule-based checks do not prove absence of all private or encoded information.", "Exact published-test-vector exceptions do not apply to changed content or other rules.", "Compressed artifacts need independent inspection; source, history and built payloads are separate gates.", "No publication or execution approval is granted by this report."]}
 
 
 def main(argv=None):

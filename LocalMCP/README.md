@@ -205,9 +205,9 @@ readiness. The first-run UI is described in the [release guide](../Release/FIRST
   `process_output` (or `process_output_many` for several jobs). Use `process_status`
   when logs are not needed, and `process_cancel` when the job should stop.
   `command_run` returns a final result and is intended for short commands. Its
-  wait runs on one bounded worker so ping, catalog, reads, status and cancellation
-  remain usable. A second pending `command_run` is rejected before launch, not
-  queued indefinitely; use `command_start` for concurrent jobs. Workspace reload
+  wait runs on one of four bounded workers so ping, catalog, reads, status and
+  cancellation remain usable. A fifth pending `command_run` is rejected before
+  launch, not queued indefinitely; use `command_start` for further jobs. Workspace reload
   is rejected until the original response is prepared and published. Output and
   its budget stay retained for that response even if another request drains or
   cancels the job; inspect `session_retained` rather than assuming release.

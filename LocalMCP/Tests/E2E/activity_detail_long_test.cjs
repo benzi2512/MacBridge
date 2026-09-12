@@ -37,7 +37,7 @@ fs.writeFileSync(path.join(workspace, 'test_long.py'), [
 const child = spawn(binary, ['--config', config, '--surface', 'web-tunnel'], {
   env: {PATH: '/usr/bin:/bin', TMPDIR: root}, stdio: ['pipe', 'pipe', 'pipe']
 });
-let sequence = 0, stderr = '', exited = false, job, transaction;
+let sequence = 0, stderr = '', exited = false, job, jobToken, transaction, transactionToken;
 const pending = new Map(), receipts = [];
 const exit = new Promise(resolve => child.once('exit', code => {
   exited = true;
@@ -74,8 +74,8 @@ async function tool(name, args = {}) {
   try {
     const catalog = await rpc('tools/list');
     assert.equal(catalog.tools.length, 72, 'combined desktop candidate catalog');
-    // The detail patch must preserve the reviewed desktop candidate's catalog.
-    assert.equal(catalog.catalogEpoch, '4e4e372a88d4e9ab7517991852f02aa9604a993a12f0bd440eef022a4cbc855e');
+    // The detail gate must preserve this reviewed release candidate's catalog.
+    assert.equal(catalog.catalogEpoch, 'b059f5b4274ca7cf0f1ac0889084a5125e080c16d1c8442cf2436dc41a868fb3');
     const caps = await tool('bridge_capabilities');
     assert.equal(caps.data.mcp_executable_sha256, expectedHash);
     assert(caps.text.includes('72 catalog tools'));
@@ -92,18 +92,25 @@ async function tool(name, args = {}) {
       {old_text: 'return a - b', new_text: 'return a + b'}
     ]});
     transaction = patched.data.transaction_id;
+    transactionToken = patched.data.transaction_control_token;
     assert(transaction);
+    assert(transactionToken);
     assert(patched.text.includes('1 edits applied'));
     const start = await tool('developer_task', {action: 'run_tests', test_kind: 'custom', workspace_id: workspaceID,
       title: 'Verify activity receipts with a long task', executable: 'python3', arguments: ['-B', 'test_long.py'], cwd: '.', maximum_output_bytes: 8192});
     job = start.data.task_id;
+    jobToken = start.data.process_control_token;
     const workflow = start.data.workflow_id;
+    const workflowToken = start.data.work_control_token;
+    assert(jobToken);
+    assert(workflowToken);
     assert(start.text.includes('command python3 -B test_long.py'));
     let final, observedRunning = 0;
     const produced = [], elapsed = [];
     for (let i = 0; i < 8; i++) {
       await new Promise(resolve => setTimeout(resolve, 4000));
-      const step = await tool('developer_task', {action: 'continue_task', workflow_id: workflow});
+      const step = await tool('developer_task', {action: 'continue_task', workflow_id: workflow,
+        work_control_token: workflowToken, process_control_token: jobToken});
       assert(step.text.includes('command python3 -B test_long.py; folder .'));
       assert(!step.text.includes('Result returned'));
       assert(!step.text.includes('VALIDATED_BATCH_'));
@@ -134,7 +141,9 @@ async function tool(name, args = {}) {
       arguments: ['-c', "printf PRIVATE_SCRIPT_CANARY"], timeout_milliseconds: 5000});
     assert.equal(inline.data.stdout, 'PRIVATE_SCRIPT_CANARY');
     assert(inline.text.includes('[script and remaining arguments omitted]'));
-    await tool('transaction_restore', {transaction_id: transaction}); transaction = null;
+    await tool('transaction_restore', {transaction_id: transaction,
+      transaction_control_token: transactionToken});
+    transaction = null; transactionToken = null;
     assert.equal(fs.readFileSync(path.join(workspace, 'sum.py'), 'utf8'), original);
     assert.equal((await tool('process_list')).data.processes.length, 0);
     assert.equal((await tool('transaction_list')).data.retained_transaction_count, 0);
@@ -146,8 +155,10 @@ async function tool(name, args = {}) {
     if (evidenceFile) fs.writeFileSync(evidenceFile, JSON.stringify(result, null, 2) + '\n', {mode: 0o600});
     console.log(JSON.stringify(result));
   } finally {
-    if (!exited && job) await tool('process_cancel', {task_id: job}).catch(() => {});
-    if (!exited && transaction) await tool('transaction_restore', {transaction_id: transaction}).catch(() => {});
+    if (!exited && job) await tool('process_cancel', {task_id: job,
+      process_control_token: jobToken}).catch(() => {});
+    if (!exited && transaction) await tool('transaction_restore', {transaction_id: transaction,
+      transaction_control_token: transactionToken}).catch(() => {});
     child.stdin.end();
     const timer = setTimeout(() => child.kill('SIGTERM'), 3000);
     await exit; clearTimeout(timer);

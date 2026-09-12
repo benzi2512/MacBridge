@@ -495,7 +495,11 @@ public final class LocalProcessService: @unchecked Sendable {
         precondition(completedStatusLimit >= 0 && completedStatusLimit <= Self.maximumCompletedStatuses)
         precondition(completedStatusTTL >= 0 && completedStatusTTL.isFinite)
         self.workspaceService = workspaceService
-        self.selfExecutable = selfExecutable
+        // SwiftPM and installers may hand us an alias. Bind the runner to the
+        // current canonical file so Seatbelt's literal read/exec/write rules
+        // all describe the same object path.
+        self.selfExecutable = URL(fileURLWithPath:
+            (try? canonicalExistingPath(selfExecutable.path)) ?? selfExecutable.path)
         self.outputByteLimit = outputByteLimit
         self.completedStatusLimit = completedStatusLimit
         self.completedStatusTTL = completedStatusTTL
@@ -878,18 +882,24 @@ public final class LocalProcessService: @unchecked Sendable {
             workspace: commandScope,
             runtime: runtime,
             executable: executable.invocationPath,
+            runner: selfExecutable.path,
             readOnlyGit: readOnlyGit,
             networkProxyPort: networkProxy?.port
         )
         try writeNewRuntimeProfile(Data(profile.utf8), to: profileURL)
 
         let process = Process()
-        process.executableURL = selfExecutable
+        // Enter Seatbelt before any project-controlled or replaceable helper is
+        // executed. The small runner is needed only to create a process group;
+        // even if its on-disk path were replaced by another same-user process,
+        // the replacement would still start inside this already-applied profile.
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/sandbox-exec")
         process.arguments =
             [
-                // command.sb is diagnostic only. The fresh runner consumes these
-                // immutable argument bytes, never a child-writable policy file.
-                "--runner-child", profile, executable.invocationPath,
+                // command.sb is diagnostic only. sandbox-exec consumes these
+                // immutable profile bytes directly, never the child-writable file.
+                "-p", profile, selfExecutable.path, "--runner-child",
+                executable.invocationPath,
             ] + normalizedArguments
         process.currentDirectoryURL = workingDirectory
         let accountHome = FileManager.default.homeDirectoryForCurrentUser
@@ -1152,11 +1162,12 @@ public final class LocalProcessService: @unchecked Sendable {
         workspace: URL,
         runtime: URL,
         executable: String,
+        runner: String,
         readOnlyGit: Bool = false,
         networkProxyPort: UInt16? = nil
     ) throws -> String {
         let home = FileManager.default.homeDirectoryForCurrentUser
-        let values = [workspace.path, runtime.path, executable, home.path]
+        let values = [workspace.path, runtime.path, executable, runner, home.path]
         guard values.allSatisfy({ !$0.contains("\n") && !$0.contains("\0") }) else {
             throw LocalMCPError.invalidPath("sandbox path")
         }
@@ -1169,6 +1180,7 @@ public final class LocalProcessService: @unchecked Sendable {
         let run = quote(runtime.path)
         let homePath = quote(home.path)
         let executablePath = quote(executable)
+        let runnerPath = quote(runner)
         let runtimeState = quote(runtime.deletingLastPathComponent().deletingLastPathComponent().path)
         let writableRuntime = ["home", "tmp", "cache"].map {
             "(subpath \(quote(runtime.appendingPathComponent($0).path)))"
@@ -1217,10 +1229,13 @@ public final class LocalProcessService: @unchecked Sendable {
         let processRules = readOnlyGit ? """
             (deny process-fork)
             (deny process-exec)
-            (allow process-exec (literal \(executablePath)))
+            (allow process-exec
+                (literal \(runnerPath))
+                (literal \(executablePath)))
             """ : """
             (allow process-fork)
             (allow process-exec
+                (literal \(runnerPath))
                 (literal \(executablePath))
                 (subpath \(stage))
                 (subpath "/Applications/Xcode.app")
@@ -1276,11 +1291,16 @@ public final class LocalProcessService: @unchecked Sendable {
             (allow file-read* file-test-existence file-map-executable
                 (subpath \(stage))
                 (subpath \(run))
+                (literal \(runnerPath))
                 (subpath \(localBin))
                 (subpath \(cargoBin))
                 (subpath \(bunBin)))
             (deny file-write*)
             \(workspaceWrites)
+            ; The live binary may sit inside a broad writable cwd. Commands may
+            ; use the rest of that workspace, but cannot persist by replacing
+            ; the executable launchd will use on the next restart.
+            (deny file-write* (literal \(runnerPath)))
             ; Owner control/recovery state is not workspace command output.
             (deny file-write*
                 (subpath \(runtimeState))
@@ -1400,13 +1420,14 @@ public final class LocalProcessService: @unchecked Sendable {
 
 public enum LocalRunnerChild {
     public static func execute(arguments: [String]) -> Never {
-        guard arguments.count >= 2 else { Darwin._exit(64) }
-        let profile = arguments[0]
-        let executable = arguments[1]
-        let commandArguments = Array(arguments.dropFirst(2))
+        // This entry point is reached only after sandbox-exec has applied the
+        // command profile. It contains no policy transition and cannot widen
+        // the child's authority.
+        guard let executable = arguments.first else { Darwin._exit(64) }
+        let commandArguments = Array(arguments.dropFirst())
         _ = umask(0o077)
         guard setpgid(0, 0) == 0 else { Darwin._exit(70) }
-        let values = ["/usr/bin/sandbox-exec", "-p", profile, executable] + commandArguments
+        let values = [executable] + commandArguments
         var pointers: [UnsafeMutablePointer<CChar>] = []
         for value in values {
             guard let pointer = strdup(value) else { Darwin._exit(71) }
@@ -1420,7 +1441,7 @@ public enum LocalRunnerChild {
             }
         }
         _ = argv.withUnsafeMutableBufferPointer { buffer in
-            execv("/usr/bin/sandbox-exec", buffer.baseAddress!)
+            execv(executable, buffer.baseAddress!)
         }
         Darwin._exit(127)
     }

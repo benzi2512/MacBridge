@@ -195,7 +195,7 @@ enum ToolDiscovery {
                 "categories": categories.map { category in
                     ["name": category, "count": all.filter { aliases[$0["name"] as! String] == nil && Self.category(for: $0["name"] as! String) == category }.count] as JSONObject
                 },
-                "instructions": "Use already-loaded callable schemas directly; otherwise use host discovery. Search query/category for a short list, names for exact schemas, or limit=\(all.count) for the full index. Use work_task for explicit multi-step activity grouping. Check each batch result; output includes job status and cursors. This lookup never executes or grants permission.",
+                "instructions": "Use loaded schemas or host discovery. Search query/category, request names for exact schemas, or limit=\(all.count) for the full index. Use work_task for multi-step grouping. Check each batch result and output cursor. This lookup never executes or grants permission.",
                 "host_callable_loading_guaranteed": false]
     }
 }

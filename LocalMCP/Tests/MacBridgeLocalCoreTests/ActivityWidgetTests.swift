@@ -139,6 +139,7 @@ final class ActivityWidgetTests: XCTestCase {
         let write = try s.callTool(name: "file_write", arguments: ["workspace_id": f.workspaceID,
             "path": "sample.txt", "content": "FIXTURE_CONTENT_NOT_IN_CARD"])
         let transaction = try XCTUnwrap(write["transaction_id"] as? String)
+        let transactionToken = try XCTUnwrap(write["transaction_control_token"] as? String)
         for _ in 0..<30 { _ = try s.callTool(name: "workspace_overview", arguments: [:]) }
         let first = try s.callTool(name: "bridge_activity_view", arguments: [:])
         let owner = try XCTUnwrap(first["instance_id"] as? String)
@@ -152,7 +153,9 @@ final class ActivityWidgetTests: XCTestCase {
             XCTAssertNil(refreshed["log"])
             XCTAssertFalse(String(decoding: try LocalJSON.encode(refreshed), as: UTF8.self).contains("FIXTURE_CONTENT_NOT_IN_CARD"))
         }
-        _ = try s.callTool(name: "transaction_restore", arguments: ["transaction_id": transaction])
+        _ = try s.callTool(name: "transaction_restore", arguments: [
+            "transaction_id": transaction, "transaction_control_token": transactionToken,
+        ])
         XCTAssertFalse(FileManager.default.fileExists(atPath: f.workspace.appendingPathComponent("sample.txt").path))
     }
 
@@ -165,7 +168,10 @@ final class ActivityWidgetTests: XCTestCase {
             "executable": "sh", "arguments": ["-c", "printf 'widget-start\\n'; sleep 0.3; printf 'widget-done\\n'"],
             "maximum_output_bytes": 8192])
         let id = try XCTUnwrap(started["task_id"] as? String)
-        defer { _ = try? s.callTool(name: "process_cancel", arguments: ["task_id": id]) }
+        let token = try XCTUnwrap(started["process_control_token"] as? String)
+        defer { _ = try? s.callTool(name: "process_cancel", arguments: [
+            "task_id": id, "process_control_token": token,
+        ]) }
         let running = try s.callTool(name: "bridge_activity", arguments: ["instance_id": owner])
         XCTAssertTrue((running["jobs"] as! [JSONObject]).contains { $0["task_id"] as? String == id && $0["running"] as? Bool == true })
         for _ in 0..<100 {
@@ -173,7 +179,9 @@ final class ActivityWidgetTests: XCTestCase {
             Thread.sleep(forTimeInterval: 0.02)
         }
         for _ in 0..<3 {
-            let peek = try s.callTool(name: "bridge_activity", arguments: ["instance_id": owner, "task_id": id])
+            let peek = try s.callTool(name: "bridge_activity", arguments: [
+                "instance_id": owner, "task_id": id, "process_control_token": token,
+            ])
             let log = try XCTUnwrap(peek["log"] as? JSONObject)
             XCTAssertEqual(log["running"] as? Bool, false)
             XCTAssertEqual(log["output_consumed"] as? Bool, false)
@@ -182,9 +190,13 @@ final class ActivityWidgetTests: XCTestCase {
             XCTAssertTrue((log["stdout"] as? String ?? "").contains("widget-done"))
             XCTAssertLessThanOrEqual((log["stdout"] as? String ?? "").utf8.count, 4096)
         }
-        let drained = try s.callTool(name: "process_output", arguments: ["task_id": id])
+        let drained = try s.callTool(name: "process_output", arguments: [
+            "task_id": id, "process_control_token": token,
+        ])
         XCTAssertEqual(drained["session_retained"] as? Bool, false)
-        let missing = try s.callTool(name: "bridge_activity", arguments: ["instance_id": owner, "task_id": id])
+        let missing = try s.callTool(name: "bridge_activity", arguments: [
+            "instance_id": owner, "task_id": id, "process_control_token": token,
+        ])
         XCTAssertNotNil(missing["log_error"])
         XCTAssertNil(missing["log"])
     }
@@ -200,17 +212,18 @@ final class ActivityWidgetTests: XCTestCase {
             do {
                 let result = try s.callTool(name: "command_run", arguments: ["workspace_id": workspaceID,
                     "executable": "cat", "arguments": [] as [String], "timeout_milliseconds": 5000])
-                XCTAssertEqual(result["exit_code"] as? Int, 0)
+                XCTAssertEqual(result["cancelled"] as? Bool, true)
             } catch { XCTFail("synthetic command failed: \(error)") }
         }
         // Always release this fixture's stdin and join before removing its files,
         // including on an assertion/error path. No unrelated owner is involved.
         defer {
             let jobs = (try? s.callTool(name: "process_list", arguments: [:])["processes"] as? [JSONObject]) ?? []
-            for job in jobs {
+            for job in jobs where job["running"] as? Bool == true {
                 if let id = job["task_id"] as? String {
-                    _ = try? s.callTool(name: "process_input", arguments: [
-                        "task_id": id, "content": "", "close_stdin": true])
+                    _ = try? s.observerRequest([
+                        "action": "cancel", "instance_id": owner, "task_id": id,
+                    ])
                 }
             }
             XCTAssertEqual(done.wait(timeout: .now() + 8), .success)
@@ -235,7 +248,9 @@ final class ActivityWidgetTests: XCTestCase {
         let completionBeforeRelease = done.wait(timeout: .now())
         if completionBeforeRelease == .success { done.signal() }
         XCTAssertEqual(completionBeforeRelease, .timedOut)
-        _ = try s.callTool(name: "process_input", arguments: ["task_id": taskID, "content": "", "close_stdin": true])
+        _ = try s.observerRequest([
+            "action": "cancel", "instance_id": owner, "task_id": taskID,
+        ])
         XCTAssertEqual(done.wait(timeout: .now() + 8), .success)
         done.signal()
         let fresh = try s.callTool(name: "bridge_activity", arguments: ["instance_id": owner])
@@ -244,6 +259,6 @@ final class ActivityWidgetTests: XCTestCase {
             $0["tool"] as? String == "command_run"
         })
         XCTAssertEqual(finished["state"] as? String, "returned")
-        XCTAssertEqual((finished["result"] as? JSONObject)?["exit_code"] as? Int, 0)
+        XCTAssertEqual((finished["result"] as? JSONObject)?["cancelled"] as? Bool, true)
     }
 }

@@ -62,12 +62,13 @@ final class ProcessActivityContextTests: XCTestCase {
         }
         let start = try call("command_start", ["workspace_id": f.workspaceID, "cwd": ".", "executable": "cat", "arguments": [String]()])
         let id = try XCTUnwrap((start["structuredContent"] as? JSONObject)?["task_id"] as? String)
+        let token = try XCTUnwrap((start["structuredContent"] as? JSONObject)?["process_control_token"] as? String)
         let status = try call("process_status", ["task_id": id])
         let text = try XCTUnwrap((status["content"] as? [JSONObject])?.first?["text"] as? String)
         XCTAssertTrue(text.contains("command cat; folder ."), text)
         XCTAssertTrue(text.contains("Process running"), text)
         XCTAssertNil((status["structuredContent"] as? JSONObject)?["activity_context"])
-        _ = try call("process_cancel", ["task_id": id])
+        _ = try call("process_cancel", ["task_id": id, "process_control_token": token])
     }
 
     private var binary: URL {

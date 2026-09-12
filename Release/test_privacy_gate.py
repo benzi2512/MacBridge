@@ -1,5 +1,6 @@
 """Synthetic tests only. Git writes are confined to each new temporary fixture."""
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -344,6 +345,44 @@ class PrivacyGateTests(unittest.TestCase):
         self.git_command("commit", "--quiet", "-m", "clean fixture")
         revision = self.git_command("rev-parse", "HEAD")
         self.assertEqual(self.run_gate("git", str(self.root), "--revision", revision)[0], 0)
+
+    def test_reviewed_public_blob_exception_is_exact_and_rule_scoped(self):
+        self.git_command("init", "--quiet")
+        token = "gh" + "p_" + "A" * 36
+        signed = "X-Amz-" + "Signature=" + "b" * 32
+        data = (token + "\n" + signed + "\n").encode()
+        (self.root / "published-vector.txt").write_bytes(data)
+        self.git_command("add", "published-vector.txt")
+        self.git_command("commit", "--quiet", "-m", "published fixture")
+        revision = self.git_command("rev-parse", "HEAD")
+        blob = self.git_command("rev-parse", "HEAD:published-vector.txt")
+        reviewed = {(blob, hashlib.sha256(data).hexdigest()):
+                    frozenset({"provider_credential", "signed_url"})}
+        with patch.object(pg, "REVIEWED_PUBLIC_GIT_BLOB_RULES", reviewed):
+            code, result = self.run_gate("git", str(self.root), "--revision", revision)
+            self.assertEqual(code, 0)
+            self.assertEqual({item["rule"] for item in result["reviewed_public_exceptions"]},
+                             {"provider_credential", "signed_url"})
+            markers = self.base / "markers"
+            markers.write_text(token)
+            code, result = self.run_gate("git", str(self.root), "--revision", revision,
+                                         "--markers", str(markers))
+            self.assertEqual(code, 1)
+            self.assertIn("private_marker", {item["rule"] for item in result["issues"]})
+        with patch.object(pg, "REVIEWED_PUBLIC_GIT_BLOB_RULES",
+                          {(blob, "0" * 64): reviewed[(blob, hashlib.sha256(data).hexdigest())]}):
+            code, result = self.run_gate("git", str(self.root), "--revision", revision)
+            self.assertEqual(code, 1)
+            self.assertEqual(result["reviewed_public_exceptions"], [])
+            self.assertIn("provider_credential", {item["rule"] for item in result["issues"]})
+        (self.root / "published-vector.txt").write_bytes(data + b"changed\n")
+        self.git_command("add", "published-vector.txt")
+        self.git_command("commit", "--quiet", "-m", "changed fixture")
+        changed_revision = self.git_command("rev-parse", "HEAD")
+        with patch.object(pg, "REVIEWED_PUBLIC_GIT_BLOB_RULES", reviewed):
+            code, result = self.run_gate("git", str(self.root), "--revision", changed_revision)
+            self.assertEqual(code, 1)
+            self.assertIn("provider_credential", {item["rule"] for item in result["issues"]})
 
     def test_git_private_author_is_detected_without_printing_identity(self):
         self.git_command("init", "--quiet")

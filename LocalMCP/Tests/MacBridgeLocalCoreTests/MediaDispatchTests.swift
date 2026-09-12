@@ -51,14 +51,18 @@ final class MediaDispatchTests: XCTestCase {
         let server = try LocalMCPServer(configurationURL: f.base.config, selfExecutable: f.base.config,
             connectorSurface: .webTunnel, observationEnabled: true, searchStartForTesting: nil,
             mediaConfigurationURLForTesting: f.config, mediaTransportForTesting: f.http.run)
-        let parent = try XCTUnwrap(try server.callTool(name: "work_task", arguments: ["action": "begin", "title": "Fixture media"])["work_id"] as? String)
-        var args = publish(f); args["work_id"] = parent
+        let begun = try server.callTool(name: "work_task", arguments: ["action": "begin", "title": "Fixture media"])
+        let parent = try XCTUnwrap(begun["work_id"] as? String)
+        let token = try XCTUnwrap(begun["work_control_token"] as? String)
+        var args = publish(f); args["work_id"] = parent; args["work_control_token"] = token
         let result = try server.callTool(name: "media_share", arguments: args)
         XCTAssertNotNil(result["media_url"])
         let text = String(decoding: try LocalJSON.encode(server.observerRequest(["action": "snapshot"])), as: UTF8.self)
         for secret in ["X-Amz", f.secret, f.access, "media_url"] { XCTAssertFalse(text.contains(secret)) }
         XCTAssertEqual(result["work_id"] as? String, parent)
-        XCTAssertEqual(try server.callTool(name: "work_task", arguments: ["action": "finish", "work_id": parent])["state"] as? String, "completed")
+        XCTAssertEqual(try server.callTool(name: "work_task", arguments: [
+            "action": "finish", "work_id": parent, "work_control_token": token,
+        ])["state"] as? String, "completed")
     }
     func testUnconfiguredSharingIsClosedButLocalPrepareStillWorks() throws {
         let f = try MediaFixture(); defer { f.remove() }

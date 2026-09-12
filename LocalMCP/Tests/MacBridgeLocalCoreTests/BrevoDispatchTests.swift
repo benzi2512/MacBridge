@@ -53,10 +53,13 @@ final class BrevoDispatchTests: XCTestCase {
         let server = try makeServer(f, transport), io = BrevoDispatchConnection(server)
         defer { transport.release.signal(); io.close() }
         try io.tool(1, "work_task", ["action": "begin", "title": "Synthetic slow read"])
-        let parent = try XCTUnwrap(try structured(io.receive(id: 1))["work_id"] as? String)
-        try io.tool(2, "brevo_read", ["action": "account", "work_id": parent])
+        let started = try structured(io.receive(id: 1))
+        let parent = try XCTUnwrap(started["work_id"] as? String)
+        let control = try XCTUnwrap(started["work_control_token"] as? String)
+        let scoped: JSONObject = ["work_id": parent, "work_control_token": control]
+        try io.tool(2, "brevo_read", scoped.merging(["action": "account"]) { _, rhs in rhs })
         XCTAssertEqual(transport.entered.wait(timeout: .now() + 2), .success)
-        try io.tool(3, "brevo_lists", ["action": "list", "work_id": parent])
+        try io.tool(3, "brevo_lists", scoped.merging(["action": "list"]) { _, rhs in rhs })
         try assertToolError(io.receive(id: 3), contains: "already active")
         XCTAssertThrowsError(try server.callTool(name: "brevo_campaign", arguments: ["action": "preflight", "campaign_id": 1]))
         XCTAssertEqual(transport.calls, 1, "Rejected calls must not touch credentials/transport or queue work")
@@ -66,11 +69,13 @@ final class BrevoDispatchTests: XCTestCase {
         XCTAssertEqual(snapshot["active_brevo_calls"] as? Int, 1)
         let item = try XCTUnwrap((snapshot["work_items"] as? [JSONObject])?.first)
         XCTAssertEqual(item["active_call_count"] as? Int, 1)
-        try io.tool(4, "work_task", ["action": "finish", "work_id": parent])
+        try io.tool(4, "work_task", ["action": "finish", "work_id": parent,
+                                     "work_control_token": control])
         try assertToolError(io.receive(id: 4), contains: "active calls")
         transport.release.signal()
         XCTAssertEqual(try structured(io.receive(id: 2))["work_id"] as? String, parent)
-        try io.tool(5, "work_task", ["action": "finish", "work_id": parent])
+        try io.tool(5, "work_task", ["action": "finish", "work_id": parent,
+                                     "work_control_token": control])
         XCTAssertEqual(try structured(io.receive(id: 5))["state"] as? String, "completed")
         try io.tool(6, "brevo_read", ["action": "account"])
         XCTAssertEqual(try structured(io.receive(id: 6))["email"] as? String, BrevoOperations.fixtureAccount)

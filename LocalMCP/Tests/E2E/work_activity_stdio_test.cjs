@@ -31,16 +31,19 @@ function observe(request){return new Promise((resolve,reject)=>{
   client.on('data',chunk=>{data+=chunk;if(data.length>1048576)client.destroy(new Error('observer reply exceeded limit'));else if(data.includes('\n')){client.end();try{const reply=JSON.parse(data.split('\n')[0]);resolve(reply.ok===true?reply.result:reply);}catch(e){reject(e);}}});
   client.on('error',reject);
 });}
-let a,b,taskID,tx;
+let a,b,aControl,bControl,taskID,processControl,tx,txControl;
 (async()=>{try{
-  const catalog=await rpc('tools/list');assert.equal(catalog.tools.length,57);
+  const catalog=await rpc('tools/list');assert.equal(catalog.tools.length,72);
   for(const name of ['file_patch','command_start','command_run','file_search'])assert(catalog.tools.find(t=>t.name===name).inputSchema.properties.work_id);
   const owner=(await tool('bridge_capabilities')).instance_id;
-  a=(await tool('work_task',{action:'begin',title:'Fix addition and run tests',chat_label:'Chat A (fixture)',workspace_id:workspaceID})).work_id;
-  b=(await tool('work_task',{action:'begin',title:'Review another task',chat_label:'Chat B (fixture)',workspace_id:workspaceID})).work_id;
+  const startedA=await tool('work_task',{action:'begin',title:'Fix addition and run tests',chat_label:'Chat A (fixture)',workspace_id:workspaceID});
+  const startedB=await tool('work_task',{action:'begin',title:'Review another task',chat_label:'Chat B (fixture)',workspace_id:workspaceID});
+  a=startedA.work_id;aControl=startedA.work_control_token;
+  b=startedB.work_id;bControl=startedB.work_control_token;
   assert(a&&b&&a!==b);
-  await tool('work_task',{action:'update',work_id:b,workspace_id:workspaceID,status:'waiting_user'});
-  await tool('file_read',{work_id:a,workspace_id:workspaceID,path:'sum.py'});
+  assert(aControl&&bControl);
+  await tool('work_task',{action:'update',work_id:b,work_control_token:bControl,workspace_id:workspaceID,status:'waiting_user'});
+  await tool('file_read',{work_id:a,work_control_token:aControl,workspace_id:workspaceID,path:'sum.py'});
   const initial=await observe({action:'snapshot',instance_id:owner});
   assert.equal(initial.observer_file_preview,true);
   const selectedEvent=initial.history.find(r=>r.tool==='file_read'&&r.work_id===a).id;
@@ -50,16 +53,17 @@ let a,b,taskID,tx;
   assert.equal(unchanged.unchanged,true);assert.equal(unchanged.text,undefined);
   const wrongOwner=await observe({...previewRequest,instance_id:crypto.randomUUID()});assert(wrongOwner.error);
   const suppliedPath=await observe({...previewRequest,path:'/etc/passwd'});assert(suppliedPath.error);
-  const run=()=>tool('command_run',{work_id:a,workspace_id:workspaceID,executable:'python3',arguments:['-B','test_sum.py'],timeout_milliseconds:10000,maximum_output_bytes:8192});
+  const run=()=>tool('command_run',{work_id:a,work_control_token:aControl,workspace_id:workspaceID,executable:'python3',arguments:['-B','test_sum.py'],timeout_milliseconds:10000,maximum_output_bytes:8192});
   assert.notEqual((await run()).exit_code,0,'real baseline must fail');
-  const patch=await call('file_patch',{work_id:a,workspace_id:workspaceID,path:'sum.py',expected_sha256:hash(baseline),old_text:'return a - b',new_text:'return a + b'});
-  tx=patch.structuredContent.transaction_id;assert.equal(patch.structuredContent.work_id,a);
+  const patch=await call('file_patch',{work_id:a,work_control_token:aControl,workspace_id:workspaceID,path:'sum.py',expected_sha256:hash(baseline),old_text:'return a - b',new_text:'return a + b'});
+  tx=patch.structuredContent.transaction_id;txControl=patch.structuredContent.transaction_control_token;assert.equal(patch.structuredContent.work_id,a);
   const after=await observe({...previewRequest,known_version:before.version});
   assert.equal(after.text,baseline.replace('a - b','a + b'));assert.notEqual(after.version,before.version);
   assert(patch.content.some(x=>x.text?.includes('sum.py')),'summary names actual file');
   const passed=await run();assert.equal(passed.exit_code,0);assert(passed.stdout.includes('WORK_TEST_PASS'));
-  taskID=(await tool('command_start',{work_id:a,workspace_id:workspaceID,executable:'cat',arguments:[],maximum_output_bytes:8192})).task_id;
-  await call('work_task',{action:'finish',work_id:a,workspace_id:workspaceID,status:'completed'},true);
+  const startedJob=await tool('command_start',{work_id:a,work_control_token:aControl,workspace_id:workspaceID,executable:'cat',arguments:[],maximum_output_bytes:8192});
+  taskID=startedJob.task_id;processControl=startedJob.process_control_token;
+  await call('work_task',{action:'finish',work_id:a,work_control_token:aControl,workspace_id:workspaceID,status:'completed'},true);
   const active=await tool('bridge_activity',{instance_id:owner});
   assert.equal(active.work_items.find(w=>w.work_id===a).phase,'executing');
   assert.equal(active.work_items.find(w=>w.work_id===b).phase,'waiting_user');
@@ -74,29 +78,29 @@ let a,b,taskID,tx;
     let expired=false;
     const holdDeadline=setTimeout(()=>{expired=true;input.close();},600000);
     try{for await(const line of input){
-        if(line.trim()==='finish-job'){await tool('process_input',{task_id:taskID,content:'UI_HANDLE_SURVIVED\n',close_stdin:true});console.log('JOB_RELEASED');}
+        if(line.trim()==='finish-job'){await tool('process_input',{task_id:taskID,process_control_token:processControl,content:'UI_HANDLE_SURVIVED\n',close_stdin:true});console.log('JOB_RELEASED');}
         if(line.trim()==='finish'){input.close();break;}
     }}finally{clearTimeout(holdDeadline);input.close();}
     assert(!expired,'UI hold exceeded its 10-minute fixture lifetime');
-  }else await tool('process_input',{task_id:taskID,content:'WORK_HANDLE_SURVIVED\n',close_stdin:true});
+  }else await tool('process_input',{task_id:taskID,process_control_token:processControl,content:'WORK_HANDLE_SURVIVED\n',close_stdin:true});
   // Bound the wait with the real process wait API; output is consumed only here.
-  for(let i=0;i<5;i++){if(!(await tool('process_wait',{task_id:taskID,maximum_wait_milliseconds:1000})).running)break;}
-  const drained=await tool('process_output',{task_id:taskID});assert.equal(drained.exit_code,0);assert.equal(drained.session_retained,false);taskID=null;
+  for(let i=0;i<5;i++){if(!(await tool('process_wait',{task_id:taskID,process_control_token:processControl,maximum_wait_milliseconds:1000})).running)break;}
+  const drained=await tool('process_output',{task_id:taskID,process_control_token:processControl});assert.equal(drained.exit_code,0);assert.equal(drained.session_retained,false);taskID=null;processControl=null;
   const waiting=await tool('bridge_activity',{instance_id:owner});assert.equal(waiting.work_items.find(w=>w.work_id===a).phase,'waiting_next_step');
-  await tool('transaction_restore',{work_id:a,transaction_id:tx});tx=null;
+  await tool('transaction_restore',{work_id:a,work_control_token:aControl,transaction_id:tx,transaction_control_token:txControl});tx=null;txControl=null;
   const restored=await observe({...previewRequest,known_version:after.version});assert.equal(restored.text,baseline);
   assert.equal(fs.readFileSync(path.join(workspace,'sum.py'),'utf8'),baseline);
   // History rollover does not erase a task or accidentally merge same-workspace chats.
-  for(let i=0;i<66;i++)await tool('directory_list',{work_id:a,workspace_id:workspaceID,path:'.'});
+  for(let i=0;i<66;i++)await tool('directory_list',{work_id:a,work_control_token:aControl,workspace_id:workspaceID,path:'.'});
   const rollover=await tool('bridge_activity',{instance_id:owner});assert.equal(rollover.work_items.length,2);assert.equal(rollover.work_items.find(w=>w.work_id===b).phase,'waiting_user');
-  await tool('work_task',{action:'finish',work_id:a,workspace_id:workspaceID,status:'completed'});
-  await tool('work_task',{action:'finish',work_id:b,workspace_id:workspaceID,status:'completed'});
+  await tool('work_task',{action:'finish',work_id:a,work_control_token:aControl,workspace_id:workspaceID,status:'completed'});
+  await tool('work_task',{action:'finish',work_id:b,work_control_token:bControl,workspace_id:workspaceID,status:'completed'});
   const finished=await tool('work_task',{action:'list',workspace_id:workspaceID});assert(finished.work_items.every(w=>w.phase==='completed'));
   const gateway=await tool('developer_task',{action:'execute_task',workspace_id:workspaceID,cwd:'.',title:'Developer gateway E2E',chat_label:'Synthetic E2E',executable:'sh',arguments:['-c',"printf 'DEVELOPER_GATEWAY_OK\\n'"],maximum_output_bytes:4096});
   assert(gateway.workflow_id&&gateway.task_id&&gateway.next_action==='continue_task');
-  let terminal;
+  let terminal;const gatewayWorkControl=gateway.work_control_token,gatewayProcessControl=gateway.process_control_token;
   for(let i=0;i<20;i++){
-    terminal=await tool('developer_task',{action:'continue_task',workflow_id:gateway.workflow_id});
+    terminal=await tool('developer_task',{action:'continue_task',workflow_id:gateway.workflow_id,work_control_token:gatewayWorkControl,process_control_token:gatewayProcessControl});
     if(terminal.workflow_terminal)break;
     await new Promise(resolve=>setTimeout(resolve,25));
   }
@@ -109,8 +113,8 @@ let a,b,taskID,tx;
   assert.equal((await tool('transaction_list')).retained_transaction_count,0);
   console.log(JSON.stringify({status:'PASS',checks,scope:'exact-binary local stdio + selected-file observer IPC, not normal Chat or inline rendering',preview_changed_and_restored:true,preview_unchanged_omits_text:true,file_restored:true,processes:0,undo:0}));
 }finally{
-  if(taskID&&!exited)await tool('process_cancel',{task_id:taskID}).catch(()=>{});
-  if(tx&&!exited)await tool('transaction_restore',{transaction_id:tx}).catch(()=>{});
+  if(taskID&&!exited)await tool('process_cancel',{task_id:taskID,process_control_token:processControl}).catch(()=>{});
+  if(tx&&!exited)await tool('transaction_restore',{transaction_id:tx,transaction_control_token:txControl}).catch(()=>{});
   child.stdin.end();const deadline=setTimeout(()=>child.kill('SIGTERM'),3000);await exit;clearTimeout(deadline);
   fs.rmSync(root,{recursive:true,force:true});assert(!fs.existsSync(root));
 }})().catch(e=>{console.error(e);process.exitCode=1;});

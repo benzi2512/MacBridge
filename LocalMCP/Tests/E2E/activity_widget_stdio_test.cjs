@@ -14,7 +14,7 @@ const config=path.join(root,'workspaces.json'),workspaceID='11111111-2222-4333-8
 const configuredWorkspace=workspace.replace(/^\/private\/tmp\//,'/tmp/');
 fs.writeFileSync(config,JSON.stringify({version:1,workspaces:[{id:workspaceID,name:'activity-fixture',path:configuredWorkspace}]}),{mode:0o600});
 const child=spawn(binary,['--config',config,'--surface','web-tunnel','--observer-directory',observer],{env:{PATH:'/usr/bin:/bin',TMPDIR:root},stdio:['pipe','pipe','pipe']});
-let sequence=0,errorText='',taskID,exited=false;const pending=new Map(),notifications=[];
+let sequence=0,errorText='',taskID,processControl,exited=false;const pending=new Map(),notifications=[];
 const exit=new Promise(resolve=>child.on('exit',code=>{exited=true;for(const item of pending.values()){clearTimeout(item.timer);item.reject(new Error(`candidate exited ${code}: ${errorText}`));}pending.clear();resolve(code);}));
 child.stderr.on('data',chunk=>{errorText=(errorText+chunk).slice(-4096);});
 readline.createInterface({input:child.stdout}).on('line',line=>{
@@ -61,9 +61,9 @@ const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
     assert.equal(view.catalog_count,72);assert.equal(view.snapshot_stale,false);
     assert.deepEqual(view.ui_resource_delivery,{read_count:3,last_outcome:'response_prepared'});
     const start=await tool('command_start',{workspace_id:workspaceID,executable:'sh',arguments:['-c',"printf 'step-1\\n'; sleep 0.4; printf 'step-2\\n'; sleep 0.4; printf 'done\\n'"],maximum_output_bytes:8192});
-    taskID=start.task_id;let sawRunning=false,sawDone=false,sawPartial=false;
+    taskID=start.task_id;processControl=start.process_control_token;let sawRunning=false,sawDone=false,sawPartial=false;
     for(let i=0;i<60;i++){
-      const data=await tool('bridge_activity',{instance_id:owner,task_id:taskID});
+      const data=await tool('bridge_activity',{instance_id:owner,task_id:taskID,process_control_token:processControl});
       assert.equal(data.instance_id,owner);assert.equal(data.log.output_consumed,false);assert.equal(data.log.session_retained,true);
       sawRunning ||= data.log.running===true;
       sawPartial ||= data.log.running===true && data.log.stdout.includes('step-1') && !data.log.stdout.includes('done');
@@ -71,11 +71,11 @@ const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
       await pause(40);
     }
     assert(sawRunning && sawPartial && sawDone,'running -> partial log -> completed');
-    const drain=await tool('process_output',{task_id:taskID});assert.equal(drain.session_retained,false);taskID=null;
+    const drain=await tool('process_output',{task_id:taskID,process_control_token:processControl});assert.equal(drain.session_retained,false);taskID=null;
     assert.equal((await tool('process_list')).processes.length,0);
     console.log('PASS: discovery/initialize agreement, all template MIME/URI contracts over real stdio, identical HTML, 72 tools, background progress, partial/final log, preserved handle and final drain. Host rendering not tested.');
   }finally{
-    if(taskID && !exited)await tool('process_cancel',{task_id:taskID}).catch(()=>{});
+    if(taskID && !exited)await tool('process_cancel',{task_id:taskID,process_control_token:processControl}).catch(()=>{});
     child.stdin.end();
     const shutdown=setTimeout(()=>child.kill('SIGTERM'),3000);await exit;clearTimeout(shutdown);
     for(const item of pending.values())clearTimeout(item.timer);

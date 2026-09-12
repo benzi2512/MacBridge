@@ -30,6 +30,8 @@ EXPECTED_TOOLS.update({'tool_catalog', 'workspace_inspect', 'file_read_lines', '
     'git_blame', 'git_file_list', 'brevo_read', 'brevo_campaign',
     'brevo_contacts', 'brevo_lists', 'brevo_segments', 'brevo_automations', 'brevo_templates',
     'brevo_events', 'brevo_transactional', 'brevo_deliverability', 'brevo_webhooks', 'brevo_reports'})
+EXPECTED_TOOLS.update({'media_inspect', 'media_share', 'desktop_open', 'network_command',
+    'computer_control'})
 
 def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
@@ -101,6 +103,10 @@ class MCPClient:
         self.surface = surface
         self.next_id = 1
         self.pending_transactions: list[str] = []
+        self.process_tokens: dict[str, str] = {}
+        self.transaction_tokens: dict[str, str] = {}
+        self.work_tokens: dict[str, str] = {}
+        self.work_processes: dict[str, str] = {}
         self.stderr_handle = evidence.stderr_path.open('ab')
         self.process = subprocess.Popen([str(binary), '--config', str(config), '--surface', surface], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.stderr_handle, bufsize=0)
         if self.process.stdin is None or self.process.stdout is None:
@@ -159,13 +165,68 @@ class MCPClient:
         return result
 
     def tool(self, name: str, arguments: dict[str, object] | None=None, *, expect_error: bool=False) -> dict[str, object]:
-        result = self.request('tools/call', {'name': name, 'arguments': arguments or {}})
+        prepared = dict(arguments or {})
+        if self.surface == 'web-tunnel':
+            work_id = prepared.get('work_id')
+            if isinstance(work_id, str) and work_id in self.work_tokens:
+                prepared.setdefault('work_control_token', self.work_tokens[work_id])
+            if name == 'work_task' and prepared.get('action') in {'update', 'finish'}:
+                work_id = prepared.get('work_id')
+                if isinstance(work_id, str) and work_id in self.work_tokens:
+                    prepared.setdefault('work_control_token', self.work_tokens[work_id])
+            task_id = prepared.get('task_id')
+            if name in {'process_wait', 'process_output', 'process_output_tail',
+                        'process_input', 'process_cancel', 'bridge_activity'}:
+                if isinstance(task_id, str) and task_id in self.process_tokens:
+                    prepared.setdefault('process_control_token', self.process_tokens[task_id])
+            if name == 'process_output_many' and isinstance(prepared.get('jobs'), list):
+                jobs = []
+                for raw_job in prepared['jobs']:
+                    job = dict(raw_job)
+                    task_id = job.get('task_id')
+                    if isinstance(task_id, str) and task_id in self.process_tokens:
+                        job.setdefault('process_control_token', self.process_tokens[task_id])
+                    jobs.append(job)
+                prepared['jobs'] = jobs
+            if name == 'developer_task' and prepared.get('action') == 'continue_task':
+                workflow_id = prepared.get('workflow_id')
+                if isinstance(workflow_id, str):
+                    if workflow_id in self.work_tokens:
+                        prepared.setdefault('work_control_token', self.work_tokens[workflow_id])
+                    task_id = self.work_processes.get(workflow_id)
+                    if task_id in self.process_tokens:
+                        prepared.setdefault('process_control_token', self.process_tokens[task_id])
+            transaction_id = prepared.get('transaction_id')
+            if name == 'transaction_restore' and isinstance(transaction_id, str):
+                if transaction_id in self.transaction_tokens:
+                    prepared.setdefault('transaction_control_token', self.transaction_tokens[transaction_id])
+            if name == 'transaction_accept' and 'transaction_control_tokens' not in prepared:
+                transaction_ids = prepared.get('transaction_ids')
+                if isinstance(transaction_ids, list) and all(
+                        isinstance(item, str) and item in self.transaction_tokens
+                        for item in transaction_ids):
+                    prepared['transaction_control_tokens'] = [
+                        self.transaction_tokens[item] for item in transaction_ids
+                    ]
+        result = self.request('tools/call', {'name': name, 'arguments': prepared})
         is_error = result.get('isError') is True
         structured = result.get('structuredContent')
         if not isinstance(structured, dict):
             raise GateFailure(f'tool {name} omitted structuredContent')
         if is_error != expect_error:
             raise GateFailure(f'tool {name} error state was {is_error}: {structured}')
+        if not is_error:
+            task_id = structured.get('task_id')
+            process_token = structured.get('process_control_token')
+            if isinstance(task_id, str) and isinstance(process_token, str):
+                self.process_tokens[task_id] = process_token
+            work_id = structured.get('work_id') or structured.get('workflow_id')
+            work_token = structured.get('work_control_token')
+            if isinstance(work_id, str) and isinstance(work_token, str):
+                self.work_tokens[work_id] = work_token
+            if isinstance(work_id, str) and isinstance(task_id, str):
+                self.work_processes[work_id] = task_id
+            self._remember_transaction_tokens(structured)
         if not is_error and name == 'transaction_accept':
             for receipt in structured.get('accepted', []):
                 transaction = receipt.get('transaction_id')
@@ -179,6 +240,18 @@ class MCPClient:
             else:
                 self.pending_transactions.append(transaction)
         return structured
+
+    def _remember_transaction_tokens(self, value: object) -> None:
+        if isinstance(value, dict):
+            transaction_id = value.get('transaction_id')
+            token = value.get('transaction_control_token')
+            if isinstance(transaction_id, str) and isinstance(token, str):
+                self.transaction_tokens[transaction_id] = token
+            for nested in value.values():
+                self._remember_transaction_tokens(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                self._remember_transaction_tokens(nested)
 
     def close(self) -> int:
         if self.process.poll() is None:
@@ -376,7 +449,7 @@ def run_gate(args: argparse.Namespace, evidence: Evidence, root: Path) -> dict[s
         with evidence.section('batch_reads_and_completed_status'):
             compact_catalog = client.tool('tool_catalog')
             evidence.check(compact_catalog.get('detail') == 'index'
-                           and compact_catalog.get('canonical_count') == 56
+                           and compact_catalog.get('canonical_count') == len(EXPECTED_TOOLS) - 1
                            and compact_catalog.get('returned_count') == 13
                            and compact_catalog.get('truncated') is True
                            and compact_catalog.get('selection') == 'starter'
@@ -385,8 +458,8 @@ def run_gate(args: argparse.Namespace, evidence: Evidence, root: Path) -> dict[s
             catalog = client.tool('tool_catalog', {'detail': 'schemas'})
             evidence.check(catalog.get('tools') == tools and catalog.get('catalog_count') == len(EXPECTED_TOOLS),
                            'expanded catalog matches actual tools/list schemas')
-            full_index = client.tool('tool_catalog', {'limit': 57})
-            evidence.check(full_index.get('returned_count') == 56 and full_index.get('truncated') is False
+            full_index = client.tool('tool_catalog', {'limit': len(EXPECTED_TOOLS)})
+            evidence.check(full_index.get('returned_count') == len(EXPECTED_TOOLS) - 1 and full_index.get('truncated') is False
                            and {row['name'] for row in full_index['tools']} == EXPECTED_TOOLS - {'workspace_list'},
                            'full index still reaches every canonical tool')
             evidence.check('already-loaded' in initialized.get('instructions', '')

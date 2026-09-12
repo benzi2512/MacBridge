@@ -40,14 +40,15 @@ enum ActivityWidget {
                     "inputSchema": ["type": "object", "additionalProperties": false,
                                     "properties": render ? [:] : [
                                         "instance_id": ["type": "string", "maxLength": 36],
-                                        "task_id": ["type": "string", "maxLength": 36]],
+                                        "task_id": ["type": "string", "maxLength": 36],
+                                        "process_control_token": ["type": "string", "maxLength": 96]],
                                     "required": render ? [] : ["instance_id"]],
                     "annotations": ["readOnlyHint": true, "destructiveHint": false,
                                     "idempotentHint": true, "openWorldHint": false], "_meta": meta]
         }
         return [
             spec("bridge_activity_view", "Open a read-only activity card for this shared runtime: recent tool receipts and jobs, not ChatGPT reasoning or a chat-scoped feed. Requires observation enabled. UI availability depends on the host; tools remain usable without UI.", render: true),
-            spec("bridge_activity", "Read bounded activity for the exact instance_id returned by bridge_activity_view. Optional task_id peeks at 4 KiB per log stream without consuming the job handle. No cancel, restore, file-content read or mutation. Cached snapshots are explicitly stale.", render: false),
+            spec("bridge_activity", "Read bounded activity for the exact instance_id returned by bridge_activity_view. Optional task_id log peek requires that job's creator process_control_token on the shared Web tunnel. No cancel, restore, file-content read or mutation. Cached snapshots are explicitly stale.", render: false),
         ]
     }
 
@@ -73,7 +74,7 @@ enum ActivityWidget {
     .section{padding:0 18px 12px}.heading{margin:5px 0 8px;font-size:12px;color:var(--muted)}
     details{border-top:1px solid var(--line)}summary{cursor:pointer;min-height:44px;padding:10px 0;overflow-wrap:anywhere}
     pre{font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--soft);border-radius:8px;padding:10px;white-space:pre-wrap;overflow-wrap:anywhere;margin:0 0 12px}
-    #mb-jobs{width:100%;margin:6px 0 10px}#mb-empty{color:var(--muted);padding:8px 0}
+    #mb-empty{color:var(--muted);padding:8px 0}
     footer{border-top:1px solid var(--line);padding:10px 18px;color:var(--muted);font-size:11px;overflow-wrap:anywhere}
     @media(max-width:380px){header,.section,footer{padding-inline:12px}.toolbar{padding-inline:12px}.brand{min-width:130px}}
     </style></head><body>
@@ -82,7 +83,6 @@ enum ActivityWidget {
       <div class="toolbar"><label><input id="mb-auto" type="checkbox" checked> Tự cập nhật</label><button id="mb-refresh" type="button">Cập nhật</button></div>
       <div id="mb-status" role="status" aria-live="polite">Đang chờ dữ liệu từ ChatGPT…</div>
       <div id="mb-stats"></div>
-      <div class="section"><div class="heading">Công việc · log gần nhất</div><label class="muted" for="mb-jobs">Chọn job để xem log</label><select id="mb-jobs"><option value="">Không đọc log</option></select><pre id="mb-log" hidden></pre></div>
       <div class="section"><div class="heading">Hoạt động gần đây · tối đa 24 mục</div><div id="mb-empty">Chưa có dữ liệu</div><div id="mb-history"></div></div>
       <footer><span id="mb-identity">Chưa xác định runtime</span><br>Chỉ đọc · Có thể gồm nhiều chat dùng chung MB · Không hiển thị suy nghĩ của ChatGPT</footer>
     </section>
@@ -90,7 +90,7 @@ enum ActivityWidget {
     (() => {
       'use strict';
       const el = id => document.getElementById(id);
-      const root=el('mb-activity'), status=el('mb-status'), auto=el('mb-auto'), refresh=el('mb-refresh'), jobs=el('mb-jobs'), log=el('mb-log'), history=el('mb-history');
+      const root=el('mb-activity'), status=el('mb-status'), auto=el('mb-auto'), refresh=el('mb-refresh'), history=el('mb-history');
       let owner=null, latest=null, timer=null, inFlight=false, paused=false, fatal=false, disposed=false, visible=true, lastObserved=0;
       const setStatus=(text,error=false)=>{status.textContent=text;status.dataset.error=String(error);};
       const clear=()=>{if(timer!==null){clearTimeout(timer);timer=null;}};
@@ -109,17 +109,6 @@ enum ActivityWidget {
         owner=s.instance_id;lastObserved=s.observed_ms;latest=s;
         el('mb-identity').textContent=`${s.build_id} · instance ${owner.slice(0,8)}`;
         el('mb-stats').textContent=`${s.catalog_count} công cụ · ${s.jobs_known?s.jobs.filter(j=>j.running).length:'?'} job đang chạy · ${s.transaction_count??'?'} bản khôi phục${s.jobs_truncated?' · danh sách job rút gọn':''}`;
-        const selected=jobs.value;
-        jobs.replaceChildren(text('option','Không đọc log'));jobs.firstChild.value='';
-        for(const job of s.jobs){const option=text('option',`${String(job.task_id).slice(0,8)} · ${job.running?'Đang chạy':`Đã dừng (${job.exit_code??'?'})`}`);option.value=job.task_id;jobs.append(option);}
-        jobs.value=Array.from(jobs.options).some(o=>o.value===selected)?selected:'';
-        log.hidden=!selected;
-        if(selected){
-          if(!jobs.value)log.textContent='Job không còn được giữ trong runtime.';
-          else if(s.log_error)log.textContent=s.log_error;
-          else if(s.log?.task_id===selected)log.textContent=`stdout (đuôi log, bỏ qua ${s.log.stdout_skipped_prefix_bytes??0} byte đầu):\n${s.log.stdout??''}\n\nstderr (bỏ qua ${s.log.stderr_skipped_prefix_bytes??0} byte đầu):\n${s.log.stderr??''}`;
-          else log.textContent='Chưa nhận log cho job đã chọn.';
-        }
         const opened=new Set(Array.from(history.querySelectorAll('details[open]')).map(d=>d.dataset.id));
         history.replaceChildren();el('mb-empty').hidden=s.history.length>0;
         el('mb-empty').textContent='Chưa có hoạt động được ghi nhận.';
@@ -146,7 +135,7 @@ enum ActivityWidget {
         inFlight=true;refresh.disabled=true;let expired=false;
         const watchdog=setTimeout(()=>{expired=true;fail(new Error('Chưa nhận phản hồi sau 20 giây; đang chờ lượt đọc này, không gửi chồng yêu cầu.'));},20000);
         try{
-          const args={instance_id:owner};if(jobs.value)args.task_id=jobs.value;
+          const args={instance_id:owner};
           const result=await window.openai.callTool('bridge_activity',args);
           if(disposed || expired)return;
           if(result?.isError)throw new Error('MB từ chối lượt đọc. Đã tạm dừng; kiểm tra runtime/quyền trước khi thử lại.');
@@ -156,7 +145,6 @@ enum ActivityWidget {
       function accept(s){if(disposed || fatal)return;try{render(s);}catch(error){fail(error);}}
       refresh.addEventListener('click',()=>{if(inFlight || fatal)return;paused=false;poll();});
       auto.addEventListener('change',()=>{if(auto.checked){paused=false;schedule();}else{clear();setStatus('Đã tắt tự cập nhật · giữ số liệu lần đọc cuối.');}});
-      jobs.addEventListener('change',()=>{if(!jobs.value){log.hidden=true;return;}log.hidden=false;log.textContent='Đang lấy đuôi log…';if(!paused)poll();});
       document.addEventListener('visibilitychange',()=>{if(document.hidden){clear();setStatus('Đang tạm dừng khi thẻ bị ẩn.');}else schedule();});
       if(typeof IntersectionObserver==='function'){
         const observer=new IntersectionObserver(entries=>{visible=entries[0]?.isIntersecting!==false;if(!visible)clear();else schedule();});observer.observe(root);

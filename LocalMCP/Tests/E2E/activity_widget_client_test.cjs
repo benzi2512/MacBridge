@@ -21,7 +21,7 @@ const snapshot=(overrides={})=>({schema_version:1,scope:'shared_runtime_not_chat
   jobs_known:true,jobs_truncated:false,jobs:[],history:[],transaction_count:1,busy:false,snapshot_stale:false,snapshot_ms:100,observed_ms:100,...overrides});
 const settle=async()=>{for(let i=0;i<6;i++)await Promise.resolve();};
 function fixture(initial=snapshot()){
-  const nodes=new Map(Array.from(html.matchAll(/id="([^"]+)"/g),match=>[match[1],new Element(match[1]==='mb-jobs'?'select':'div')]));
+  const nodes=new Map(Array.from(html.matchAll(/id="([^"]+)"/g),match=>[match[1],new Element()]));
   const window=new Element(),document=new Element();document.hidden=false;document.getElementById=id=>{assert(nodes.has(id),id);return nodes.get(id);};
   document.createElement=tag=>new Element(tag);document.documentElement={style:{}};window.parent={};
   let sequence=0,resolveCall;const timers=new Map(),calls=[];
@@ -44,15 +44,10 @@ function fixture(initial=snapshot()){
   await f.resolve({structuredContent:snapshot({observed_ms:200,jobs:[{task_id:'job-A',running:true}],history:[{id:'event-A',tool:'command_start',state:'returned',result:{task_id:'job-A'}}]})});
   assert([...f.timers.values()].some(t=>t.ms===3000));
   assert.equal(f.get('mb-history').children.length,1);
-  f.get('mb-jobs').value='job-A';f.get('mb-jobs').emit('change');
-  assert.equal(f.calls.at(-1).args.task_id,'job-A');
-  await f.resolve({structuredContent:snapshot({observed_ms:300,jobs:[{task_id:'job-A',running:false,exit_code:0}],log:{task_id:'job-A',stdout:'build complete',stderr:'',output_consumed:false}})});
-  assert(f.get('mb-log').textContent.includes('build complete'));
-  assert(!f.get('mb-log').hidden);
   f.document.hidden=true;f.document.emit('visibilitychange');assert.equal(f.timers.size,0);
   f.document.hidden=false;f.document.emit('visibilitychange');assert.equal(f.timers.size,1);
   f.get('mb-auto').checked=false;f.get('mb-auto').emit('change');assert.equal(f.timers.size,0);
-  console.log('PASS: initial snapshot, owner-bound refresh, serial reads, adaptive intervals, selected log, hidden/pause');
+  console.log('PASS: initial snapshot, owner-bound refresh, serial reads, adaptive intervals, hidden/pause');
 
   const timeout=fixture();timeout.fire(10000);timeout.fire(20000);
   assert(timeout.get('mb-status').textContent.includes('20'));
