@@ -62,6 +62,24 @@ extension View {
     }
 }
 
+/// Owns AppKit's opaque monitor tokens and always unregisters them when the
+/// controller goes away. The controller mutates this bag only on MainActor;
+/// unchecked sendability is limited to the non-Sendable tokens supplied by
+/// AppKit, whose removal API is itself thread-safe.
+private final class OutsideClickMonitorBag: @unchecked Sendable {
+    var global: Any?
+    var local: Any?
+
+    func removeAll() {
+        if let global { NSEvent.removeMonitor(global) }
+        if let local { NSEvent.removeMonitor(local) }
+        global = nil
+        local = nil
+    }
+
+    deinit { removeAll() }
+}
+
 @MainActor
 final class FloatingTabController: ObservableObject {
     @Published private(set) var machine = FloatingInteractionStateMachine()
@@ -82,8 +100,7 @@ final class FloatingTabController: ObservableObject {
     private var hoverCloseTask: Task<Void, Never>?
     private var previewTask: Task<Void, Never>?
     private var shrinkTask: Task<Void, Never>?
-    private var globalOutsideClickMonitor: Any?
-    private var localOutsideClickMonitor: Any?
+    private let outsideClickMonitors = OutsideClickMonitorBag()
     private var previewLayer: FloatingLayer?
     private var anchoredScreen: NSScreen?
     private var readingOwner: String?
@@ -147,6 +164,13 @@ final class FloatingTabController: ObservableObject {
         return !acceptsInteractivePoint(local)
     }
 
+    static func screenPoint(forLocalMouseEvent event: NSEvent) -> CGPoint {
+        // Capture the click carried by the event. Sampling NSEvent.mouseLocation
+        // here races both asynchronous delivery and fast pointer movement.
+        guard let window = event.window else { return event.locationInWindow }
+        return window.convertPoint(toScreen: event.locationInWindow)
+    }
+
     init(model: ObserverModel, preferences: ObserverPreferences,
          presentsWindow: Bool = true,
          openDashboard: @escaping (String?) -> Void, openSettings: @escaping () -> Void) {
@@ -196,6 +220,7 @@ final class FloatingTabController: ObservableObject {
 
     deinit {
         hoverOpenTask?.cancel(); hoverCloseTask?.cancel(); previewTask?.cancel(); shrinkTask?.cancel()
+        // outsideClickMonitors unregisters its opaque AppKit tokens in deinit.
     }
 
     func start() {
@@ -358,6 +383,10 @@ final class FloatingTabController: ObservableObject {
         if machine != FloatingInteractionStateMachine() { machine = FloatingInteractionStateMachine() }
         if windowLayer != .idle { windowLayer = .idle }
         if pointerInside { pointerInside = false }
+        // A drag collapses the panel without going through setMachine(). Tear
+        // down the temporary outside-click monitors here as well, so an idle
+        // widget consumes no global mouse-event callbacks.
+        removeOutsideClickMonitors()
         let next = FloatingDockLayout.anchor(at: point, visibleFrame: screen.visibleFrame, previousEdge: previousEdge)
         if draggingAnchor != next { draggingAnchor = next }
         reposition(animated: false)
@@ -430,17 +459,19 @@ final class FloatingTabController: ObservableObject {
             removeOutsideClickMonitors()
             return
         }
-        if globalOutsideClickMonitor == nil {
-            globalOutsideClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) {
+        if outsideClickMonitors.global == nil {
+            outsideClickMonitors.global = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) {
                 [weak self] _ in
-                let point = NSEvent.mouseLocation
-                Task { @MainActor [weak self] in self?.dismissForOutsideClick(at: point) }
+                // Global monitors receive only events delivered to another app,
+                // so this is necessarily outside MacBridge. Do not resample the
+                // pointer after AppKit's asynchronous delivery.
+                Task { @MainActor [weak self] in self?.dismissForOutsideApplicationClick() }
             }
         }
-        if localOutsideClickMonitor == nil {
-            localOutsideClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) {
+        if outsideClickMonitors.local == nil {
+            outsideClickMonitors.local = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) {
                 [weak self] event in
-                let point = NSEvent.mouseLocation
+                let point = Self.screenPoint(forLocalMouseEvent: event)
                 Task { @MainActor [weak self] in self?.dismissForOutsideClick(at: point) }
                 return event
             }
@@ -448,10 +479,12 @@ final class FloatingTabController: ObservableObject {
     }
 
     private func removeOutsideClickMonitors() {
-        if let monitor = globalOutsideClickMonitor { NSEvent.removeMonitor(monitor) }
-        if let monitor = localOutsideClickMonitor { NSEvent.removeMonitor(monitor) }
-        globalOutsideClickMonitor = nil
-        localOutsideClickMonitor = nil
+        outsideClickMonitors.removeAll()
+    }
+
+    private func dismissForOutsideApplicationClick() {
+        guard layer.isExpanded else { return }
+        show(.idle, locked: false)
     }
 
     private func dismissForOutsideClick(at screenPoint: CGPoint) {
@@ -718,7 +751,11 @@ struct FloatingTabView: View {
                 .animation(FloatingMotion.contents(index: index, appearing: controller.layer.isExpanded,
                                                   reduced: reducedMotion), value: controller.layer.isExpanded)
                 .onHover { inside in
-                    if action == .recentTasks { controller.preview(.recentTasks, inside: inside) }
+                    switch action {
+                    case .recentTasks: controller.preview(.recentTasks, inside: inside)
+                    case .settings: controller.preview(.settings, inside: inside)
+                    case .connection, .hide: break
+                    }
                 }
             }
         }

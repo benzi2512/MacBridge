@@ -25,7 +25,10 @@ enum MBMetrics {
     static let taskDetailWidth: CGFloat = 360
     static let settingsHeight: CGFloat = 520
     static let taskDetailHeight: CGFloat = 520
-    static let panelRadius: CGFloat = 16
+    // The compact cards and Settings share one continuous Apple-style corner
+    // treatment. A larger radius keeps the translucent outline soft instead of
+    // reading as a clipped rectangle when it crosses a bright background.
+    static let panelRadius: CGFloat = 22
     // Native shadows must have real backing-store room. Without this gutter,
     // the compositor clips the soft shadow to the rectangular NSPanel edge.
     static let panelShadowMargin: CGFloat = 16
@@ -40,8 +43,13 @@ enum MBMetrics {
     static let reducedMotionDuration: TimeInterval = 0.10
     static let edgeMotionHorizontalSlack: CGFloat = 8
     static let edgeMotionVerticalSlack: CGFloat = 38
-    static let verticalEndCapShoulder: CGFloat = 9
-    static let horizontalEndCapShoulder: CGFloat = 3
+    // The taller right-edge rail can carry a deeper rounded shoulder without
+    // crowding its brand target.
+    static let verticalEndCapShoulder: CGFloat = 14
+    // The horizontal handle has only 30 points of depth and must still contain
+    // a 38-point logo/count row inside its 44-point target. Six points softens
+    // the end cap without shaving brand pixels from the shallow material.
+    static let horizontalEndCapShoulder: CGFloat = 6
 }
 
 enum MBPalette {
@@ -393,7 +401,10 @@ struct EdgeLayout: Equatable, Sendable {
     static let brandVisualInset: CGFloat = 16
     static let brandVisualAlongOffset: CGFloat = 5
     static let horizontalBrandVisualAlongOffset: CGFloat = 1
-    static let idleShapeAlongOffset: CGFloat = 5
+    // Seven points centers the complete 58-point idle outline in the 58-point
+    // backing window at either endpoint. Five clipped two points from the
+    // forward/reverse shoulder (and the transposed bottom-dock equivalent).
+    static let idleShapeAlongOffset: CGFloat = 7
     static let expandedShapeAlongAdjustment: CGFloat = 3
 
     static func isContained(_ frame: CGRect, in visibleFrame: CGRect, tolerance: CGFloat = 0.5) -> Bool {
@@ -430,18 +441,28 @@ struct FloatingHitRegion: Shape {
                 .applying(CGAffineTransform(a: 0, b: 1, c: 1, d: 0, tx: 0, ty: 0))
         }
         let logo = CGPoint(x: rect.maxX - EdgeLayout.logoInset, y: logoY)
-        func includeControls(in path: inout Path) {
+        func controlsPath() -> Path {
+            // These rectangles intentionally cross the painted curve so every
+            // compact control keeps a 44-point target. Normalize them into a
+            // geometric union before combining with the silhouette; appending
+            // overlapping subpaths can create winding holes and pass clicks
+            // through to the app underneath.
+            var controls = Path()
             let target = MBMetrics.edgeTargetSize
-            path.addRect(CGRect(x: logo.x - target / 2, y: logo.y - target / 2,
-                                width: target, height: target).intersection(rect))
             if expansion > 0 {
-                for index in 0..<4 {
-                    let center = FloatingDockLayout.actionCenter(index: index, logo: logo,
-                                                                 edge: .right, direction: direction)
-                    path.addRect(CGRect(x: center.x - target / 2, y: center.y - target / 2,
+                // The five targets are exactly adjacent, so one stack is the
+                // same union with far less path work during the spring morph.
+                let last = FloatingDockLayout.actionCenter(index: 3, logo: logo,
+                                                            edge: .right, direction: direction)
+                controls.addRect(CGRect(x: logo.x - target / 2,
+                                        y: min(logo.y, last.y) - target / 2,
+                                        width: target,
+                                        height: abs(last.y - logo.y) + target).intersection(rect))
+            } else {
+                controls.addRect(CGRect(x: logo.x - target / 2, y: logo.y - target / 2,
                                         width: target, height: target).intersection(rect))
-                }
             }
+            return controls
         }
         let rail = CGRect(x: rect.maxX - MBMetrics.edgeRailWidth,
                           y: rect.minY + logoY + direction.sign * EdgeLayout.railLogoOffset
@@ -452,10 +473,12 @@ struct FloatingHitRegion: Shape {
             let panel = CGRect(x: rect.maxX - MBMetrics.edgeRailWidth - panelSize.width,
                                y: rect.midY - panelSize.height / 2,
                                width: panelSize.width, height: panelSize.height)
-            path.addRoundedRect(in: panel, cornerSize: CGSize(width: MBMetrics.panelRadius, height: MBMetrics.panelRadius))
+            let panelPath = Path(roundedRect: panel,
+                                 cornerRadius: MBMetrics.panelRadius,
+                                 style: .continuous)
+            path = Path(path.cgPath.union(panelPath.cgPath))
         }
-        includeControls(in: &path)
-        return path
+        return Path(path.cgPath.union(controlsPath().cgPath))
     }
 }
 

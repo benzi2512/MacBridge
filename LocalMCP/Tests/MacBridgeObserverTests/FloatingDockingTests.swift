@@ -27,6 +27,21 @@ final class FloatingDockingTests: XCTestCase {
             "A click outside the panel frame must dismiss the open widget")
     }
 
+    @MainActor
+    func testLocalOutsideClickUsesTheEventsCapturedLocation() throws {
+        _ = NSApplication.shared
+        let window = NSWindow(contentRect: CGRect(x: 120, y: 240, width: 300, height: 400),
+                              styleMask: [.borderless], backing: .buffered, defer: false)
+        let localPoint = CGPoint(x: 33, y: 47)
+        let event = try XCTUnwrap(NSEvent.mouseEvent(with: .leftMouseDown,
+            location: localPoint, modifierFlags: [], timestamp: 1,
+            windowNumber: window.windowNumber, context: nil,
+            eventNumber: 1, clickCount: 1, pressure: 1))
+
+        XCTAssertEqual(FloatingTabController.screenPoint(forLocalMouseEvent: event),
+                       window.convertPoint(toScreen: localPoint))
+    }
+
     func testClickToleranceAndDragLatch() {
         var drag = FloatingLogoDrag(start: CGPoint(x: 100, y: 200))
         XCTAssertFalse(drag.move(to: CGPoint(x: 103, y: 202)))
@@ -99,6 +114,43 @@ final class FloatingDockingTests: XCTestCase {
                     height: MBMetrics.edgeTargetSize)
                 XCTAssertGreaterThanOrEqual(target.minY, screen.minY + EdgeLayout.outerInset - 0.001)
                 XCTAssertLessThanOrEqual(target.maxY, screen.maxY - EdgeLayout.outerInset + 0.001)
+            }
+        }
+    }
+
+    func testIdleOrganicOutlineFitsItsBackingWindowAtEveryEndpoint() {
+        let screen = CGRect(x: 0, y: 40, width: 1512, height: 920)
+        for edge in FloatingDockEdge.allCases {
+            for position in [0.0, 1.0] {
+                let placement = FloatingDockLayout.placement(visibleFrame: screen, layer: .idle,
+                    anchor: .init(edge: edge, position: position), taskCount: 0)
+                let canvas = CGRect(origin: .zero, size: placement.frame.size)
+                let handleSize = edge == .right
+                    ? CGSize(width: MBMetrics.edgeTargetSize,
+                             height: MBMetrics.edgeRailHeight + MBMetrics.edgeMotionVerticalSlack)
+                    : CGSize(width: MBMetrics.edgeRailHeight + MBMetrics.edgeMotionVerticalSlack,
+                             height: MBMetrics.edgeTargetSize)
+                let center = edge == .right
+                    ? CGPoint(x: canvas.maxX - MBMetrics.edgeTargetSize / 2,
+                              y: placement.logo.y + placement.direction.sign * EdgeLayout.railLogoOffset)
+                    : CGPoint(x: placement.logo.x + placement.direction.sign * EdgeLayout.railLogoOffset,
+                              y: canvas.maxY - MBMetrics.edgeTargetSize / 2)
+                let handleFrame = CGRect(x: center.x - handleSize.width / 2,
+                                         y: center.y - handleSize.height / 2,
+                                         width: handleSize.width, height: handleSize.height)
+                let bounds = DockedOrganicEdgeShape(edge: edge, expansion: 0,
+                    direction: placement.direction)
+                    .path(in: CGRect(origin: .zero, size: handleSize))
+                    .applying(CGAffineTransform(translationX: handleFrame.minX, y: handleFrame.minY))
+                    .boundingRect
+                XCTAssertGreaterThanOrEqual(bounds.minX, canvas.minX - 0.001,
+                    "\(edge) \(position) clipped the leading idle shoulder: \(bounds) in \(canvas)")
+                XCTAssertGreaterThanOrEqual(bounds.minY, canvas.minY - 0.001,
+                    "\(edge) \(position) clipped the top idle shoulder: \(bounds) in \(canvas)")
+                XCTAssertLessThanOrEqual(bounds.maxX, canvas.maxX + 0.001,
+                    "\(edge) \(position) clipped the trailing idle shoulder: \(bounds) in \(canvas)")
+                XCTAssertLessThanOrEqual(bounds.maxY, canvas.maxY + 0.001,
+                    "\(edge) \(position) clipped the bottom idle shoulder: \(bounds) in \(canvas)")
             }
         }
     }
@@ -333,5 +385,28 @@ final class FloatingDockingTests: XCTestCase {
         XCTAssertEqual(opened, 0)
         XCTAssertEqual(controller.pendingTransitionCount, 0)
         controller.stop()
+    }
+
+    @MainActor
+    func testUnpinnedRailCanPreviewRecentTasksAndSettingsOnHover() async throws {
+        let suite = "MacBridge.Docking.HoverPreview.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let preferences = ObserverPreferences(defaults: defaults)
+        preferences.hoverPreviews = true
+        let controller = FloatingTabController(model: ObserverModel(), preferences: preferences,
+            presentsWindow: false, openDashboard: { _ in }, openSettings: {})
+        defer { controller.stop() }
+
+        controller.show(.rail, locked: false)
+        controller.preview(.recentTasks, inside: true)
+        try await Task.sleep(nanoseconds: UInt64((MBMetrics.hoverDelay + 0.05) * 1_000_000_000))
+        XCTAssertEqual(controller.layer, .recentTasks)
+        XCTAssertFalse(controller.machine.locked)
+
+        controller.preview(.settings, inside: true)
+        try await Task.sleep(nanoseconds: UInt64((MBMetrics.hoverDelay + 0.05) * 1_000_000_000))
+        XCTAssertEqual(controller.layer, .settings)
+        XCTAssertFalse(controller.machine.locked)
     }
 }

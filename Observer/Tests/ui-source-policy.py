@@ -89,7 +89,9 @@ check("explicit-switch-track-and-thumb", "CompactSwitchToggleStyle" in SURFACES
       and ".fill(Color.white.opacity(configuration.isOn ? 0.96 : 0.84))" in SURFACES)
 check("event-driven-outside-click-dismissal", "addGlobalMonitorForEvents" in SURFACES
       and "addLocalMonitorForEvents" in SURFACES and "removeOutsideClickMonitors()" in SURFACES
-      and "shouldDismissForOutsideClick" in SURFACES)
+      and "shouldDismissForOutsideClick" in SURFACES
+      and "screenPoint(forLocalMouseEvent: event)" in SURFACES
+      and "dismissForOutsideApplicationClick()" in SURFACES)
 check("spring-motion-not-fixed-curve", ".spring(response:" in MOTION
       and "FloatingMotion.unfold(reduced:" in SURFACES and ".timingCurve(" not in SURFACES)
 check("bounded-content-stagger", "staggerStep = 0.045" in MOTION and "maximumStagger = 0.18" in MOTION
@@ -107,7 +109,8 @@ check("drag-does-not-grant-input-access", all(value not in DOCKING for value in 
 check("bounded-dock-preferences", "updated.count - 16" in DESIGN and "ui.floatingTabDockAnchors" in DESIGN)
 check("first-click-floating-host", "FloatingFirstClickHostingView(rootView:" in SURFACES
       and "override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }" in DOCKING)
-check("full-rect-action-targets", ".contentShape(Rectangle())" in SURFACES and "includeControls(in:" in DESIGN)
+check("full-rect-action-targets", ".contentShape(Rectangle())" in SURFACES
+      and "controlsPath()" in DESIGN and ".cgPath.union(controlsPath().cgPath)" in DESIGN)
 check("minimum-44-point-targets", "edgeTargetSize: CGFloat = minimumHitTargetSize" in DESIGN
       and "CompactIconButtonLabel" in SURFACES and "minimumHitTargetSize" in SURFACES)
 check("fixed-edge-endpoint-drag", "let edge = previousEdge" in DOCKING
