@@ -8,6 +8,13 @@ dashboard. It does not run an AI model.
 Local MCP clients use stdio. Ordinary Chat requires a supported connector and
 transport; the core alone cannot guarantee that a host permits every tool.
 
+The current public source release is **0.4.0**. The installed app and public
+source can be compared against the exact hashes in [Current state](CURRENT-STATE.md).
+For a separate user's Mac and ChatGPT account, use the owner-neutral
+[installation guide](INSTALL-FOR-CHATGPT.md). The GitHub marketplace installs the
+MB Operator workflow; each user must still build/install the local app and create
+their own Secure MCP Tunnel and personal ChatGPT connection.
+
 ## Source layout
 
 - [Current state](CURRENT-STATE.md): serving artifact, proven scope and remaining host boundary.
@@ -95,3 +102,9 @@ complete Codex/DC parity or universal normal-Chat support is claimed.
 Only this branch was filtered. Other branches, tags, cached commit views and
 forks can retain old material. Do not infer whole-repository erasure or change
 repository visibility from this publication.
+
+The repository marketplace contains no registered ChatGPT app mapping. That is
+intentional: an app ID and Secure MCP Tunnel belong to the installing user's
+account/workspace and must not be copied from the maintainer. This source release
+does not claim one-click public-directory installation or a notarized consumer
+DMG.

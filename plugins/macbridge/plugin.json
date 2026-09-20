@@ -1,0 +1,35 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "macbridge",
+  "version": "0.4.0",
+  "description": "Evidence-backed workflows for a MacBridge connection owned by the installer.",
+  "author": {
+    "name": "MacBridge Maintainers",
+    "url": "https://github.com/benzi2512/MacBridge"
+  },
+  "homepage": "https://github.com/benzi2512/MacBridge",
+  "repository": "https://github.com/benzi2512/MacBridge",
+  "keywords": ["mcp", "macos", "local-tools", "chatgpt"],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "MacBridge",
+        "shortDescription": "Use your own local MacBridge safely.",
+        "longDescription": "Adds the MacBridge operator workflow. The local app, MCP runtime and ChatGPT connection remain separately installed and owned by each user.",
+        "developerName": "MacBridge Maintainers",
+        "category": "Productivity",
+        "capabilities": ["Read", "Write"],
+        "websiteURL": "https://github.com/benzi2512/MacBridge",
+        "privacyPolicyURL": "https://github.com/benzi2512/MacBridge/blob/main/SECURITY.md",
+        "defaultPrompt": [
+          "Check my MacBridge connection and report its exact build.",
+          "Use MacBridge to inspect this project without changing it.",
+          "Complete this MacBridge task and verify the result."
+        ],
+        "brandColor": "#0B4FE8",
+        "composerIcon": "./assets/macbridge-icon-composer.png",
+        "logo": "./assets/macbridge-icon.png"
+      }
+    }
+  }
+}

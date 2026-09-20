@@ -1,0 +1,20 @@
+{
+  "name": "macbridge-public",
+  "interface": {
+    "displayName": "MacBridge"
+  },
+  "plugins": [
+    {
+      "name": "macbridge",
+      "source": {
+        "source": "local",
+        "path": "./plugins/macbridge"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
