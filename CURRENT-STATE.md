@@ -33,15 +33,31 @@ remain writable. Direct file-tool writes keep their existing workspace and file
 policy gates and are not described as globally read-only.
 
 After cutover, eight existing normal Chat conversations were exercised at the
-same time. Seven returned this exact build, owner, catalog count and catalog
-digest. One older conversation still returned
-`Resource not found: MacBridge_Developer.bridge_capabilities`; that failure is
-the conversation host's stale binding and did not reach this runtime. The
-working conversations include ones that previously reported disabled, timeout,
+same time. Seven initially returned this exact build, owner, catalog count and
+catalog digest. The eighth older conversation initially returned
+`Resource not found: MacBridge_Developer.bridge_capabilities` because earlier
+plain-text `plugin://` syntax had not created a real attachment. Selecting
+MacBridge Developer from the conversation's plugin menu created the actual
+inline plugin pill; the next bounded capability call then returned the exact
+serving build, owner, catalog and digest. A follow-up API-delivered probe is
+recorded separately as the persistence check. Final acceptance is therefore
+8/8 conversations, including ones that previously reported disabled, timeout,
 502 and file-recipient mismatches. Two normal Chats then independently
 `file_stat`ed and read the same synthetic Downloads fixture, including the
 previously failing conversation; both returned the same 174-byte content and
 SHA-256 `ce2fca5e5d1eb4794f93ab4a10779635a6d8c8c5171311458c56a9fbf7790fb5`.
+
+Three later cross-chat transactions retained undo after that acceptance run.
+Their five affected files were reconciled against the recorded current hashes,
+and an idle preflight confirmed zero active jobs, calls or process handles. The
+creator-only transaction tokens were unavailable by design, so the approved
+maintenance path restarted the existing tunnel/core once to clear the retained
+in-memory state, including undo, without changing the five files. The observer
+stayed running and the five file hashes remained unchanged. The replacement
+instance returned this exact build, catalog and
+digest in the previously failing normal Chat, with zero jobs, work items,
+transactions, undo bytes and reload blockers. The official tunnel health probe
+also passed live, ready and control-plane-poll checks without another restart.
 
 Normal-Chat command routing reaches the new runtime, but least-privilege policy
 still applies. A host safety gate blocked one `printf` payload before MB, and
