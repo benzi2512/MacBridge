@@ -16,7 +16,7 @@ final class ObserverTests: XCTestCase {
         let f = try Fixture(); defer { f.remove() }
         let owner = try server(f, enabled: false)
         XCTAssertThrowsError(try owner.observerRequest(["action": "snapshot"]))
-        XCTAssertEqual(try owner.callTool(name: "bridge_capabilities", arguments: [:])["catalog_count"] as? Int, 72)
+        XCTAssertEqual(try owner.callTool(name: "bridge_capabilities", arguments: [:])["catalog_count"] as? Int, 76)
     }
 
     func testHistoryIsBoundedAndDoesNotStoreRequestContent() throws {
@@ -39,11 +39,11 @@ final class ObserverTests: XCTestCase {
         let batch = try owner.callTool(name: "file_write_many", arguments: [
             "workspace_id": f.workspaceID, "files": [
                 ["path": "a.txt", "content": "SYNTHETIC_BATCH_BODY"],
-                ["path": "missing/child.txt", "content": "SYNTHETIC_REJECTED_BODY"],
+                ["path": "b.txt", "content": "SYNTHETIC_SECOND_BODY"],
             ],
         ])
-        XCTAssertEqual(batch["success_count"] as? Int, 1)
-        XCTAssertEqual(batch["error_count"] as? Int, 1)
+        XCTAssertEqual(batch["success_count"] as? Int, 2)
+        XCTAssertEqual(batch["error_count"] as? Int, 0)
         let snapshot = try owner.observerRequest(["action": "snapshot"])
         let identity = try XCTUnwrap(snapshot["instance_id"] as? String)
         let activity = try owner.callTool(name: "bridge_activity", arguments: ["instance_id": identity])
@@ -51,17 +51,17 @@ final class ObserverTests: XCTestCase {
             let event = try XCTUnwrap((surface["history"] as? [JSONObject])?.last)
             XCTAssertEqual(event["state"] as? String, "returned")
             let result = try XCTUnwrap(event["result"] as? JSONObject)
-            XCTAssertEqual(result["success_count"] as? Int, 1)
-            XCTAssertEqual(result["error_count"] as? Int, 1)
-            XCTAssertEqual(result["complete"] as? Bool, false)
+            XCTAssertEqual(result["success_count"] as? Int, 2)
+            XCTAssertEqual(result["error_count"] as? Int, 0)
+            XCTAssertEqual(result["complete"] as? Bool, true)
             XCTAssertNil(result["results"], "Do not retain nested file results or payloads")
             let encoded = String(decoding: try LocalJSON.encode(surface), as: UTF8.self)
             XCTAssertFalse(encoded.contains("SYNTHETIC_BATCH_BODY"))
-            XCTAssertFalse(encoded.contains("SYNTHETIC_REJECTED_BODY"))
+            XCTAssertFalse(encoded.contains("SYNTHETIC_SECOND_BODY"))
         }
-        let receipt = try XCTUnwrap((batch["results"] as? [JSONObject])?.first?["receipt"] as? JSONObject)
-        _ = try owner.callTool(name: "transaction_restore", arguments: ["transaction_id": receipt["transaction_id"]!])
+        _ = try owner.callTool(name: "transaction_restore", arguments: ["transaction_id": batch["transaction_id"]!])
         XCTAssertFalse(FileManager.default.fileExists(atPath: f.workspace.appendingPathComponent("a.txt").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.workspace.appendingPathComponent("b.txt").path))
     }
 
     func testTransactionOwnerConflictReadbackAndStaleGuards() throws {
@@ -149,7 +149,7 @@ final class ObserverTests: XCTestCase {
                                                payload: LocalJSON.encode(["action": "snapshot"] as JSONObject))
         let wrapper = try LocalJSON.decodeObject(bytes)
         XCTAssertEqual(wrapper["ok"] as? Bool, true)
-        XCTAssertEqual((wrapper["result"] as? JSONObject)?["catalog_count"] as? Int, 72)
+        XCTAssertEqual((wrapper["result"] as? JSONObject)?["catalog_count"] as? Int, 76)
         XCTAssertThrowsError(try LocalObserverEndpoint(directory: directory, server: owner))
         XCTAssertNoThrow(try ObserverSocket.request(directory: directory,
                                                     payload: LocalJSON.encode(["action": "snapshot"] as JSONObject)))

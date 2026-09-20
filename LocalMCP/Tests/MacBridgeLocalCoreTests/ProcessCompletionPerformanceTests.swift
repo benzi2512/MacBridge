@@ -155,10 +155,10 @@ final class ProcessCompletionPerformanceTests: XCTestCase {
 
     private func makeProcesses(_ fixture: Fixture) throws -> LocalProcessService {
         let binary = packageRoot().appendingPathComponent(".build/debug/macbridge-mcp")
-        guard FileManager.default.isExecutableFile(atPath: binary.path) else {
-            throw XCTSkip("macbridge-mcp debug product is unavailable")
-        }
-        return LocalProcessService(workspaceService: try fixture.service(), selfExecutable: binary)
+        let executable = try XCTUnwrap(
+            FileManager.default.isExecutableFile(atPath: binary.path) ? binary : nil,
+            "macbridge-mcp debug product is required for process qualification")
+        return LocalProcessService(workspaceService: try fixture.service(), selfExecutable: executable)
     }
 
     private func packageRoot() -> URL {

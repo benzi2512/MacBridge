@@ -45,6 +45,23 @@ final class CommandDispatchTests: XCTestCase {
         XCTAssertEqual(responses.outstandingCount, 0)
     }
 
+    func testOutstandingResponseByteBudgetIsFixedAndBalanced() {
+        let responses = PendingToolResponses()
+        let half = PendingToolResponses.maximumEstimatedBytes / 2
+        XCTAssertTrue(responses.reserve(estimatedBytes: half))
+        XCTAssertTrue(responses.reserve(
+            estimatedBytes: PendingToolResponses.maximumEstimatedBytes - half
+        ))
+        XCTAssertEqual(responses.estimatedByteCount, PendingToolResponses.maximumEstimatedBytes)
+        XCTAssertFalse(responses.reserve(estimatedBytes: 1))
+        responses.release(estimatedBytes: half)
+        XCTAssertTrue(responses.reserve(estimatedBytes: 1))
+        responses.release(estimatedBytes: 1)
+        responses.release(estimatedBytes: PendingToolResponses.maximumEstimatedBytes - half)
+        XCTAssertEqual(responses.estimatedByteCount, 0)
+        XCTAssertEqual(responses.outstandingCount, 0)
+    }
+
     func testUndrainedOutputStopsAdmissionAtTheFixedResponseBudget() throws {
         let f = try Fixture(); defer { f.remove() }
         let entered = DispatchSemaphore(value: 0)
@@ -87,7 +104,7 @@ final class CommandDispatchTests: XCTestCase {
                   result["isError"] as? Bool == true,
                   let structured = result["structuredContent"] as? JSONObject,
                   let error = structured["error"] as? String else { return false }
-            return error.contains("awaiting delivery")
+            return error.contains("response delivery budget")
         })
         XCTAssertTrue(try io.finishAndDrain().isEmpty,
                       "every admitted or rejected request must receive exactly one reply")
@@ -163,10 +180,10 @@ final class CommandDispatchTests: XCTestCase {
         XCTAssertNotNil(try io.receive(id: 3)["result"])
         let catalog = try XCTUnwrap(try io.receive(id: 4)["result"] as? JSONObject)
         let tools = try XCTUnwrap(catalog["tools"] as? [JSONObject])
-        XCTAssertEqual(tools.count, 72)
-        XCTAssertEqual(Set(tools.compactMap { $0["name"] as? String }).count, 72)
+        XCTAssertEqual(tools.count, 76)
+        XCTAssertEqual(Set(tools.compactMap { $0["name"] as? String }).count, 76)
         let capabilities = try structured(io.receive(id: 5))
-        XCTAssertEqual(capabilities["catalog_count"] as? Int, 72)
+        XCTAssertEqual(capabilities["catalog_count"] as? Int, 76)
         XCTAssertEqual(capabilities["catalog_sha256"] as? String, catalog["catalogEpoch"] as? String)
         XCTAssertEqual(capabilities["active_command_runs"] as? Int, 8)
         XCTAssertEqual(capabilities["maximum_concurrent_command_runs"] as? Int, 8)
@@ -286,7 +303,10 @@ final class CommandDispatchTests: XCTestCase {
         let completions = try inspectionIDs.map { _ in try io.receive() }
         XCTAssertEqual(Set(completions.compactMap { $0["id"] as? String }), Set(inspectionIDs))
         for response in completions {
-            XCTAssertEqual(try result(response)["isError"] as? Bool, false)
+            XCTAssertEqual(
+                try result(response)["isError"] as? Bool, false,
+                "response=\(response)"
+            )
             XCTAssertEqual(try structured(response)["developer_action"] as? String, "inspect_repo")
         }
         try io.tool(105, "bridge_capabilities", [:])

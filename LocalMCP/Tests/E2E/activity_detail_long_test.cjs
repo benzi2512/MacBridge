@@ -73,14 +73,16 @@ async function tool(name, args = {}) {
   const started = Date.now();
   try {
     const catalog = await rpc('tools/list');
-    assert.equal(catalog.tools.length, 72, 'combined desktop candidate catalog');
-    // The detail gate must preserve this reviewed release candidate's catalog.
-    assert.equal(catalog.catalogEpoch, '0725dab73d8abb6739a6785f5af4a0e2e7e55807a86c7f7e23cd62f1aafb85ca');
+    assert.equal(catalog.tools.length, 76, 'combined desktop candidate catalog');
+    // The caller pins the exact executable above. Check its own catalog stays
+    // consistent rather than pinning a digest from an older release's schema.
+    assert.match(catalog.catalogEpoch, /^[0-9a-f]{64}$/);
+    assert.equal((await rpc('tools/list')).catalogEpoch, catalog.catalogEpoch);
     const caps = await tool('bridge_capabilities');
     assert.equal(caps.data.mcp_executable_sha256, expectedHash);
-    assert(caps.text.includes('72 catalog tools'));
+    assert.equal(caps.data.catalog_sha256, catalog.catalogEpoch);
+    assert(caps.text.includes('76 catalog tools'));
     assert.equal(caps.data.desktop_open_enabled, false);
-    assert.equal(caps.data.computer_grants_configured, 0);
     const read = await tool('file_read_lines', {workspace_id: workspaceID, path: 'sum.py', start_line: 1, maximum_lines: 2});
     assert(read.text.includes('target sum.py'));
     assert(read.text.includes('Read 2 lines (1–2)'));
@@ -147,8 +149,10 @@ async function tool(name, args = {}) {
     assert.equal(fs.readFileSync(path.join(workspace, 'sum.py'), 'utf8'), original);
     assert.equal((await tool('process_list')).data.processes.length, 0);
     assert.equal((await tool('transaction_list')).data.retained_transaction_count, 0);
+    assert(Date.now() - started <= 90000,
+      'fixture exceeded 90 seconds; investigate suspension/stall rather than reporting a clean acceptance');
     const result = {status: 'PASS', scope: 'isolated exact-binary MCP receipt test; NOT normal Chat rendering',
-      binary_sha256: expectedHash, catalog_sha256: catalog.catalogEpoch, tool_count: 72,
+      binary_sha256: expectedHash, catalog_sha256: catalog.catalogEpoch, tool_count: 76,
       elapsed_milliseconds: Date.now() - started, live_snapshots: observedRunning,
       produced_stdout_bytes: produced, observed_elapsed_seconds: elapsed,
       fixture_checks: 120000, file_restored: true, jobs_remaining: 0, undo_remaining: 0, receipts};

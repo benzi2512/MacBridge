@@ -1,6 +1,6 @@
-# Working with MacBridge's 72-tool candidate source catalog
+# Working with the MacBridge candidate source catalog
 
-The opt-in Finder/document, scoped-network and application-Accessibility tools
+The opt-in Finder/document and scoped-network tools
 are described in [Desktop access](DESKTOP-ACCESS.md). They are off for existing
 configurations. A source candidate is not an installed or host-enabled feature.
 
@@ -38,14 +38,14 @@ For an unfamiliar choice, `tool_catalog` supports:
   5 suggestions by default. Suggestions are not proof that a tool fits every
   constraint; verify its exact schema before use.
 - `category`: `workspace`, `files`, `search`, `edit`, `process`, `git`, `undo`, or `external`.
-- `limit`: 1–72; filters intersect, and `matched_count`/`truncated` expose omissions.
+- `limit`: 1–128; filters intersect, and `matched_count`/`truncated` expose omissions.
 - `names`: exact schemas for selected names, preserving the previous shortcut.
 - `detail: "schemas"`: explicitly requests full schemas; without filters this
-  still returns all 72, including the compatibility alias.
+  still returns all 77, including the compatibility alias.
 
 An empty call returns a **13-tool starter index**, not all schemas or all tools.
 Its `truncated: true` and category counts explicitly show there is more.
-Use `limit: 72` for the 71-entry canonical index, or search the whole catalog
+Use `limit: 77` for the 76-entry canonical index, or search the whole catalog
 with query/category. Specialist tools are not removed or hidden from `tools/list`.
 Index descriptions can be truncated and are labelled accordingly.
 `workspace_list` stays callable for existing clients but is deprecated; prefer
@@ -131,7 +131,6 @@ configured workspace. This mechanism does not collect model reasoning.
 | Long/interacting jobs | `command_start`, `process_status`, `process_wait`, `process_status_many`, `process_input`, `process_output`, `process_output_tail`, `process_output_many`, `process_list`, `process_cancel` |
 | Pop up a folder/document or fixed app (opt-in) | `desktop_open` |
 | Project shell with an existing expiring network grant (opt-in) | `network_command` |
-| Selected app UI when APIs are insufficient (opt-in, Accessibility) | `computer_control` |
 | Typed read-only Git | `git_status`, `git_diff`, `git_log`, `git_show`, `git_branches`, `git_worktrees`, `git_blame`, `git_file_list` |
 
 The two developer surfaces are the short path when a normal Chat needs a familiar
@@ -160,8 +159,8 @@ permissions. For uncertain delivery or an existing task ID, reconcile the job
 before starting again.
 
 `command_run` accepts `timeout_milliseconds` and returns final output. Its wait
-does not block the MCP input loop. One `command_run` response may be pending;
-additional synchronous starts are rejected before launch instead of queued.
+does not block the MCP input loop. Up to eight command jobs may run concurrently;
+additional starts are rejected before launch instead of queued.
 `command_start` does **not** accept that field: start once, keep the returned
 `task_id`, do other work, then inspect status/output. `process_wait` is a bounded
 optional observation wait of at most one second, not a kill deadline or a required
@@ -227,10 +226,13 @@ job instead of starting another. If a start result is uncertain, inspect the
 process list before deciding whether any retry is appropriate.
 
 `file_apply_edits` validates all unique, non-overlapping matches against the
-original file hash before one write and one transaction. `file_write_many` is
-**not atomic**: check every result, retain successful receipts and do not replay
-the whole batch after uncertainty. Restore only the transactions the task owns.
-Batch reads and directory summaries are not atomic filesystem snapshots.
+original file hash before one write and one transaction. `file_write_many`
+preflights every destination, publishes under one mutation lock, and returns
+one composite undo transaction. A write-time failure triggers verified reverse
+compensation; never replay an outcome-unknown mutation without inspecting state.
+Batch reads are ordinarily not snapshots; use `snapshot_consistent=true` or
+`project_read_bundle` for a small explicit pre/post-fingerprinted set. Directory
+summaries remain bounded traversals rather than atomic filesystem snapshots.
 
 For a handoff, pass a short checkpoint: workspace/root, live owner/build if known,
 task IDs, independent stdout/stderr cursors, transaction IDs, verified results and

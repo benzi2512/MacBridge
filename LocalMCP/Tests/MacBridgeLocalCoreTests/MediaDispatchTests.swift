@@ -15,7 +15,7 @@ final class MediaDispatchTests: XCTestCase {
         try io.tool(2, "bridge_capabilities", [:])
         let capabilities = try io.structured(id: 2)
         XCTAssertEqual(capabilities["active_media_calls"] as? Int, 1)
-        XCTAssertEqual(capabilities["catalog_count"] as? Int, 72)
+        XCTAssertEqual(capabilities["catalog_count"] as? Int, 76)
         try io.tool(3, "media_share", publish(f))
         XCTAssertEqual(try io.receive(3)["isError"] as? Bool, true)
         XCTAssertThrowsError(try server.callTool(name: "media_inspect", arguments: ["action": "capabilities"]))

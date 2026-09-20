@@ -57,7 +57,8 @@ else
   /usr/bin/codesign --verify --strict "$observer"
   [ -f "$script_dir/Info.plist" ] &&
     [ -f "$script_dir/../Assets/Brand/macbridge-icon.png" ] &&
-    [ -f "$script_dir/../Assets/Brand/MacBridge.icns" ] || fail "Missing local bundle resources"
+    [ -f "$script_dir/../Assets/Brand/MacBridge.icns" ] &&
+    [ -f "$script_dir/CODENOTCH-LICENSE.txt" ] || fail "Missing local bundle resources"
 fi
 /bin/mkdir -p "$(dirname -- "$destination")"
 # Reserve a new directory, rather than allowing a copy command to overwrite one.
@@ -75,6 +76,7 @@ else
   /bin/cp "$script_dir/Info.plist" "$destination/Contents/Info.plist"
   /bin/cp "$script_dir/../Assets/Brand/macbridge-icon.png" "$destination/Contents/Resources/MacBridge.png"
   /bin/cp "$script_dir/../Assets/Brand/MacBridge.icns" "$destination/Contents/Resources/MacBridge.icns"
+  /bin/cp "$script_dir/CODENOTCH-LICENSE.txt" "$destination/Contents/Resources/ThirdPartyNotices.txt"
 fi
 /bin/cp "$core" "$destination/Contents/MacOS/macbridge-mcp"
 [ "$core_hash" = "$(/usr/bin/shasum -a 256 "$destination/Contents/MacOS/macbridge-mcp" | /usr/bin/awk '{print $1}')" ] || fail "Candidate core changed during copy"

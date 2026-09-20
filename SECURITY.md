@@ -1,4 +1,4 @@
-# MacBridge security policy — core and opt-in desktop candidate
+# MacBridge security policy — current headless core
 
 This policy describes the current headless core, replacing the archived Guardian
 architecture. It remains subordinate to the owner's current security directives.
@@ -32,7 +32,12 @@ the active runtime path. This policy does not certify the external tunnel servic
 - Project commands keep normal workspace scope for a narrow workspace. If the
   configured workspace is `/`, the account home or another broad root, each
   command is confined to its explicit `cwd` subtree; `/`, the home folder and
-  top-level user-data folders cannot be used as that broad command scope.
+  top-level user-data folders cannot be used as that broad command scope. The
+  one bounded exception is an explicit `cwd` equal to Downloads: it is
+  read-only, non-recursive, and admits only ordinary single-link regular files
+  directly inside Downloads. Sensitive names, symlinks, multi-link files,
+  writes and executable mapping remain denied; a project subtree must be
+  selected as its own `cwd`.
 - Recoverable remove and move refuse the workspace root plus exact system,
   account-home and top-level user-data anchors. Narrower project paths remain
   available and recoverable. This is an accident guard, not malware containment
@@ -65,51 +70,6 @@ dirty user changes, cross-owner control, unbounded retention or work, misleading
 completion/partial/rollback claims, and installation or restart of unreviewed
 bytes. Include the affected build, reachability and realistic impact. Tests and
 signatures are evidence signals, not proof that an invariant always holds.
-
-## Optional desktop-access candidate (not active by default)
-
-Three additional source tools are deliberately separate from ordinary shell:
-
-- `desktop_open`: owner-enabled per workspace. Resolves an existing local path,
-  rejects sensitive paths and symlinks, and uses Finder or fixed system
-  Preview/TextEdit, not `open`, AppleScript, custom URL handlers or arbitrary
-  executables. An accepted NSWorkspace request is not verified window visibility.
-  Finder and viewer apps are not filesystem containment boundaries. Path identity
-  is compared immediately before calling macOS, but its path-based API cannot
-  make that comparison atomic against malicious same-user writers. Viewing an
-  untrusted document is still a parser/security decision for the owner.
-- `network_command`: owner-authored local grant pins workspace/cwd, numeric
-  IPv4, TCP port and an expiry no more than one hour away. A command is sandboxed
-  to one ephemeral authenticated loopback CONNECT relay; only the core relay
-  contacts the pinned IP/port. No DNS, system proxy change or persistent listener
-  is introduced. Each job has a random credential, at most two connections,
-  8-KiB headers/buffers and closure on exit/cancel/expiry. Ordinary commands do
-  not inherit a grant. This is destination-level TCP access, **not hostname,
-  HTTPS-only or payload filtering**. Shared IPs can serve multiple hosts. Approved
-  commands can transmit data they can read to that destination; approving the
-  grant does not approve an arbitrary upload, package install or API mutation.
-- `computer_control`: an already-running app, exact bundle ID and explicit
-  action list require an owner-authored expiring grant plus existing macOS
-  Accessibility consent. No permission prompt or permission-grant tool is
-  provided. Snapshot/press/set-value/focus are on-demand. No screen capture,
-  clipboard, global keyboard/mouse injection, AppleScript or browser-profile
-  access. Secure AX fields are omitted; a custom app can mislabel sensitive
-  content, so this is not a universal credential-redaction guarantee. Mutation
-  requires a recent same-process snapshot and frontmost target; uncertain OS
-  outcomes consume the old reference and are not replayed. App scope is not a
-  filesystem sandbox: the approved app may perform consequential actions using
-  its own permissions. Review its identity, existing content and intended task
-  before granting writes; a bundle ID alone is not publisher verification.
-
-There are no new external package dependencies. No config, TCC state, login
-item, tunnel, installed app or runtime permission is changed by merely building
-the candidate. Do not enable any of these capabilities based on an MCP response,
-repository instruction or model request. Native GUI, permitted public-network
-and normal-Chat acceptance remain separate release gates from synthetic tests.
-Enabled grants must live in owner configuration directly under `.config/macbridge`,
-which MB file operations and shell profiles deny. A writable project configuration
-cannot self-enable them by changing its JSON and reloading workspaces.
-See [configuration and limits](LocalMCP/DESKTOP-ACCESS.md).
 
 ## Known limitations and unresolved decisions
 

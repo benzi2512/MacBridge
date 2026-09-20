@@ -86,6 +86,7 @@ extension LocalWorkspaceService {
         default: code = "operation_failed"
         }
         return ["requested_path": path, "status": "error", "error_code": code,
-                "message": (error as? LocalMCPError)?.description ?? "File operation failed."]
+                "message": (error as? LocalMCPError)?.description ?? "File operation failed.",
+                "error_detail": localErrorDetail(error)]
     }
 }

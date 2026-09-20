@@ -122,9 +122,11 @@ struct FullObserverSettingsView: View {
             }
             Divider()
             ScrollView {
-                CompactSettingsView(preferences: preferences, displayID: position.displayID,
-                    onAnchorChanged: position.setNormalizedY)
-                    .id(position.displayID)
+                VStack(alignment: .leading, spacing: 16) {
+                    CompactSettingsView(preferences: preferences, displayID: position.displayID,
+                        onAnchorChanged: position.setNormalizedY)
+                        .id(position.displayID)
+                }
             }
             Text("UI preferences do not grant file or command permissions.")
                 .font(.caption).foregroundStyle(.secondary)

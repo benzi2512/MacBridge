@@ -1,6 +1,17 @@
 import Darwin
 import Foundation
 
+struct QuarantineRemovalRolledBack: Error {
+    let cause: Error
+}
+
+struct QuarantineRemovalRelocated: Error {
+    let recoveryName: String
+    let rootVersion: stat
+    let cleanupCause: Error
+    let rollbackCause: Error
+}
+
 /// Keep the directory used by a mutation open. Every leaf operation is relative
 /// to that descriptor, so a later replacement of a pathname cannot redirect it.
 final class WorkspaceDirectory {
@@ -147,10 +158,21 @@ final class WorkspaceDirectory {
         }
     }
 
-    func atomicWrite(_ data: Data, name: String, mode: Int, replacing: Bool) throws {
+    /// Stage and fsync the new bytes, then run the caller's final revision
+    /// check immediately before publication. This does not claim kernel-level
+    /// compare-and-swap against unrelated writers, but it closes the long
+    /// staging window without publishing after a detected stale preimage.
+    @discardableResult
+    func atomicWrite(
+        _ data: Data,
+        name: String,
+        mode: Int,
+        replacing: Bool,
+        beforeReplacing: (() throws -> Void)? = nil
+    ) throws -> stat {
         try Self.leaf(name)
         let temporary = ".macbridge-write-" + UUID().uuidString.lowercased()
-        let fd = openat(descriptor, temporary, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+        let fd = openat(descriptor, temporary, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
                         mode_t(mode & 0o777))
         guard fd >= 0 else { throw Self.failure() }
         var created = stat()
@@ -164,11 +186,32 @@ final class WorkspaceDirectory {
             }
             close(fd)
         }
+        guard fchmod(fd, mode_t(mode & 0o777)) == 0 else { throw Self.failure() }
         try Self.write(data, descriptor: fd)
         guard fsync(fd) == 0 else { throw Self.failure() }
-        try requireIdentity(temporary, expected: created)
+        var written = stat()
+        let intendedSHA256 = LocalHash.sha256(data)
+        let writtenSHA256 = try LocalHash.sha256(
+            descriptor: fd, maximumBytes: off_t(data.count)
+        )
+        guard fstat(fd, &written) == 0, written.st_nlink == 1,
+              writtenSHA256 == intendedSHA256
+        else { throw LocalMCPError.conflict("staged file changed while being written") }
+        try requireVersion(temporary, expected: written)
+        try beforeReplacing?()
+        var finalStage = stat()
+        let finalStageSHA256 = try LocalHash.sha256(
+            descriptor: fd, maximumBytes: off_t(data.count)
+        )
+        guard fstat(fd, &finalStage) == 0, Self.sameVersion(finalStage, written),
+              finalStageSHA256 == intendedSHA256
+        else { throw LocalMCPError.conflict("staged file changed before publication") }
+        try requireVersion(temporary, expected: written)
         try rename(temporary, to: self, as: name, replace: replacing)
         published = true
+        var publishedStatus = stat()
+        guard fstat(fd, &publishedStatus) == 0 else { throw Self.failure() }
+        return publishedStatus
     }
 
     private static func write(_ data: Data, descriptor: Int32) throws {
@@ -207,11 +250,16 @@ final class WorkspaceDirectory {
     struct TreeEntry {
         let name: String
         let version: stat
+        let metadataDigest: String
         let children: [TreeEntry]
     }
 
     struct TreeSnapshot {
         let digest: String
+        let revisionDigest: String
+        let descendantRevisionDigest: String
+        let revisionRows: [String: String]
+        let stableMetadataRows: [String: String]
         let root: TreeEntry
     }
 
@@ -219,18 +267,37 @@ final class WorkspaceDirectory {
         try snapshot(name, logicalPath: logicalPath).digest
     }
 
+    func revisionDigest(_ name: String, logicalPath: String) throws -> String {
+        try snapshot(name, logicalPath: logicalPath).revisionDigest
+    }
+
     /// The manifest shares the digest traversal's entry, byte and depth budgets.
     /// It is retained only for this operation, never persisted in an undo receipt.
     func snapshot(_ name: String, logicalPath: String,
                   afterDirectoryEnumerationForTesting: ((String) throws -> Void)? = nil) throws -> TreeSnapshot {
-        var budget = TreeBudget(), rows: [String] = []
+        var budget = TreeBudget(), rows: [String] = [], revisionRows: [String: String] = [:]
+        var stableMetadataRows: [String: String] = [:]
         let root = try snapshotEntry(name, logicalPath: logicalPath, relative: ".", depth: 0,
-            budget: &budget, rows: &rows, afterDirectoryEnumeration: afterDirectoryEnumerationForTesting)
-        return TreeSnapshot(digest: LocalHash.sha256(Data(rows.sorted().joined(separator: "\n").utf8)), root: root)
+            budget: &budget, rows: &rows, revisionRows: &revisionRows,
+            stableMetadataRows: &stableMetadataRows,
+            afterDirectoryEnumeration: afterDirectoryEnumerationForTesting)
+        return TreeSnapshot(
+            digest: LocalHash.sha256(Data(rows.sorted().joined(separator: "\n").utf8)),
+            revisionDigest: LocalHash.sha256(Data(revisionRows.values.sorted().joined(separator: "\n").utf8)),
+            descendantRevisionDigest: LocalHash.sha256(Data(
+                revisionRows.filter { $0.key != "." }.map(\.value).sorted()
+                    .joined(separator: "\n").utf8
+            )),
+            revisionRows: revisionRows,
+            stableMetadataRows: stableMetadataRows,
+            root: root
+        )
     }
 
     private func snapshotEntry(_ name: String, logicalPath: String, relative: String, depth: Int,
                                budget: inout TreeBudget, rows: inout [String],
+                               revisionRows: inout [String: String],
+                               stableMetadataRows: inout [String: String],
                                afterDirectoryEnumeration: ((String) throws -> Void)?) throws -> TreeEntry {
         guard !LocalFilesystemAccess.isSensitive(logicalPath) else { throw LocalMCPError.sensitivePathBlocked }
         guard let value = try status(name) else { throw LocalMCPError.notFound }
@@ -238,6 +305,12 @@ final class WorkspaceDirectory {
         if value.st_mode & S_IFMT == S_IFREG {
             let fd = try openFile(name)
             defer { close(fd) }
+            let metadataDigest = try Self.metadataDigest(descriptor: fd)
+            revisionRows[relative] =
+                Self.revisionRow(relative: relative, value: value) + "\0" + metadataDigest
+            stableMetadataRows[relative] = Self.stableMetadataRow(
+                relative: relative, value: value, metadataDigest: metadataDigest
+            )
             var opened = stat()
             guard fstat(fd, &opened) == 0, Self.sameVersion(opened, value) else {
                 throw LocalMCPError.conflict("tree file changed")
@@ -245,10 +318,16 @@ final class WorkspaceDirectory {
             let hash = try LocalHash.sha256(descriptor: fd, maximumBytes: value.st_size)
             try requireVersion(name, expected: value)
             rows.append("F\0\(relative)\0\(value.st_size)\0\(posixMode(value))\0\(hash)")
-            return TreeEntry(name: name, version: value, children: [])
+            return TreeEntry(name: name, version: value, metadataDigest: metadataDigest, children: [])
         } else {
             let directory = try child(name)
             guard Self.sameVersion(try directory.identity(), value) else { throw LocalMCPError.conflict("tree directory changed") }
+            let metadataDigest = try Self.metadataDigest(descriptor: directory.descriptor)
+            revisionRows[relative] =
+                Self.revisionRow(relative: relative, value: value) + "\0" + metadataDigest
+            stableMetadataRows[relative] = Self.stableMetadataRow(
+                relative: relative, value: value, metadataDigest: metadataDigest
+            )
             rows.append("D\0\(relative)\0\(posixMode(value))")
             let entries = try directory.names(maximumCount: LocalWorkspaceService.maximumTreeEntries - budget.entries)
             guard !entries.limited else { throw LocalMCPError.limitExceeded("tree entry count") }
@@ -258,14 +337,67 @@ final class WorkspaceDirectory {
                 children.append(try directory.snapshotEntry(child, logicalPath: logicalPath + "/" + child,
                     relative: relative == "." ? child : relative + "/" + child,
                     depth: depth + 1, budget: &budget, rows: &rows,
+                    revisionRows: &revisionRows,
+                    stableMetadataRows: &stableMetadataRows,
                     afterDirectoryEnumeration: afterDirectoryEnumeration))
             }
             guard Self.sameVersion(try directory.identity(), value) else {
                 throw LocalMCPError.conflict("tree directory changed during enumeration")
             }
             try requireVersion(name, expected: value)
-            return TreeEntry(name: name, version: value, children: children)
+            return TreeEntry(name: name, version: value, metadataDigest: metadataDigest, children: children)
         }
+    }
+
+    private static func revisionRow(relative: String, value: stat) -> String {
+        [relative, String(value.st_dev), String(value.st_ino), String(value.st_mode),
+         String(value.st_nlink), String(value.st_uid), String(value.st_gid),
+         String(value.st_size), String(value.st_flags),
+         String(value.st_mtimespec.tv_sec), String(value.st_mtimespec.tv_nsec),
+         String(value.st_ctimespec.tv_sec), String(value.st_ctimespec.tv_nsec)]
+            .joined(separator: "\0")
+    }
+
+    private static func stableMetadataRow(
+        relative: String, value: stat, metadataDigest: String
+    ) -> String {
+        [relative, String(value.st_dev), String(value.st_ino), String(value.st_mode),
+         String(value.st_uid), String(value.st_gid), String(value.st_flags), metadataDigest]
+            .joined(separator: "\0")
+    }
+
+    private static func metadataDigest(descriptor: Int32) throws -> String {
+        var rows: [String] = []
+        let nameBytes = flistxattr(descriptor, nil, 0, 0)
+        guard nameBytes >= 0 else { throw failure() }
+        if nameBytes > 0 {
+            var buffer = [CChar](repeating: 0, count: nameBytes)
+            guard flistxattr(descriptor, &buffer, buffer.count, 0) == nameBytes else {
+                throw failure()
+            }
+            let names = buffer.split(separator: 0).map { bytes in
+                String(decoding: bytes.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+            }.sorted()
+            for name in names {
+                let size = fgetxattr(descriptor, name, nil, 0, 0, 0)
+                guard size >= 0 else { throw failure() }
+                var value = Data(count: size)
+                let read = value.withUnsafeMutableBytes { raw in
+                    fgetxattr(descriptor, name, raw.baseAddress, size, 0, 0)
+                }
+                guard read == size else { throw failure() }
+                rows.append("X\0\(name)\0\(LocalHash.sha256(value))")
+            }
+        }
+        if let acl = acl_get_fd_np(descriptor, ACL_TYPE_EXTENDED) {
+            defer { acl_free(UnsafeMutableRawPointer(acl)) }
+            var length: ssize_t = 0
+            if let text = acl_to_text(acl, &length), length > 0 {
+                defer { acl_free(text) }
+                rows.append("A\0" + LocalHash.sha256(Data(bytes: text, count: Int(length))))
+            }
+        }
+        return LocalHash.sha256(Data(rows.joined(separator: "\n").utf8))
     }
 
     func copy(_ name: String, to destination: WorkspaceDirectory, as target: String,
@@ -333,6 +465,144 @@ final class WorkspaceDirectory {
                             beforeEntryRemovalForTesting: ((String) throws -> Void)? = nil) throws {
         try verifySnapshotEntry(snapshot.root)
         try removeSnapshotEntry(snapshot.root, beforeEntryRemoval: beforeEntryRemovalForTesting)
+    }
+
+    /// Atomically remove the verified root from its public name before doing
+    /// recursive cleanup. Cleanup failure can leave only the private quarantine
+    /// spelling; it cannot leave a partially deleted tree at the user path.
+    func quarantineAndRemoveVerifiedTree(
+        _ snapshot: TreeSnapshot,
+        afterRenameForTesting: ((WorkspaceDirectory, String, String) throws -> Void)? = nil,
+        beforeEntryRemovalForTesting: ((String) throws -> Void)? = nil
+    ) throws {
+        try verifySnapshotEntry(snapshot.root)
+        try preflightRelocatedRemoval(snapshot.root)
+        let quarantine = ".macbridge-undo-" + UUID().uuidString.lowercased()
+        try rename(snapshot.root.name, to: self, as: quarantine)
+        // Consume only the entries in the verified manifest. A late addition
+        // is never selected for deletion and instead makes the final rmdir fail.
+        // Directory modes/flags are normalized only after the public name has
+        // been removed and only after preflight proved this owner can do so.
+        do {
+            guard let quarantined = try status(quarantine),
+                  Self.sameIdentity(quarantined, snapshot.root.version) else {
+                throw LocalMCPError.conflict(
+                    "undo root changed before quarantine; replacement was preserved"
+                )
+            }
+            try afterRenameForTesting?(self, quarantine, snapshot.root.name)
+            let relocated = try self.snapshot(
+                quarantine, logicalPath: snapshot.root.name
+            )
+            guard Self.sameVersion(relocated.root.version, quarantined),
+                  relocated.digest == snapshot.digest,
+                  relocated.descendantRevisionDigest == snapshot.descendantRevisionDigest,
+                  relocated.stableMetadataRows == snapshot.stableMetadataRows,
+                  relocated.root.metadataDigest == snapshot.root.metadataDigest else {
+                throw LocalMCPError.conflict(
+                    "quarantined tree changed before cleanup; current data was preserved"
+                )
+            }
+            try removeRelocatedSnapshotEntry(
+                relocated.root, beforeEntryRemoval: beforeEntryRemovalForTesting
+            )
+        } catch let cleanupError {
+            do {
+                try rename(quarantine, to: self, as: snapshot.root.name)
+                throw QuarantineRemovalRolledBack(cause: cleanupError)
+            } catch let rollback as QuarantineRemovalRolledBack {
+                throw rollback
+            } catch let rollbackError {
+                // The reserved quarantine spelling is intentionally unreachable
+                // through ordinary workspace paths. If the public name was
+                // concurrently occupied, publish the residual tree at a fresh,
+                // resolvable recovery spelling so the owner can retain an
+                // identity-bound restore action instead of stranding it.
+                let recoveryName = ".macbridge-recovery-" + UUID().uuidString.lowercased()
+                do {
+                    try rename(quarantine, to: self, as: recoveryName)
+                    guard let recovered = try status(recoveryName) else {
+                        throw LocalMCPError.notFound
+                    }
+                    throw QuarantineRemovalRelocated(
+                        recoveryName: recoveryName, rootVersion: recovered,
+                        cleanupCause: cleanupError, rollbackCause: rollbackError
+                    )
+                } catch let relocated as QuarantineRemovalRelocated {
+                    throw relocated
+                } catch let relocationError {
+                    throw LocalMCPError.partial(
+                        "verified tree removal failed; public rollback and recovery relocation also failed; retained quarantine entry \(quarantine): \(relocationError)"
+                    )
+                }
+            }
+        }
+    }
+
+    private func preflightRelocatedRemoval(_ entry: TreeEntry) throws {
+        if entry.version.st_mode & S_IFMT == S_IFDIR {
+            guard entry.version.st_uid == getuid() else {
+                throw LocalMCPError.conflict("tree contains a directory not owned by the current user")
+            }
+            let directory = try child(entry.name)
+            for child in entry.children { try directory.preflightRelocatedRemoval(child) }
+        } else if entry.version.st_flags & UInt32(UF_IMMUTABLE | UF_APPEND) != 0,
+                  entry.version.st_uid != getuid() {
+            throw LocalMCPError.conflict("tree contains immutable data not owned by the current user")
+        }
+    }
+
+    private func removeRelocatedSnapshotEntry(
+        _ entry: TreeEntry,
+        beforeEntryRemoval: ((String) throws -> Void)?
+    ) throws {
+        try beforeEntryRemoval?(entry.name)
+        try requireVersion(entry.name, expected: entry.version)
+        if entry.version.st_mode & S_IFMT == S_IFDIR {
+            let directory = try child(entry.name)
+            guard Self.sameVersion(try directory.identity(), entry.version) else {
+                throw LocalMCPError.conflict("quarantined directory changed before cleanup")
+            }
+            guard fchmod(directory.descriptor, 0o700) == 0,
+                  fchflags(directory.descriptor, 0) == 0 else { throw Self.failure() }
+            for child in entry.children {
+                try directory.removeRelocatedSnapshotEntry(
+                    child, beforeEntryRemoval: beforeEntryRemoval
+                )
+            }
+            var normalized = stat()
+            guard fstat(directory.descriptor, &normalized) == 0,
+                  Self.sameIdentity(normalized, entry.version),
+                  posixMode(normalized) == 0o700,
+                  normalized.st_uid == entry.version.st_uid,
+                  normalized.st_gid == entry.version.st_gid,
+                  normalized.st_flags == 0,
+                  try Self.metadataDigest(descriptor: directory.descriptor)
+                    == entry.metadataDigest else {
+                throw LocalMCPError.conflict(
+                    "quarantined directory metadata changed during cleanup"
+                )
+            }
+            try requireIdentity(entry.name, expected: normalized)
+            try unlink(entry.name, directory: true)
+        } else {
+            if entry.version.st_flags & UInt32(UF_IMMUTABLE | UF_APPEND) != 0 {
+                let fd = try openFile(entry.name)
+                defer { close(fd) }
+                guard fchflags(fd, 0) == 0 else { throw Self.failure() }
+                var normalized = stat()
+                guard fstat(fd, &normalized) == 0,
+                      Self.sameIdentity(normalized, entry.version),
+                      normalized.st_flags == 0,
+                      try Self.metadataDigest(descriptor: fd) == entry.metadataDigest else {
+                    throw LocalMCPError.conflict(
+                        "quarantined file metadata changed during cleanup"
+                    )
+                }
+                try requireVersion(entry.name, expected: normalized)
+            }
+            try unlink(entry.name)
+        }
     }
 
     private func verifySnapshotEntry(_ entry: TreeEntry) throws {

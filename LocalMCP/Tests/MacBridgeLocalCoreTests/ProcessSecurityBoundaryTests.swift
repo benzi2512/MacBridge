@@ -108,6 +108,28 @@ final class ProcessSecurityBoundaryTests: XCTestCase {
         }
     }
 
+    func testSensitiveAncestorCannotBeRenamedToBypassSandbox() throws {
+        let f = try Fixture(); defer { f.remove() }
+        let protected = f.workspace.appendingPathComponent("container/.docker")
+        try FileManager.default.createDirectory(at: protected, withIntermediateDirectories: true)
+        try Data("synthetic-auth-only".utf8).write(
+            to: protected.appendingPathComponent("config.json")
+        )
+        let p = LocalProcessService(
+            workspaceService: try f.service(), selfExecutable: try binary()
+        )
+        let result = try run(p, f, """
+            if /bin/mv container moved; then exit 41; fi
+            if /bin/cat container/.docker/config.json; then exit 42; fi
+            printf protected
+            """)
+        XCTAssertEqual(result["exit_code"] as? Int, 0, result["stderr"] as? String ?? "")
+        XCTAssertEqual(result["stdout"] as? String, "protected")
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: protected.appendingPathComponent("config.json").path
+        ))
+    }
+
     // Only reviewed system Git and a fresh synthetic repository are used for
     // fixture setup. No user config, hooks, credentials, remotes or network.
     private func fixtureGit(_ f: Fixture, _ arguments: [String]) throws {

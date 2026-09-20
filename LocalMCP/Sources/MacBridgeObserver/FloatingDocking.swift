@@ -150,14 +150,16 @@ final class FloatingFirstClickHostingView<Content: View>: NSHostingView<Content>
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
-        if let hit = super.hitTest(point) { return hit }
         // AppKit supplies `point` in the receiver's superview coordinates.
-        // Convert it exactly once before comparing it with the controller's
-        // canvas path. Otherwise a non-zero frame origin shifts the hot region
-        // and the click can fall through to the app underneath.
+        // Convert it exactly once before consulting the controller's path.
+        // NSHostingView itself can otherwise report a hit across its complete
+        // transparent backing canvas, including pixels that must belong to the
+        // application underneath the floating widget.
         let localPoint = superview.map { convert(point, from: $0) } ?? point
-        guard bounds.contains(localPoint), acceptsInteractivePoint?(localPoint) == true else { return nil }
-        return self
+        guard bounds.contains(localPoint) else { return nil }
+        if let acceptsInteractivePoint, !acceptsInteractivePoint(localPoint) { return nil }
+        if let hit = super.hitTest(point) { return hit }
+        return acceptsInteractivePoint?(localPoint) == true ? self : nil
     }
 }
 

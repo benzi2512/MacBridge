@@ -4,7 +4,7 @@ import XCTest
 @testable import MacBridgeLocalCore
 
 final class WorkspaceEfficiencyTests: XCTestCase {
-    func testFullReadReusesDigestWithoutChangingUnicodeOrBinaryChunks() throws {
+    func testEveryReadReturnsWholeDigestWithoutChangingUnicodeOrBinaryChunks() throws {
         let fixture = try Fixture()
         defer { fixture.remove() }
         let service = try fixture.service()
@@ -33,7 +33,7 @@ final class WorkspaceEfficiencyTests: XCTestCase {
             maximumBytes: 4))
         XCTAssertEqual(firstUnicode["content"] as? String, "ab🙂")
         XCTAssertEqual(firstUnicode["chunk_sha256"] as? String, LocalHash.sha256(Data("ab🙂".utf8)))
-        XCTAssertNil(firstUnicode["sha256"])
+        XCTAssertEqual(firstUnicode["sha256"] as? String, LocalHash.sha256(unicode))
         let nextOffset = try XCTUnwrap(firstUnicode["next_offset"] as? Int)
         let tailUnicode = try fileObject(service.readFile(
             workspaceID: fixture.workspaceID, path: "unicode.txt", encoding: "utf8",
@@ -41,7 +41,7 @@ final class WorkspaceEfficiencyTests: XCTestCase {
         XCTAssertEqual(tailUnicode["content"] as? String, "Xin chào\n")
         XCTAssertEqual(tailUnicode["chunk_sha256"] as? String,
                        LocalHash.sha256(Data("Xin chào\n".utf8)))
-        XCTAssertNil(tailUnicode["sha256"])
+        XCTAssertEqual(tailUnicode["sha256"] as? String, LocalHash.sha256(unicode))
         XCTAssertEqual(tailUnicode["eof"] as? Bool, true)
 
         let partialBinary = try fileObject(service.readFile(
@@ -50,7 +50,7 @@ final class WorkspaceEfficiencyTests: XCTestCase {
         let expectedBinary = binary.subdata(in: 17..<48)
         XCTAssertEqual(partialBinary["content"] as? String, expectedBinary.base64EncodedString())
         XCTAssertEqual(partialBinary["chunk_sha256"] as? String, LocalHash.sha256(expectedBinary))
-        XCTAssertNil(partialBinary["sha256"])
+        XCTAssertEqual(partialBinary["sha256"] as? String, LocalHash.sha256(binary))
         XCTAssertEqual(partialBinary["next_offset"] as? Int, 48)
     }
 

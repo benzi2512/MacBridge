@@ -123,10 +123,13 @@ def main():
     brand = package.parent.parent / "Assets" / "Brand"
     packaged_png = raw_app / "Contents/Resources/MacBridge.png"
     packaged_icns = raw_app / "Contents/Resources/MacBridge.icns"
+    packaged_notice = raw_app / "Contents/Resources/ThirdPartyNotices.txt"
     require(packaged_png.is_file() and digest(packaged_png) == digest(brand / "macbridge-icon.png"),
             "Raw package omitted or changed the canonical PNG logo")
     require(packaged_icns.is_file() and digest(packaged_icns) == digest(brand / "MacBridge.icns"),
             "Raw package omitted or changed the Finder/Dock icon")
+    require(packaged_notice.is_file() and digest(packaged_notice) == digest(package.parent / "CODENOTCH-LICENSE.txt"),
+            "Raw package omitted or changed the CodeNotch MIT notice")
     plist = run(["/usr/libexec/PlistBuddy", "-c", "Print :CFBundleIconFile", raw_app / "Contents/Info.plist"])
     require(plist.returncode == 0 and plist.stdout.strip() == "MacBridge", "Raw package does not declare the bundle icon")
     agent_app = run(["/usr/libexec/PlistBuddy", "-c", "Print :LSUIElement", raw_app / "Contents/Info.plist"])
@@ -136,8 +139,8 @@ def main():
     require(display_name.returncode == 0 and display_name.stdout.strip() == "MacBridge",
             "Raw package still exposes a preview-only app name")
     version = run(["/usr/libexec/PlistBuddy", "-c", "Print :CFBundleShortVersionString", raw_app / "Contents/Info.plist"])
-    require(version.returncode == 0 and version.stdout.strip() == "0.3.1",
-            "Observer app version is not aligned with the 0.3 runtime")
+    require(version.returncode == 0 and version.stdout.strip() == "0.4.0",
+            "Observer app version is not aligned with the 0.4 runtime")
 
     # This is a full copy of a signed app, not its extracted, bundle-bound UI binary.
     fixture = root / "source" / "MacBridge.app"

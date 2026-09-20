@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import XCTest
 @testable import MacBridgeLocalCore
@@ -14,7 +15,7 @@ final class ExpandedToolsTests: XCTestCase {
         let f = try Fixture(); defer { f.remove() }
         let s = try server(f), specs = LocalMCPServer.toolSpecs
         let names = specs.compactMap { $0["name"] as? String }
-        XCTAssertEqual(names.count, 72); XCTAssertEqual(Set(names).count, 72)
+        XCTAssertEqual(names.count, 76); XCTAssertEqual(Set(names).count, 76)
         let compact = try s.callTool(name: "tool_catalog", arguments: [:])
         XCTAssertEqual(compact["returned_count"] as? Int, 13)
         XCTAssertEqual(compact["truncated"] as? Bool, true)
@@ -122,19 +123,83 @@ final class ExpandedToolsTests: XCTestCase {
         XCTAssertThrowsError(try s.callTool(name: "file_apply_edits", arguments: stale))
     }
 
-    func testBatchWritesPartialReceiptsAndValidationBeforeMutation() throws {
+    func testBatchWritesAreCoordinatedWithOneUndoAndValidationBeforeMutation() throws {
         let f = try Fixture(); defer { f.remove() }
         let s = try server(f), id = f.workspaceID
-        let batch = try s.callTool(name: "file_write_many", arguments: ["workspace_id": id, "files": [
-            ["path": "a", "content": "new"], ["path": "absent/child", "content": "no"]]])
-        XCTAssertEqual(batch["success_count"] as? Int, 1); XCTAssertEqual(batch["error_count"] as? Int, 1)
-        XCTAssertEqual(batch["batch_atomic"] as? Bool, false)
-        let receipt = (batch["results"] as! [JSONObject])[0]["receipt"] as! JSONObject
-        _ = try s.callTool(name: "transaction_restore", arguments: ["transaction_id": receipt["transaction_id"]!])
+        XCTAssertThrowsError(try s.callTool(name: "file_write_many", arguments: ["workspace_id": id, "files": [
+            ["path": "a", "content": "new"], ["path": "absent/child", "content": "no"]]]))
         XCTAssertFalse(FileManager.default.fileExists(atPath: f.workspace.appendingPathComponent("a").path))
+        let batch = try s.callTool(name: "file_write_many", arguments: ["workspace_id": id, "files": [
+            ["path": "a", "content": "new"], ["path": "b", "content": "two"]]])
+        XCTAssertEqual(batch["success_count"] as? Int, 2); XCTAssertEqual(batch["error_count"] as? Int, 0)
+        XCTAssertEqual(batch["batch_atomic"] as? Bool, false)
+        XCTAssertEqual(batch["all_or_compensated"] as? Bool, true)
+        XCTAssertEqual(batch["crash_atomic"] as? Bool, false)
+        _ = try s.callTool(name: "transaction_restore", arguments: ["transaction_id": batch["transaction_id"]!])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.workspace.appendingPathComponent("a").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.workspace.appendingPathComponent("b").path))
         XCTAssertThrowsError(try s.callTool(name: "file_write_many", arguments: ["workspace_id": id, "files": [
             ["path": "b", "content": "new"], ["path": "c", "content": "no", "extra": "invalid"]]]))
         XCTAssertFalse(FileManager.default.fileExists(atPath: f.workspace.appendingPathComponent("b").path))
+
+        let caseSensitive = try f.workspace.resourceValues(
+            forKeys: [.volumeSupportsCaseSensitiveNamesKey]
+        ).volumeSupportsCaseSensitiveNames ?? true
+        if !caseSensitive {
+            XCTAssertThrowsError(try s.callTool(name: "file_write_many", arguments: [
+                "workspace_id": id,
+                "files": [["path": "alias.txt", "content": "one"],
+                          ["path": "ALIAS.TXT", "content": "two"]],
+            ]))
+            XCTAssertFalse(FileManager.default.fileExists(
+                atPath: f.workspace.appendingPathComponent("alias.txt").path
+            ))
+            let sigma = f.workspace.appendingPathComponent("σ.txt")
+            try Data("baseline".utf8).write(to: sigma)
+            XCTAssertThrowsError(try s.callTool(name: "file_write_many", arguments: [
+                "workspace_id": id,
+                "files": [["path": "σ.txt", "content": "one",
+                           "expected_sha256": LocalHash.sha256(Data("baseline".utf8))],
+                          ["path": "ς.txt", "content": "two",
+                           "expected_sha256": LocalHash.sha256(Data("baseline".utf8))]],
+            ]))
+            XCTAssertEqual(try String(contentsOf: sigma, encoding: .utf8), "baseline")
+        }
+    }
+
+    func testCompositeRestoreRetainsOnlyMembersNotYetRestored() throws {
+        let f = try Fixture(); defer { f.remove() }
+        let blocked = f.workspace.appendingPathComponent("blocked")
+        let writable = f.workspace.appendingPathComponent("writable")
+        try FileManager.default.createDirectory(at: blocked, withIntermediateDirectories: false)
+        try FileManager.default.createDirectory(at: writable, withIntermediateDirectories: false)
+        let a = blocked.appendingPathComponent("a.txt")
+        let b = writable.appendingPathComponent("b.txt")
+        try Data("a-old".utf8).write(to: a)
+        try Data("b-old".utf8).write(to: b)
+        let s = try server(f)
+        let batch = try s.callTool(name: "file_write_many", arguments: [
+            "workspace_id": f.workspaceID,
+            "files": [
+                ["path": "blocked/a.txt", "content": "a-new",
+                 "expected_sha256": LocalHash.sha256(Data("a-old".utf8))],
+                ["path": "writable/b.txt", "content": "b-new",
+                 "expected_sha256": LocalHash.sha256(Data("b-old".utf8))],
+            ],
+        ])
+        let transactionID = try XCTUnwrap(batch["transaction_id"] as? String)
+        XCTAssertEqual(chmod(blocked.path, 0o500), 0)
+        XCTAssertThrowsError(try s.callTool(
+            name: "transaction_restore", arguments: ["transaction_id": transactionID]
+        ))
+        XCTAssertEqual(try String(contentsOf: b, encoding: .utf8), "b-old")
+        XCTAssertEqual(try String(contentsOf: a, encoding: .utf8), "a-new")
+        XCTAssertEqual(chmod(blocked.path, 0o700), 0)
+        _ = try s.callTool(
+            name: "transaction_restore", arguments: ["transaction_id": transactionID]
+        )
+        XCTAssertEqual(try String(contentsOf: a, encoding: .utf8), "a-old")
+        XCTAssertEqual(try String(contentsOf: b, encoding: .utf8), "b-old")
     }
 
     func testProcessWaitIsNonCancellingAndTailIsNonConsuming() throws {
@@ -240,5 +305,122 @@ final class ExpandedToolsTests: XCTestCase {
         XCTAssertEqual(empty["running"] as? Int, 0)
         XCTAssertEqual(empty["retained_handles"] as? Int, 0)
         XCTAssertEqual(empty["completed_retained_handles"] as? Int, 0)
+    }
+
+    func testFeedbackHardeningDiagnosticsResolutionAndSnapshotBundle() throws {
+        let f = try Fixture(); defer { f.remove() }
+        let s = try server(f), id = f.workspaceID
+        try Data("readme".utf8).write(to: f.workspace.appendingPathComponent("README.md"))
+        try Data("value".utf8).write(to: f.workspace.appendingPathComponent("a.txt"))
+        let diagnostic = try s.callTool(name: "bridge_diagnostic", arguments: [:])
+        XCTAssertEqual(diagnostic["server_alive"] as? Bool, true)
+        XCTAssertEqual(diagnostic["host_binding_verified"] as? Bool, false)
+        XCTAssertEqual(diagnostic["workspace_actions_callable"] as? Bool, true)
+        XCTAssertNil(diagnostic["file_actions_callable"] as? Bool)
+        XCTAssertEqual(diagnostic["file_actions_verified"] as? Bool, false)
+        XCTAssertNotNil(diagnostic["binding_epoch"] as? String)
+        let caps = try s.callTool(name: "bridge_capabilities", arguments: [:])
+        XCTAssertEqual(caps["binding_epoch"] as? String, diagnostic["binding_epoch"] as? String)
+        let resolved = try s.callTool(name: "workspace_resolve", arguments: [
+            "path": f.workspace.appendingPathComponent("a.txt").path,
+        ])
+        XCTAssertEqual(resolved["workspace_id"] as? String, id)
+        XCTAssertEqual(resolved["relative_path"] as? String, "a.txt")
+        XCTAssertEqual(resolved["access_changed"] as? Bool, false)
+        let bundle = try s.callTool(name: "project_read_bundle", arguments: [
+            "workspace_id": id, "paths": ["README.md", "a.txt"],
+        ])
+        XCTAssertEqual(bundle["snapshot_consistent"] as? Bool, true)
+        XCTAssertEqual(bundle["snapshot_atomic"] as? Bool, true)
+        XCTAssertEqual(bundle["project_markers"] as? [String], ["README.md"])
+        XCTAssertNotNil(bundle["snapshot_token"] as? String)
+    }
+
+    func testDiagnosticBlocksWhenRegisteredWorkspaceRootDisappears() throws {
+        let f = try Fixture(); defer { f.remove() }
+        let s = try server(f)
+        let moved = f.root.appendingPathComponent("workspace-moved")
+        try FileManager.default.moveItem(at: f.workspace, to: moved)
+        defer { try? FileManager.default.moveItem(at: moved, to: f.workspace) }
+        let diagnostic = try s.callTool(name: "bridge_diagnostic", arguments: [:])
+        XCTAssertEqual(diagnostic["status"] as? String, "BLOCKED")
+        XCTAssertEqual(diagnostic["workspace_actions_callable"] as? Bool, false)
+        XCTAssertEqual(diagnostic["available_workspace_count"] as? Int, 0)
+        XCTAssertNil(diagnostic["file_actions_callable"] as? Bool)
+    }
+
+    func testDiagnosticDoesNotCallUnreadableWorkspaceAvailable() throws {
+        let f = try Fixture(); defer { f.remove() }
+        let s = try server(f)
+        XCTAssertEqual(chmod(f.workspace.path, 0o000), 0)
+        defer { _ = chmod(f.workspace.path, 0o700) }
+        let diagnostic = try s.callTool(name: "bridge_diagnostic", arguments: [:])
+        XCTAssertEqual(diagnostic["status"] as? String, "BLOCKED")
+        XCTAssertEqual(diagnostic["available_workspace_count"] as? Int, 0)
+    }
+
+    func testJSONPatchAndContentAddressedArtifactHaveCASAndUndo() throws {
+        let f = try Fixture(); defer { f.remove() }
+        let s = try server(f), id = f.workspaceID
+        let original = Data("{\"name\":\"old\",\"items\":[1]}\n".utf8)
+        let json = f.workspace.appendingPathComponent("data.json")
+        try original.write(to: json)
+        let originalHash = LocalHash.sha256(original)
+        let patched = try s.callTool(name: "file_json_patch", arguments: [
+            "workspace_id": id, "path": "data.json", "expected_sha256": originalHash,
+            "operations": [
+                ["op": "test", "path": "/name", "value": "old"],
+                ["op": "replace", "path": "/name", "value": "new"],
+                ["op": "add", "path": "/items/-", "value": 2],
+            ],
+        ])
+        XCTAssertEqual(patched["json_patch_operations"] as? Int, 3)
+        let object = try JSONSerialization.jsonObject(with: Data(contentsOf: json)) as? JSONObject
+        XCTAssertEqual(object?["name"] as? String, "new")
+        XCTAssertEqual(object?["items"] as? [Int], [1, 2])
+        XCTAssertThrowsError(try s.callTool(name: "file_json_patch", arguments: [
+            "workspace_id": id, "path": "data.json", "expected_sha256": originalHash,
+            "operations": [["op": "replace", "path": "/name", "value": "stale"]],
+        ]))
+        _ = try s.callTool(name: "transaction_restore", arguments: ["transaction_id": patched["transaction_id"]!])
+        XCTAssertEqual(try Data(contentsOf: json), original)
+
+        let destination = "artifacts/\(originalHash).json"
+        try FileManager.default.createDirectory(
+            at: f.workspace.appendingPathComponent("artifacts"), withIntermediateDirectories: false
+        )
+        let artifact = try s.callTool(name: "artifact_snapshot", arguments: [
+            "workspace_id": id, "source_path": "data.json",
+            "destination_path": destination, "expected_source_sha256": originalHash,
+        ])
+        XCTAssertEqual(artifact["artifact_sha256"] as? String, originalHash)
+        XCTAssertEqual(artifact["content_addressed"] as? Bool, true)
+        XCTAssertThrowsError(try s.callTool(name: "artifact_snapshot", arguments: [
+            "workspace_id": id, "source_path": "data.json",
+            "destination_path": destination, "expected_source_sha256": originalHash,
+        ]))
+        _ = try s.callTool(name: "transaction_restore", arguments: ["transaction_id": artifact["transaction_id"]!])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.workspace.appendingPathComponent(destination).path))
+    }
+
+    func testCreateOnlyAndStaleCASExposeCurrentRevision() throws {
+        let f = try Fixture(); defer { f.remove() }
+        let s = try server(f), id = f.workspaceID
+        let current = Data("current".utf8)
+        try current.write(to: f.workspace.appendingPathComponent("existing.txt"))
+        for createOnly in [true, false] {
+            do {
+                var arguments: JSONObject = [
+                    "workspace_id": id, "path": "existing.txt", "content": "next",
+                    "create_only": createOnly,
+                ]
+                if !createOnly { arguments["expected_sha256"] = String(repeating: "0", count: 64) }
+                _ = try s.callTool(name: "file_write", arguments: arguments)
+                XCTFail("conflict should be returned")
+            } catch let error as LocalMCPError {
+                XCTAssertEqual(error.detail["current_sha256"] as? String, LocalHash.sha256(current))
+                XCTAssertNotNil(error.detail["current_modified_milliseconds"])
+            }
+        }
     }
 }

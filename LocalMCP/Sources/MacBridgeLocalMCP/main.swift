@@ -17,6 +17,9 @@ private func failUsage() -> Never {
 if arguments.first == "--runner-child" {
     LocalRunnerChild.execute(arguments: Array(arguments.dropFirst()))
 }
+if arguments.first == "--runner-child-direct" {
+    LocalRunnerChild.execute(arguments: Array(arguments.dropFirst()), supervised: false)
+}
 
 if arguments == ["--version"] {
     print(LocalMCPServer.version)

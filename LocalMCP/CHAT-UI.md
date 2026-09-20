@@ -35,7 +35,7 @@ outside the shareable source repository.
   `text/html;profile=mcp-app`, retained for existing references. All exact
   allowlisted resources return the same embedded HTML. Arbitrary URI/file/network
   lookup is not supported.
-- The two activity tools supplement the 50 file/process/discovery tools. They
+- The two activity tools supplement the other 75 catalog tools. They
   are read-only and require observation enabled on the same headless instance.
 
 ## Scope and resource use

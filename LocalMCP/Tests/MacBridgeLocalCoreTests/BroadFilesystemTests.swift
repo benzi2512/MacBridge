@@ -111,6 +111,68 @@ final class BroadFilesystemTests: XCTestCase {
         XCTAssertFalse(LocalFilesystemAccess.isSensitive("/Volumes/Work/project/main.swift"))
     }
 
+    func testReadOnlyRootRulesAdmitOnlyImmediateSingleLinkOrdinaryFiles() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "macbridge-read-only-root-\(UUID().uuidString)", isDirectory: true
+        )
+        let outside = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "macbridge-read-only-outside-\(UUID().uuidString).txt"
+        )
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: outside)
+        }
+        let ordinary = root.appendingPathComponent("ordinary file.txt")
+        let sensitive = root.appendingPathComponent(".env")
+        let profileBreaking = root.appendingPathComponent("line\nbreak.txt")
+        let symlink = root.appendingPathComponent("outside-symlink.txt")
+        let hardlink = root.appendingPathComponent("outside-hardlink.txt")
+        let child = root.appendingPathComponent("child", isDirectory: true)
+        let nested = child.appendingPathComponent("nested.txt")
+        try Data("ordinary".utf8).write(to: ordinary)
+        try Data("dummy-secret".utf8).write(to: sensitive)
+        try Data("profile-breaking".utf8).write(to: profileBreaking)
+        try Data("outside".utf8).write(to: outside)
+        try FileManager.default.createDirectory(at: child, withIntermediateDirectories: false)
+        try Data("nested".utf8).write(to: nested)
+        XCTAssertEqual(Darwin.symlink(outside.path, symlink.path), 0)
+        XCTAssertEqual(Darwin.link(outside.path, hardlink.path), 0)
+
+        let rules = try LocalFilesystemAccess.sandboxReadOnlyRootRules(root: root)
+        let canonicalRoot = try canonicalExistingPath(root.path)
+        XCTAssertTrue(rules.contains("(literal \"\(canonicalRoot)\")"))
+        XCTAssertTrue(rules.contains("(literal \"\(canonicalRoot)/ordinary file.txt\")"))
+        XCTAssertFalse(rules.contains(sensitive.path))
+        XCTAssertFalse(rules.contains(profileBreaking.path))
+        XCTAssertFalse(rules.contains(symlink.path))
+        XCTAssertFalse(rules.contains(hardlink.path))
+        XCTAssertFalse(rules.contains(child.path))
+        XCTAssertFalse(rules.contains(nested.path))
+        XCTAssertFalse(rules.contains("file-map-executable"))
+    }
+
+    func testReadOnlyRootRulesRefuseBeforeProfileCanExceedArgumentBudget() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "macbridge-read-only-budget-\(UUID().uuidString)", isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: root) }
+        for index in 0..<512 {
+            let prefix = String(format: "%04d-", index)
+            let name = prefix + String(repeating: "x", count: 220)
+            _ = FileManager.default.createFile(
+                atPath: root.appendingPathComponent(name).path, contents: Data()
+            )
+        }
+        XCTAssertThrowsError(try LocalFilesystemAccess.sandboxReadOnlyRootRules(root: root)) {
+            guard case LocalMCPError.limitExceeded = $0 else {
+                return XCTFail("expected a bounded limit error, got \($0)")
+            }
+        }
+        XCTAssertEqual(LocalFilesystemAccess.maximumReadOnlyRootPathBytes, 128 * 1_024)
+    }
+
     func testBroadCommandUsesPrivateTempAndScopesEachCommandToItsExplicitCWD() throws {
         let fixture = try Fixture()
         defer { fixture.remove() }
@@ -193,6 +255,12 @@ final class BroadFilesystemTests: XCTestCase {
                 workingDirectory: URL(fileURLWithPath: "/", isDirectory: true)
             )
         )
+        XCTAssertThrowsError(
+            try OperationSafety.commandScope(
+                workspace: workspace,
+                workingDirectory: FileManager.default.homeDirectoryForCurrentUser
+            )
+        )
         for protected in ["/etc", "/opt", "/private/etc", "/private/tmp", "/private/var", "/tmp", "/var"] {
             XCTAssertTrue(OperationSafety.isProtectedAnchor(protected), protected)
             XCTAssertThrowsError(
@@ -213,5 +281,19 @@ final class BroadFilesystemTests: XCTestCase {
             try OperationSafety.commandScope(workspace: workspace, workingDirectory: project).path,
             project.path
         )
+        let downloads = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Downloads", isDirectory: true).standardizedFileURL
+        let downloadsPolicy = try OperationSafety.commandScopePolicy(
+            workspace: workspace, workingDirectory: downloads
+        )
+        XCTAssertEqual(downloadsPolicy.rootURL.path, downloads.path)
+        XCTAssertTrue(downloadsPolicy.readOnly)
+        let downloadsChildPolicy = try OperationSafety.commandScopePolicy(
+            workspace: workspace,
+            workingDirectory: downloads.appendingPathComponent(
+                "synthetic-macbridge-project", isDirectory: true
+            )
+        )
+        XCTAssertFalse(downloadsChildPolicy.readOnly)
     }
 }

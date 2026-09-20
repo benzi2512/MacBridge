@@ -85,7 +85,7 @@ final class ActivityWidgetTests: XCTestCase {
         let initializeCapabilities = try XCTUnwrap(initialized["capabilities"] as? JSONObject)
         XCTAssertEqual(try LocalJSON.encode(discoveryCapabilities), try LocalJSON.encode(initializeCapabilities))
         XCTAssertEqual((discoveryCapabilities["resources"] as? JSONObject)?["listChanged"] as? Bool, false)
-        XCTAssertEqual((discoveryCapabilities["tools"] as? JSONObject)?["listChanged"] as? Bool, false)
+        XCTAssertEqual((discoveryCapabilities["tools"] as? JSONObject)?["listChanged"] as? Bool, true)
     }
 
     func testRefreshIsOwnerBoundAndCannotDispatchMutations() throws {

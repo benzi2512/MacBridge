@@ -56,11 +56,82 @@ private struct ProcessSnapshot {
 }
 
 private let runtimePathLock = NSLock()
+private let runtimeCleanupLock = NSLock()
 private let runtimeCleanupQueue = DispatchQueue(
     label: "com.macbridge.local-mcp.runtime-cleanup",
     qos: .utility,
     attributes: .concurrent
 )
+private let descendantObservationQueue = DispatchQueue(
+    label: "com.macbridge.local-mcp.descendant-observation",
+    qos: .utility,
+    attributes: .concurrent
+)
+
+private struct ObservedProcess: Hashable {
+    let pid: pid_t
+    let startedSeconds: UInt64
+    let startedMicroseconds: UInt64
+}
+
+private func observedProcess(_ pid: pid_t) -> ObservedProcess? {
+    guard pid > 0 else { return nil }
+    var info = proc_bsdinfo()
+    let count = withUnsafeMutablePointer(to: &info) {
+        proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, $0, Int32(MemoryLayout<proc_bsdinfo>.size))
+    }
+    guard count == MemoryLayout<proc_bsdinfo>.size else { return nil }
+    return ObservedProcess(
+        pid: pid,
+        startedSeconds: info.pbi_start_tvsec,
+        startedMicroseconds: info.pbi_start_tvusec
+    )
+}
+
+private func allProcessIDs() -> [pid_t] {
+    var capacity = 1_024
+    while capacity <= 65_536 {
+        var values = [pid_t](repeating: 0, count: capacity)
+        let count = values.withUnsafeMutableBytes {
+            proc_listallpids($0.baseAddress, Int32($0.count))
+        }
+        guard count > 0 else { return [] }
+        if count < capacity { return Array(values.prefix(Int(count))).filter { $0 > 0 } }
+        capacity *= 2
+    }
+    return []
+}
+
+private func childProcessIDs(of parent: pid_t) -> [pid_t] {
+    guard parent > 0 else { return [] }
+    var capacity = 64
+    while capacity <= 4_096 {
+        var values = [pid_t](repeating: 0, count: capacity)
+        let count = values.withUnsafeMutableBytes { bytes in
+            proc_listchildpids(parent, bytes.baseAddress, Int32(bytes.count))
+        }
+        guard count > 0 else { return [] }
+        if count < capacity {
+            return Array(values.prefix(Int(count))).filter { $0 > 0 }
+        }
+        capacity *= 2
+    }
+    return []
+}
+
+private func descendantProcessIDs(of root: pid_t) -> [pid_t] {
+    var pending = childProcessIDs(of: root)
+    var seen = Set<pid_t>()
+    var ordered: [pid_t] = []
+    while let pid = pending.popLast(), seen.count < 4_096 {
+        guard seen.insert(pid).inserted else { continue }
+        ordered.append(pid)
+        pending.append(contentsOf: childProcessIDs(of: pid))
+    }
+    // Children before parents makes an escaping session leader unable to keep
+    // a still-running descendant alive while its former parent is reaped.
+    return ordered.reversed()
+}
 
 func cleanupRuntimePath(_ runtime: URL) {
     // A terminating toolchain can still finish a last HOME/cache filesystem
@@ -85,17 +156,23 @@ func scheduleRuntimePathCleanup(_ runtime: URL, delay: TimeInterval = 1.0) {
 }
 
 private func cleanupRuntimePathOnce(_ runtime: URL) {
-    runtimePathLock.lock()
-    defer { runtimePathLock.unlock() }
+    // Recursive removal may be slow for a child-populated HOME/cache tree, so
+    // do not hold the short parent create/rmdir lock while traversing it.
+    // Cleanup itself remains serialized to avoid two deferred sweeps walking
+    // the same exact UUID tree concurrently.
+    runtimeCleanupLock.lock()
     var status = stat()
     if lstat(runtime.path, &status) == 0 {
         prepareRuntimeForRemoval(runtime)
         try? FileManager.default.removeItem(at: runtime)
     }
+    runtimeCleanupLock.unlock()
     // Remove only empty parents created by this runtime. rmdir never follows a
     // symlink and safely fails while another task or existing state uses them.
+    runtimePathLock.lock()
     _ = rmdir(runtime.deletingLastPathComponent().path)
     _ = rmdir(runtime.deletingLastPathComponent().deletingLastPathComponent().path)
+    runtimePathLock.unlock()
 }
 
 private func prepareRuntimeForRemoval(_ url: URL) {
@@ -143,6 +220,7 @@ private final class RunningCommand: @unchecked Sendable {
     private var stderrTruncated = false
     private var running = true
     private var childExited = false
+    private var initialRuntimeCleanupFinished = false
     private var stdoutReachedEOF = false
     private var stderrReachedEOF = false
     private var exitCode: Int32?
@@ -150,6 +228,10 @@ private final class RunningCommand: @unchecked Sendable {
     private var endedMilliseconds: Int64?
     private var timedOut = false
     private var cancelled = false
+    private let descendantLock = NSLock()
+    private var knownDescendants = Set<ObservedProcess>()
+    private var descendantTimer: DispatchSourceTimer?
+    private var descendantObservationStopped = false
 
     // Status-only observation must not copy output or expose another job's
     // identity. Use the same completion state as process_status/output.
@@ -211,11 +293,20 @@ private final class RunningCommand: @unchecked Sendable {
         }
         process.terminationHandler = { [weak self] process in
             guard let self else { return }
+            // Publish the OS child's terminal result before any potentially
+            // slow descendant/runtime cleanup. Pipe EOF still gates the final
+            // stopped snapshot, but timeout/cancel can no longer relabel a
+            // child that has already exited naturally.
+            self.lock.lock()
+            self.childExited = true
+            self.exitCode = process.terminationStatus
+            self.terminationReason =
+                process.terminationReason == .exit ? "exit" : "uncaught_signal"
+            self.endedMilliseconds = Int64(Date().timeIntervalSince1970 * 1_000)
+            self.lock.unlock()
             self.networkProxy?.stop()
-            let processGroup = process.processIdentifier
-            if processGroup > 0 {
-                _ = kill(-processGroup, SIGKILL)
-            }
+            self.terminateProcessTree(signal: SIGKILL)
+            self.stopDescendantObservation()
             self.stdinLock.lock()
             if !self.stdinClosed {
                 try? self.stdinPipe.fileHandleForWriting.close()
@@ -223,22 +314,19 @@ private final class RunningCommand: @unchecked Sendable {
             }
             self.stdinLock.unlock()
             cleanupRuntimePathOnce(self.runtimeURL)
+            self.lock.lock()
+            self.initialRuntimeCleanupFinished = true
+            self.finishIfReadyWhileLocked()
+            self.lock.unlock()
             scheduleRuntimePathCleanup(self.runtimeURL, delay: 0.02)
             // Some toolchains finish a final cache/HOME mkdir after the
             // process group receives its terminal signal. Recheck this exact
             // UUID after quiescence without delaying the command response.
             scheduleRuntimePathCleanup(self.runtimeURL)
-            self.lock.lock()
-            self.childExited = true
-            self.exitCode = process.terminationStatus
-            self.terminationReason =
-                process.terminationReason == .exit ? "exit" : "uncaught_signal"
-            self.endedMilliseconds = Int64(Date().timeIntervalSince1970 * 1_000)
-            self.finishIfReadyWhileLocked()
-            self.lock.unlock()
         }
         do {
             try process.run()
+            startDescendantObservation()
         } catch {
             stdoutPipe.fileHandleForReading.readabilityHandler = nil
             stderrPipe.fileHandleForReading.readabilityHandler = nil
@@ -289,8 +377,15 @@ private final class RunningCommand: @unchecked Sendable {
         lock.lock()
         if running, !childExited { cancelled = true }
         lock.unlock()
-        // No graceful one-second network window after an authorization expires.
-        forceKillProcessGroup()
+        // The proxy is already closed, so no network authorization remains.
+        // Give the in-sandbox supervisor a brief catchable signal to reap any
+        // detached peers before a bounded last-resort SIGKILL.
+        terminateProcessGroup()
+        descendantObservationQueue.asyncAfter(deadline: .now() + .milliseconds(250)) {
+            [weak self] in
+            guard let self, self.snapshot().running else { return }
+            self.forceKillProcessGroup()
+        }
     }
 
     func waitForCompletion(timeoutMilliseconds: Int) -> Bool {
@@ -392,7 +487,8 @@ private final class RunningCommand: @unchecked Sendable {
     }
 
     private func finishIfReadyWhileLocked() {
-        guard running, childExited, stdoutReachedEOF, stderrReachedEOF else { return }
+        guard running, childExited, initialRuntimeCleanupFinished,
+              stdoutReachedEOF, stderrReachedEOF else { return }
         // A stopped snapshot promises that the output totals are final. This
         // also makes it safe for process_output to forget a drained session.
         running = false
@@ -453,17 +549,75 @@ private final class RunningCommand: @unchecked Sendable {
     }
 
     private func terminateProcessGroup() {
-        guard process.isRunning else { return }
         let pid = process.processIdentifier
-        if pid > 0, kill(-pid, SIGTERM) != 0, process.isRunning {
+        terminateProcessTree(signal: SIGTERM)
+        if pid > 0, process.isRunning, kill(pid, 0) == 0,
+           kill(-pid, SIGTERM) != 0, process.isRunning {
             process.terminate()
         }
     }
 
     private func forceKillProcessGroup() {
-        guard process.isRunning else { return }
+        terminateProcessTree(signal: SIGKILL)
+    }
+
+    private func startDescendantObservation() {
+        let timer = DispatchSource.makeTimerSource(queue: descendantObservationQueue)
+        timer.schedule(deadline: .now(), repeating: .milliseconds(25), leeway: .milliseconds(5))
+        timer.setEventHandler { [weak self] in self?.recordDescendants() }
+        descendantLock.lock()
+        guard !descendantObservationStopped else {
+            descendantLock.unlock()
+            timer.resume()
+            timer.cancel()
+            return
+        }
+        descendantTimer = timer
+        descendantLock.unlock()
+        timer.resume()
+    }
+
+    private func stopDescendantObservation() {
+        descendantLock.lock()
+        descendantObservationStopped = true
+        let timer = descendantTimer
+        descendantTimer = nil
+        descendantLock.unlock()
+        timer?.cancel()
+    }
+
+    private func recordDescendants() {
         let pid = process.processIdentifier
-        if pid > 0 { _ = kill(-pid, SIGKILL) }
+        guard pid > 0 else { return }
+        let observed = descendantProcessIDs(of: pid).compactMap(observedProcess)
+        descendantLock.lock()
+        knownDescendants = Set(knownDescendants.filter { observedProcess($0.pid) == $0 })
+        for item in observed where knownDescendants.count < 4_096 {
+            knownDescendants.insert(item)
+        }
+        descendantLock.unlock()
+    }
+
+    private func terminateProcessTree(signal: Int32) {
+        let root = process.processIdentifier
+        guard root > 0 else { return }
+        for _ in 0..<4 {
+            recordDescendants()
+            descendantLock.lock()
+            let descendants = Array(knownDescendants)
+            descendantLock.unlock()
+            for item in descendants where observedProcess(item.pid) == item {
+                _ = kill(item.pid, signal)
+            }
+            // The root can exit before this callback while ordinary background
+            // children still retain the process group created by runner-child.
+            // A live group keeps its PGID reserved, so signalling that exact
+            // group cannot collide with a newly reused root PID. Directly
+            // signal the root only while Foundation still reports it alive.
+            _ = kill(-root, signal)
+            if process.isRunning { _ = kill(root, signal) }
+            if signal == SIGTERM { usleep(10_000) }
+        }
     }
 }
 
@@ -623,7 +777,10 @@ public final class LocalProcessService: @unchecked Sendable {
             let elapsed = Int((ProcessInfo.processInfo.systemUptime - admittedAt) * 1000)
             let snapshot = command.wait(timeoutMilliseconds: max(0, timeoutMilliseconds - elapsed))
             let result = snapshotJSON(snapshot, includeOutput: true)
-            forget(command, releaseSynchronousResponse: true)
+            forget(
+                command, observedSnapshot: snapshot,
+                releaseSynchronousResponse: true
+            )
             return result
         }
         return (command.taskID, finish)
@@ -678,9 +835,9 @@ public final class LocalProcessService: @unchecked Sendable {
         guard (0...1000).contains(maximumWaitMilliseconds) else {
             throw LocalMCPError.invalidRequest("observation wait must be 0...1000 ms")
         }
-        let before = try processStatus(taskID: taskID)
-        if before["running"] as? Bool == true {
-            _ = try process(taskID).waitForCompletion(timeoutMilliseconds: maximumWaitMilliseconds)
+        let observed = try processForObservation(taskID)
+        if observed.status["running"] as? Bool == true, let command = observed.command {
+            _ = command.waitForCompletion(timeoutMilliseconds: maximumWaitMilliseconds)
         }
         var result = try processStatus(taskID: taskID)
         result["observation_timed_out"] = result["running"] as? Bool == true
@@ -825,7 +982,7 @@ public final class LocalProcessService: @unchecked Sendable {
     public func cancelProcess(taskID rawID: String) throws -> JSONObject {
         let command = try process(rawID)
         let snapshot = command.cancel()
-        let released = forget(command)
+        let released = forget(command, observedSnapshot: snapshot)
         var result = snapshotJSON(snapshot, includeOutput: true)
         result["session_retained"] = !released
         return result
@@ -871,10 +1028,11 @@ public final class LocalProcessService: @unchecked Sendable {
             throw LocalMCPError.wrongFileType
         }
         let workspace = try workspaceService.registry.workspace(id: workspaceID)
-        let commandScope = try OperationSafety.commandScope(
+        let commandPolicy = try OperationSafety.commandScopePolicy(
             workspace: workspace,
             workingDirectory: workingDirectory
         )
+        let commandScope = commandPolicy.rootURL
         // Narrow workspaces retain their existing runtime location. Broad
         // access uses the user's private OS temp directory, never /.macbridge.
         let bridgeState: URL
@@ -934,6 +1092,7 @@ public final class LocalProcessService: @unchecked Sendable {
             executable: executable.invocationPath,
             runner: selfExecutable.path,
             readOnlyGit: readOnlyGit,
+            readOnlyWorkspace: commandPolicy.readOnly,
             networkProxyPort: networkProxy?.port
         )
         try writeNewRuntimeProfile(Data(profile.utf8), to: profileURL)
@@ -948,7 +1107,9 @@ public final class LocalProcessService: @unchecked Sendable {
             [
                 // command.sb is diagnostic only. sandbox-exec consumes these
                 // immutable profile bytes directly, never the child-writable file.
-                "-p", profile, selfExecutable.path, "--runner-child",
+                "-p", profile, selfExecutable.path,
+                readOnlyGit ? "--runner-child-direct" : "--runner-child",
+                String(getpid()),
                 executable.invocationPath,
             ] + normalizedArguments
         process.currentDirectoryURL = workingDirectory
@@ -1070,28 +1231,58 @@ public final class LocalProcessService: @unchecked Sendable {
         return value
     }
 
+    private func processForObservation(_ rawID: String) throws
+        -> (status: JSONObject, command: RunningCommand?) {
+        guard let uuid = UUID(uuidString: rawID) else {
+            throw LocalMCPError.invalidRequest("task_id must be a UUID")
+        }
+        let id = uuid.uuidString.lowercased()
+        lock.lock()
+        defer { lock.unlock() }
+        pruneCompletedStatusesWhileLocked()
+        if let command = processes[id] {
+            var status = snapshotJSON(command.snapshot(), includeOutput: false)
+            status["session_retained"] = true
+            status["status_only"] = false
+            return (status, command)
+        }
+        guard let completed = completedStatuses[id] else { throw LocalMCPError.processNotFound }
+        return (completed.metadata, nil)
+    }
+
     @discardableResult
-    private func forget(_ command: RunningCommand, releaseSynchronousResponse: Bool = false) -> Bool {
-        let snapshot = command.snapshot()
+    private func forget(
+        _ command: RunningCommand,
+        observedSnapshot: ProcessSnapshot? = nil,
+        releaseSynchronousResponse: Bool = false
+    ) -> Bool {
+        // When a caller is returning a receipt, removal must be gated on that
+        // exact observed state. Re-snapshotting here could see a just-finished
+        // command and discard the output handle while the caller still receives
+        // the earlier running/incomplete receipt.
+        let snapshot = observedSnapshot ?? command.snapshot()
         lock.lock()
         defer { lock.unlock() }
         if releaseSynchronousResponse { synchronousResponsePins.remove(command.taskID) }
         guard !synchronousResponsePins.contains(command.taskID) else { return false }
-        if processes[command.taskID] === command {
-            processes.removeValue(forKey: command.taskID)
-            reservedOutputBytes -= command.maximumOutputBytes * 2
-            pruneCompletedStatusesWhileLocked()
-            if !snapshot.running, completedStatusLimit > 0, completedStatusTTL > 0 {
-                var metadata = snapshotJSON(snapshot, includeOutput: false)
-                metadata["session_retained"] = false
-                metadata["status_only"] = true
-                // Retain no output, raw arguments, stdin, pipes or process objects.
-                // Only the already-bounded, sanitized command/folder display label survives.
-                completedStatuses[command.taskID] = (monotonicNow() + completedStatusTTL, metadata, command.activityContext)
-                completedOrder.append(command.taskID)
-                while completedOrder.count > completedStatusLimit {
-                    completedStatuses.removeValue(forKey: completedOrder.removeFirst())
-                }
+        guard processes[command.taskID] === command else { return true }
+        // A bounded timeout/cancel wait may finish before pipe EOF or private
+        // runtime cleanup. Keep that still-finalizing handle and its capacity;
+        // otherwise the returned task_id would immediately become unobservable.
+        guard !snapshot.running else { return false }
+        processes.removeValue(forKey: command.taskID)
+        reservedOutputBytes -= command.maximumOutputBytes * 2
+        pruneCompletedStatusesWhileLocked()
+        if completedStatusLimit > 0, completedStatusTTL > 0 {
+            var metadata = snapshotJSON(snapshot, includeOutput: false)
+            metadata["session_retained"] = false
+            metadata["status_only"] = true
+            // Retain no output, raw arguments, stdin, pipes or process objects.
+            // Only the already-bounded, sanitized command/folder display label survives.
+            completedStatuses[command.taskID] = (monotonicNow() + completedStatusTTL, metadata, command.activityContext)
+            completedOrder.append(command.taskID)
+            while completedOrder.count > completedStatusLimit {
+                completedStatuses.removeValue(forKey: completedOrder.removeFirst())
             }
         }
         return true // Removed here or already absent; false means retained by the pin.
@@ -1214,6 +1405,7 @@ public final class LocalProcessService: @unchecked Sendable {
         executable: String,
         runner: String,
         readOnlyGit: Bool = false,
+        readOnlyWorkspace: Bool = false,
         networkProxyPort: UInt16? = nil
     ) throws -> String {
         let home = FileManager.default.homeDirectoryForCurrentUser
@@ -1276,6 +1468,9 @@ public final class LocalProcessService: @unchecked Sendable {
         } else {
             swiftTemporaryRules = ""
         }
+        // Read-only user-data roots admit fixed reviewed tools, never an
+        // executable placed in that root by a download or another app.
+        let workspaceExecutableRule = readOnlyWorkspace ? "" : "(subpath \(stage))"
         let processRules = readOnlyGit ? """
             (deny process-fork)
             (deny process-exec)
@@ -1287,7 +1482,7 @@ public final class LocalProcessService: @unchecked Sendable {
             (allow process-exec
                 (literal \(runnerPath))
                 (literal \(executablePath))
-                (subpath \(stage))
+                \(workspaceExecutableRule)
                 (subpath "/Applications/Xcode.app")
                 (subpath "/Library/Developer")
                 (subpath "/opt/homebrew")
@@ -1309,11 +1504,22 @@ public final class LocalProcessService: @unchecked Sendable {
                 (literal "/usr/bin/ssh")
                 (literal "/usr/bin/sudo"))
             """
-        let workspaceWrites = readOnlyGit ? "" : "(allow file-write* (subpath \(stage)))"
+        let workspaceWrites = readOnlyGit || readOnlyWorkspace
+            ? "" : "(allow file-write* (subpath \(stage)))"
+        let workspaceReads = readOnlyWorkspace
+            ? try LocalFilesystemAccess.sandboxReadOnlyRootRules(root: workspace)
+            : "(allow file-read* file-test-existence file-map-executable (subpath \(stage)))"
         let networkRules = readOnlyGit ? "(deny network*)" : networkProxyPort.map { LocalNetworkGrant.sandboxRule(proxyPort: $0) } ?? """
             (allow network-inbound (local ip "localhost:*"))
             (allow network-outbound (remote ip "localhost:*"))
             """
+        // The expensive vnode/ancestor walk prevents a writable command from
+        // renaming an existing sensitive subtree around pathname filters. A
+        // read-only Downloads scope cannot rename or unlink anything, so the
+        // fixed credential regexes below are sufficient and avoid traversing a
+        // potentially large or partially unavailable Downloads directory.
+        let existingSensitiveRules = readOnlyWorkspace ? "" :
+            try LocalFilesystemAccess.sandboxExistingSensitiveRules(root: workspace)
         return """
             (version 1)
             (deny default)
@@ -1323,7 +1529,6 @@ public final class LocalProcessService: @unchecked Sendable {
             \(processRules)
             (allow file-read-metadata (subpath "/"))
             (allow file-read* file-test-existence file-map-executable
-                (subpath \(stage))
                 (subpath \(run))
                 (subpath "/Applications/Xcode.app")
                 (subpath "/Library/Apple")
@@ -1339,12 +1544,12 @@ public final class LocalProcessService: @unchecked Sendable {
                 (subpath "/dev"))
             (deny file-read* (subpath \(homePath)))
             (allow file-read* file-test-existence file-map-executable
-                (subpath \(stage))
                 (subpath \(run))
                 (literal \(runnerPath))
                 (subpath \(localBin))
                 (subpath \(cargoBin))
                 (subpath \(bunBin)))
+            \(workspaceReads)
             (deny file-write*)
             \(workspaceWrites)
             ; The live binary may sit inside a broad writable cwd. Commands may
@@ -1358,6 +1563,7 @@ public final class LocalProcessService: @unchecked Sendable {
             (allow file-write* \(writableRuntime) (literal "/dev/null"))
             \(swiftTemporaryRules)
             \(LocalFilesystemAccess.sandboxDenyRules())
+            \(existingSensitiveRules)
             \(networkRules)
             (deny appleevent-send)
             (deny mach-register)
@@ -1468,13 +1674,53 @@ public final class LocalProcessService: @unchecked Sendable {
     }
 }
 
+nonisolated(unsafe) private var runnerTerminationSignal: sig_atomic_t = 0
+nonisolated(unsafe) private var runnerSpawnedChild: pid_t = 0
+
+private func terminateSameSandboxPeers() {
+    let ownPID = getpid()
+    for _ in 0..<4 {
+        for pid in allProcessIDs() where pid != ownPID {
+            // The applied profile permits signals only to targets carrying this
+            // same unique command sandbox. EPERM for every unrelated process is
+            // expected and intentionally ignored.
+            _ = kill(pid, SIGKILL)
+        }
+        usleep(10_000)
+    }
+}
+
+private func exitRunnerBySignal(_ value: Int32) -> Never {
+    _ = signal(value, SIG_DFL)
+    _ = kill(getpid(), value)
+    Darwin._exit(128 + value)
+}
+
 public enum LocalRunnerChild {
-    public static func execute(arguments: [String]) -> Never {
+    public static func execute(arguments: [String], supervised: Bool = true) -> Never {
         // This entry point is reached only after sandbox-exec has applied the
         // command profile. It contains no policy transition and cannot widen
         // the child's authority.
-        guard let executable = arguments.first else { Darwin._exit(64) }
-        let commandArguments = Array(arguments.dropFirst())
+        guard arguments.count >= 2, let ownerPID = pid_t(arguments[0]), ownerPID > 1 else {
+            Darwin._exit(64)
+        }
+        let executable = arguments[1]
+        guard getppid() == ownerPID, let owner = observedProcess(ownerPID),
+              owner.pid == ownerPID else { Darwin._exit(75) }
+        var ownerInfo = proc_bsdinfo()
+        let ownerCount = withUnsafeMutablePointer(to: &ownerInfo) {
+            proc_pidinfo(ownerPID, PROC_PIDTBSDINFO, 0, $0,
+                         Int32(MemoryLayout<proc_bsdinfo>.size))
+        }
+        guard ownerCount == MemoryLayout<proc_bsdinfo>.size,
+              ownerInfo.pbi_uid == getuid() else { Darwin._exit(75) }
+        errno = 0
+        guard kill(ownerPID, 0) != 0, errno == EPERM else {
+            // Direct invocation would make a supervisor sweep unsafe. The
+            // applied command profile denies signalling its unsandboxed owner.
+            Darwin._exit(75)
+        }
+        let commandArguments = Array(arguments.dropFirst(2))
         _ = umask(0o077)
         guard setpgid(0, 0) == 0 else { Darwin._exit(70) }
         let values = [executable] + commandArguments
@@ -1490,9 +1736,43 @@ public enum LocalRunnerChild {
                 free(UnsafeMutableRawPointer(pointer))
             }
         }
-        _ = argv.withUnsafeMutableBufferPointer { buffer in
-            execv(executable, buffer.baseAddress!)
+        if !supervised {
+            _ = argv.withUnsafeMutableBufferPointer { buffer in
+                execv(executable, buffer.baseAddress!)
+            }
+            Darwin._exit(127)
         }
-        Darwin._exit(127)
+        // Keep a tiny supervisor inside this command's unique Seatbelt profile.
+        // Its signal permission is `(target same-sandbox)`, so the bounded PID
+        // sweeps reach detached/session-changing descendants of this command
+        // while the kernel denies unrelated processes.
+        let reapSameSandbox: @convention(c) (Int32) -> Void = { signal in
+            runnerTerminationSignal = signal
+            let child = runnerSpawnedChild
+            if child > 0 { _ = kill(child, SIGKILL) }
+        }
+        _ = signal(SIGTERM, reapSameSandbox)
+        _ = signal(SIGINT, reapSameSandbox)
+        _ = signal(SIGHUP, reapSameSandbox)
+        var child: pid_t = 0
+        let spawned = argv.withUnsafeMutableBufferPointer { buffer in
+            posix_spawn(&child, executable, nil, nil, buffer.baseAddress!, environ)
+        }
+        guard spawned == 0 else { Darwin._exit(72) }
+        runnerSpawnedChild = child
+        if runnerTerminationSignal != 0 { _ = kill(child, SIGKILL) }
+        var status: Int32 = 0
+        while waitpid(child, &status, 0) < 0 {
+            if errno == EINTR { continue }
+            Darwin._exit(73)
+        }
+        terminateSameSandboxPeers()
+        if runnerTerminationSignal != 0 {
+            exitRunnerBySignal(runnerTerminationSignal)
+        }
+        let terminationSignal = status & 0x7f
+        if terminationSignal == 0 { Darwin._exit((status >> 8) & 0xff) }
+        if terminationSignal != 0x7f { exitRunnerBySignal(terminationSignal) }
+        Darwin._exit(74)
     }
 }

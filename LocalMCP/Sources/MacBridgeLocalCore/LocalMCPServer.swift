@@ -51,13 +51,13 @@ public enum MacBridgeConnectorSurface: String, Sendable {
 }
 
 public final class LocalMCPServer: @unchecked Sendable {
-    public static let version = "0.3.1-functional-first"
+    public static let version = "0.4.0-feedback-hardening"
     public static let maximumFrameBytes = 24 * 1_024 * 1_024
     public static let supportedProtocolVersions = [
         "2026-07-28", "2025-11-25", "2025-06-18",
     ]
     private static var protocolCapabilities: JSONObject {
-        ["tools": ["listChanged": false], "resources": ["listChanged": false]]
+        ["tools": ["listChanged": true], "resources": ["listChanged": false]]
     }
 
     private var workspaceService: LocalWorkspaceService
@@ -73,6 +73,12 @@ public final class LocalMCPServer: @unchecked Sendable {
     private var initializeResponded = false
     private var initialized = false
     private var negotiatedProtocol = "2025-06-18"
+
+    /// Changes whenever either the serving process or typed catalog changes.
+    /// Hosts must invalidate callable-schema caches when this value changes.
+    private var bindingEpoch: String {
+        LocalHash.sha256(Data("\(instanceID):\(catalogDigest)".utf8))
+    }
     private let operationLock = NSRecursiveLock()
     private let outputLock = NSLock()
     // Web-tunnel conversations intentionally share one runtime, but a public
@@ -103,7 +109,6 @@ public final class LocalMCPServer: @unchecked Sendable {
     // Immutable offline-test dependency only; never configurable by MCP, CLI or environment.
     private let brevoTransportForTesting: BrevoOperations.Transport?
     private let desktopPresenterForTesting: DesktopOpen.Presenter?
-    private let computerControl: ComputerControl
     private let observerLock = NSLock()
     private var observerHistory: [JSONObject] = []
     private var observerCached: JSONObject = [:]
@@ -131,11 +136,13 @@ public final class LocalMCPServer: @unchecked Sendable {
          searchStartForTesting: (@Sendable () -> Void)?,
          brevoTransportForTesting: BrevoOperations.Transport? = nil,
          desktopPresenterForTesting: DesktopOpen.Presenter? = nil,
-         computerBackendForTesting: (any ComputerBackend)? = nil,
          mediaConfigurationURLForTesting: URL? = nil,
          mediaTransportForTesting: MediaShareTransport.Perform? = nil,
          developerInspectionStartForTesting: (@Sendable () -> Void)? = nil,
-         processWaitStartForTesting: (@Sendable () -> Void)? = nil) throws {
+         processWaitStartForTesting: (@Sendable () -> Void)? = nil,
+         workspaceServiceForTesting: LocalWorkspaceService? = nil) throws {
+        let canonicalExecutable = URL(fileURLWithPath: try canonicalExistingPath(selfExecutable.path))
+        let canonicalExecutableHash = try LocalHash.sha256(fileAt: canonicalExecutable)
         self.mediaConfigurationURL = mediaConfigurationURLForTesting ?? MediaShareConfiguration.defaultURL
         self.mediaTransportForTesting = mediaTransportForTesting
         self.searchStartForTesting = searchStartForTesting
@@ -143,14 +150,15 @@ public final class LocalMCPServer: @unchecked Sendable {
         self.processWaitStartForTesting = processWaitStartForTesting
         self.brevoTransportForTesting = brevoTransportForTesting
         self.desktopPresenterForTesting = desktopPresenterForTesting
-        self.computerControl = ComputerControl(backend: computerBackendForTesting ?? NativeComputerBackend())
         self.observationEnabled = observationEnabled
         // The configured executable may use a trusted installation alias (for
         // example SwiftPM's debug symlink); workspace readers never resolve aliases.
-        let canonicalExecutable = URL(fileURLWithPath: try canonicalExistingPath(selfExecutable.path))
-        executableHash = try LocalHash.sha256(fileAt: canonicalExecutable)
+        executableHash = canonicalExecutableHash
         let registry = try LocalWorkspaceRegistry(configurationURL: configurationURL)
-        let workspaceService = LocalWorkspaceService(registry: registry)
+        let workspaceService = workspaceServiceForTesting ?? LocalWorkspaceService(
+            registry: registry,
+            protectedMutationPaths: [canonicalExecutable.path]
+        )
         self.workspaceService = workspaceService
         processService = LocalProcessService(
             workspaceService: workspaceService,
@@ -279,6 +287,7 @@ public final class LocalMCPServer: @unchecked Sendable {
                         "capabilities": Self.protocolCapabilities,
                         "instructions": connectorSurface.instructions + " " + Self.discoveryGuide,
                         "catalogEpoch": catalogDigest,
+                        "bindingEpoch": bindingEpoch,
                     ]
                 )
             case "notifications/initialized":
@@ -296,6 +305,7 @@ public final class LocalMCPServer: @unchecked Sendable {
                         "ttlMs": 0,
                         "cacheScope": "private",
                         "catalogEpoch": catalogDigest,
+                        "bindingEpoch": bindingEpoch,
                         "connection": [
                             "surface": connectorSurface.capabilityName,
                             "transport": connectorSurface.transportName,
@@ -324,7 +334,8 @@ public final class LocalMCPServer: @unchecked Sendable {
                 try requireInitializedForCurrentSurface()
                 return rpcSuccess(
                     id: id,
-                    result: ["tools": Self.toolSpecs, "catalogEpoch": catalogDigest]
+                    result: ["tools": Self.toolSpecs, "catalogEpoch": catalogDigest,
+                             "bindingEpoch": bindingEpoch]
                 )
             case "tools/call":
                 try requireInitializedForCurrentSurface()
@@ -342,7 +353,7 @@ public final class LocalMCPServer: @unchecked Sendable {
                     return rpcSuccess(
                         id: id,
                         result: toolResult(
-                            ["error": safeMessage(error)],
+                            structuredError(error),
                             message: safeMessage(error),
                             isError: true
                         )
@@ -434,6 +445,8 @@ public final class LocalMCPServer: @unchecked Sendable {
         let workID = try workActivity.beginCall(name: name, arguments: effectiveArguments)
         var prepared = effectiveArguments
         prepared.removeValue(forKey: "work_id")
+        let transactionsBefore = Self.transactionCreatingTools.contains(name)
+            ? workspaceService.retainedTransactionIDs() : []
         do {
             var result = try observedTool(
                 name: name, arguments: effectiveArguments, workID: workID
@@ -447,6 +460,8 @@ public final class LocalMCPServer: @unchecked Sendable {
                 )
             }
             if Self.transactionCreatingTools.contains(name) {
+                workspaceService.associateTransactions(transactionIDs(in: result), workID: workID)
+                if let workID { result["work_id"] = workID }
                 result = protectNewTransactions(in: result)
             }
             if let createdDeveloperWorkToken {
@@ -471,6 +486,25 @@ public final class LocalMCPServer: @unchecked Sendable {
             }
             return result
         } catch {
+            var surfacedError: Error = error
+            if Self.transactionCreatingTools.contains(name) {
+                let newTransactions = workspaceService.retainedTransactionIDs()
+                    .subtracting(transactionsBefore).sorted()
+                if !newTransactions.isEmpty {
+                    workspaceService.associateTransactions(newTransactions, workID: workID)
+                    let receipts: [RecoveryTransactionReceipt] = newTransactions.map { id in
+                        RecoveryTransactionReceipt(
+                            transactionID: id,
+                            transactionControlToken: registerCapability(
+                                for: id, kind: .transaction
+                            )
+                        )
+                    }
+                    surfacedError = LocalMCPError.recoveryRequired(
+                        safeMessage(error), recoveryTransactions: receipts
+                    )
+                }
+            }
             if let id = createdDeveloperWorkID {
                 operationLock.lock()
                 defer { operationLock.unlock() }
@@ -481,13 +515,14 @@ public final class LocalMCPServer: @unchecked Sendable {
                 )
                 removeCapability(for: id, kind: .work)
             }
-            throw error
+            throw surfacedError
         }
     }
 
     private static let transactionCreatingTools: Set<String> = [
         "file_write", "file_patch", "file_append", "directory_create",
         "path_copy", "path_move", "path_remove", "file_apply_edits", "file_write_many",
+        "file_json_patch", "artifact_snapshot",
     ]
 
     private func newControlToken() -> String {
@@ -583,9 +618,26 @@ public final class LocalMCPServer: @unchecked Sendable {
         }
         operationLock.lock()
         defer { operationLock.unlock() }
+        var persistenceVerified = false
+        if prepared["scheduler_phase"] as? String == "persisted" {
+            let id = try prepared.requiredString("work_id", maximumBytes: 36)
+            let workspaceID = try prepared.requiredString("workspace_id", maximumBytes: 36)
+            let artifactPath = try prepared.requiredString("artifact_path", maximumBytes: 4_096)
+            let artifactSHA = try prepared.requiredString("artifact_sha256", maximumBytes: 64).lowercased()
+            let transactionID = try prepared.requiredString("write_transaction_id", maximumBytes: 36)
+            try workspaceService.verifyArtifactPersistence(
+                workspaceID: workspaceID,
+                path: artifactPath,
+                sha256: artifactSHA,
+                transactionID: transactionID,
+                workID: id
+            )
+            persistenceVerified = true
+        }
         var result = try workActivity.manage(prepared,
             validWorkspaces: Set(workspaceService.registry.workspaces.map { $0.id.lowercased() }),
-            jobs: processService.processList()["processes"] as? [JSONObject] ?? [])
+            jobs: processService.processList()["processes"] as? [JSONObject] ?? [],
+            persistenceVerified: persistenceVerified)
         if action == "begin", let id = result["work_id"] as? String,
            connectorSurface == .webTunnel {
             result["work_control_token"] = registerCapability(for: id, kind: .work)
@@ -694,6 +746,19 @@ public final class LocalMCPServer: @unchecked Sendable {
             return value
         }
         return protect(object) as? JSONObject ?? object
+    }
+
+    private func transactionIDs(in value: Any) -> [String] {
+        if let object = value as? JSONObject {
+            var ids: [String] = []
+            if let id = object["transaction_id"] as? String, UUID(uuidString: id) != nil {
+                ids.append(id.lowercased())
+            }
+            for nested in object.values { ids += transactionIDs(in: nested) }
+            return Array(Set(ids)).sorted()
+        }
+        if let array = value as? [Any] { return Array(Set(array.flatMap(transactionIDs))).sorted() }
+        return []
     }
 
     private func callPreparedTool(name: String, arguments: JSONObject, workID: String?) throws -> JSONObject {
@@ -1028,6 +1093,32 @@ public final class LocalMCPServer: @unchecked Sendable {
 
     private func executeTool(name: String, arguments: JSONObject) throws -> JSONObject {
         switch name {
+        case "bridge_diagnostic":
+            try arguments.requireOnlyKeys([])
+            let workspaceAvailability = workspaceService.diagnosticAvailability()
+            let workspaceReady = workspaceAvailability.available > 0
+            return [
+                "status": workspaceReady ? "DEGRADED" : "BLOCKED",
+                "server_alive": true,
+                "core_catalog_ready": true,
+                "registered_workspace_count": workspaceAvailability.registered,
+                "available_workspace_count": workspaceAvailability.available,
+                "workspace_actions_callable": workspaceReady,
+                "file_actions_callable": NSNull(),
+                "file_actions_verified": false,
+                "scheduler_context_callable": true,
+                "host_binding_ready": NSNull(),
+                "host_binding_verified": false,
+                "tunnel_state": connectorSurface == .webTunnel ? "CONNECTED_TO_CORE_HOST_STATE_UNKNOWN" : "LOCAL",
+                "binding_epoch": bindingEpoch,
+                "catalog_sha256": catalogDigest,
+                "catalog_count": Self.toolSpecs.count,
+                "recommended_action": workspaceReady
+                    ? "The host must resolve and call bridge_capabilities, workspace_overview, file_stat and file_read under this binding_epoch. A file fixture is required before file actions can be reported as verified. Treat any missing schema as HOST_BINDING_MISSING and rebind before retrying."
+                    : "Restore or reload at least one registered workspace root before file work; then probe file_stat and file_read with an explicit fixture.",
+                "probe_tools": ["bridge_capabilities", "workspace_overview", "file_stat", "file_read"],
+                "scope": "core-observable state only; host binding and tunnel control-plane health require host-side confirmation",
+            ]
         case "bridge_capabilities":
             try arguments.requireOnlyKeys([])
             return [
@@ -1050,13 +1141,12 @@ public final class LocalMCPServer: @unchecked Sendable {
                     $0.allowsBroadAccess
                 },
                 "credential_paths_blocked": true,
-                "desktop_open": "owner_opt_in_per_workspace_fixed_finder_preview_textedit",
+                "desktop_open": "owner_opt_in_per_workspace_fixed_finder_preview_textedit_safari_local_html",
                 "desktop_open_enabled": workspaceService.registry.workspaces.contains { $0.allowsDesktopOpen },
-                "computer_control": "owner_opt_in_application_ax_only_no_screenshot_or_global_input",
-                "computer_grants_configured": workspaceService.registry.workspaces.reduce(0) { $0 + $1.computerGrants.count },
                 "observer_output_pagination": true,
                 "catalog_count": Self.toolSpecs.count,
                 "catalog_sha256": catalogDigest,
+                "binding_epoch": bindingEpoch,
                 "tool_names": Self.toolSpecs.compactMap { $0["name"] as? String },
                 "tool_discovery": "Use host tool discovery to load missing callable schemas. tool_catalog returns the exact live catalog; catalog visibility does not grant permission or guarantee host loading.",
                 "mcp_executable_sha256": executableHash,
@@ -1068,6 +1158,7 @@ public final class LocalMCPServer: @unchecked Sendable {
                 "outbound_tunnel_adapter": connectorSurface == .webTunnel,
                 "shell_execution": "headless_stdio",
                 "interactive_process_input": true,
+                "process_cancel_scope": "unique Seatbelt command boundary with an in-sandbox supervisor, plus root process group and birth-identity-checked descendant cleanup; bounded normal-workload containment, not hostile fork-bomb containment",
                 "workspace_reload": true,
                 "active_searches": searchInProgress ? 1 : 0,
                 "maximum_concurrent_searches": 1,
@@ -1093,6 +1184,10 @@ public final class LocalMCPServer: @unchecked Sendable {
                 "transaction_accept_purges_disk_recovery": false,
                 "maximum_retained_undo_transactions": LocalWorkspaceService.maximumRetainedTransactions,
                 "maximum_retained_undo_file_bytes": LocalWorkspaceService.maximumRetainedUndoFileBytes,
+                "retained_transaction_count": workspaceService.retainedTransactionCount,
+                "workspace_reload_blocked_by_undo": workspaceService.retainedTransactionCount > 0,
+                "scheduler_lifecycle": ["fired", "worker_started", "result_ready", "persisted", "acknowledged"],
+                "scheduler_completion_requires_acknowledgement": true,
                 "maximum_aggregate_process_output_bytes": LocalProcessService.maximumAggregateOutputBytes,
                 "process_output_budget_policy": "reserve_both_stream_capacities_until_handle_release",
                 "batch_file_operations": true,
@@ -1108,6 +1203,11 @@ public final class LocalMCPServer: @unchecked Sendable {
         case "workspace_overview", "workspace_list":
             try arguments.requireOnlyKeys([])
             return workspaceService.workspaceOverview()
+        case "workspace_resolve":
+            try arguments.requireOnlyKeys(["path"])
+            return try workspaceService.resolveWorkspace(
+                path: arguments.requiredString("path", maximumBytes: 4_096)
+            )
         case "workspace_reload":
             try arguments.requireOnlyKeys([])
             guard !mediaInProgress else {
@@ -1136,7 +1236,8 @@ public final class LocalMCPServer: @unchecked Sendable {
                 )
             }
             let replacementWorkspaceService = LocalWorkspaceService(
-                registry: try LocalWorkspaceRegistry(configurationURL: configurationURL)
+                registry: try LocalWorkspaceRegistry(configurationURL: configurationURL),
+                protectedMutationPaths: [selfExecutable.path]
             )
             workspaceService = replacementWorkspaceService
             processService = LocalProcessService(
@@ -1149,8 +1250,6 @@ public final class LocalMCPServer: @unchecked Sendable {
             var result = replacementWorkspaceService.workspaceOverview()
             result["reloaded"] = true
             return result
-        case "computer_control":
-            return try computerControl.execute(arguments, workspace: workspaceService)
         case "desktop_open":
             if let presenter = desktopPresenterForTesting {
                 return try DesktopOpen.execute(arguments, workspace: workspaceService, presenter: presenter)
@@ -1185,13 +1284,21 @@ public final class LocalMCPServer: @unchecked Sendable {
                 includeSHA256: arguments.optionalBool("include_sha256", default: false)
             )
         case "file_read_many":
-            try arguments.requireOnlyKeys(["workspace_id", "paths", "encoding", "maximum_bytes_per_file", "maximum_total_bytes"])
+            try arguments.requireOnlyKeys(["workspace_id", "paths", "encoding", "maximum_bytes_per_file", "maximum_total_bytes", "snapshot_consistent"])
+            let workspaceID = try arguments.requiredString("workspace_id", maximumBytes: 36)
+            let paths = try arguments.requiredStringArray("paths", maximumItems: 32, maximumItemBytes: 4096)
+            let encoding = try arguments.optionalString("encoding", maximumBytes: 16) ?? "utf8"
+            let perFile = try arguments.optionalInt("maximum_bytes_per_file", default: 65_536, range: 1...262_144)
+            let total = try arguments.optionalInt("maximum_total_bytes", default: 1_048_576, range: 4...1_048_576)
+            if try arguments.optionalBool("snapshot_consistent", default: false) {
+                return try workspaceService.readFilesSnapshot(
+                    workspaceID: workspaceID, paths: paths, encoding: encoding,
+                    maximumBytesPerFile: perFile, maximumTotalBytes: total
+                )
+            }
             return try workspaceService.readFiles(
-                workspaceID: arguments.requiredString("workspace_id", maximumBytes: 36),
-                paths: arguments.requiredStringArray("paths", maximumItems: 32, maximumItemBytes: 4096),
-                encoding: try arguments.optionalString("encoding", maximumBytes: 16) ?? "utf8",
-                maximumBytesPerFile: arguments.optionalInt("maximum_bytes_per_file", default: 65_536, range: 1...262_144),
-                maximumTotalBytes: arguments.optionalInt("maximum_total_bytes", default: 1_048_576, range: 4...1_048_576)
+                workspaceID: workspaceID, paths: paths, encoding: encoding,
+                maximumBytesPerFile: perFile, maximumTotalBytes: total
             )
         case "file_read":
             try arguments.requireOnlyKeys([
@@ -1211,7 +1318,7 @@ public final class LocalMCPServer: @unchecked Sendable {
             return try executeSearch(arguments, workspace: workspaceService)
         case "file_write":
             try arguments.requireOnlyKeys([
-                "workspace_id", "path", "content", "encoding", "expected_sha256",
+                "workspace_id", "path", "content", "encoding", "expected_sha256", "create_only",
             ])
             return try workspaceService.writeFile(
                 workspaceID: arguments.requiredString("workspace_id", maximumBytes: 36),
@@ -1220,7 +1327,8 @@ public final class LocalMCPServer: @unchecked Sendable {
                 encoding: try arguments.optionalString("encoding", maximumBytes: 16) ?? "utf8",
                 expectedSHA256: try arguments.optionalString(
                     "expected_sha256", maximumBytes: 64
-                )
+                ),
+                createOnly: try arguments.optionalBool("create_only", default: false)
             )
         case "file_patch":
             try arguments.requireOnlyKeys([
@@ -1551,7 +1659,8 @@ public final class LocalMCPServer: @unchecked Sendable {
               let params = message["params"] as? JSONObject,
               let name = params["name"] as? String,
               name == "file_search" || name == "command_run" || name == "developer_inspect"
-                || name == "process_wait" || Self.isBrevoTool(name) || Self.isMediaTool(name) else { return false }
+                || name == "process_wait" || Self.isBrevoTool(name) || Self.isMediaTool(name)
+                else { return false }
         // Validate protocol/session state on the input thread, in frame order.
         // Invalid envelopes retain handle()'s existing JSON-RPC error semantics.
         do {
@@ -1571,13 +1680,21 @@ public final class LocalMCPServer: @unchecked Sendable {
         activityArguments.removeValue(forKey: "transaction_control_tokens")
         var workID: String?
         var responseReserved = false
+        var responseByteBudget = 0
         do {
             var effective = try authorizeAndStripWorkControl(name: name, arguments: original)
             effective = try authorizeAndStripProcessControl(name: name, arguments: effective)
             activityArguments = effective
-            guard responses.reserve() else {
+            if name == "command_run" {
+                let requested = effective["maximum_output_bytes"] as? Int ?? 1_048_576
+                let bounded = min(16_777_216, max(1, requested))
+                responseByteBudget = bounded * 12 + 1_048_576
+            } else {
+                responseByteBudget = 1_048_576
+            }
+            guard responses.reserve(estimatedBytes: responseByteBudget) else {
                 throw LocalMCPError.limitExceeded(
-                    "32 completed or active tool responses are awaiting delivery; no additional operation was started"
+                    "the bounded completed/active response delivery budget is full; no additional operation was started"
                 )
             }
             responseReserved = true
@@ -1607,18 +1724,19 @@ public final class LocalMCPServer: @unchecked Sendable {
             }
         }
         catch {
-            if responseReserved { responses.release() }
+            if responseReserved { responses.release(estimatedBytes: responseByteBudget) }
             // Preserve Issues history even when admission fails before a worker
             // exists. This records only the same bounded metadata as other calls.
             _ = try? observedTool(name: name, arguments: activityArguments, workID: workID) {
                 throw error
             }
             try write(rpcSuccess(id: message["id"] ?? NSNull(), result: toolResult(
-                ["error": safeMessage(error)], message: safeMessage(error), isError: true)), to: output)
+                structuredError(error), message: safeMessage(error), isError: true)), to: output)
             return true
         }
         responses.group.enter()
         let admittedWorkID = workID
+        let admittedResponseByteBudget = responseByteBudget
         // One admitted worker per local long tool, one for the whole Brevo
         // family. No unbounded queue, automatic retry or idle polling.
         // Immutable frame bytes cross the queue, not a shared Any dictionary.
@@ -1627,7 +1745,7 @@ public final class LocalMCPServer: @unchecked Sendable {
                 // Hold the global response reservation until serialization has
                 // completed or failed. Per-family execution leases are released
                 // separately before the writer can block.
-                responses.release()
+                responses.release(estimatedBytes: admittedResponseByteBudget)
                 responses.group.leave()
             }
             autoreleasepool {
@@ -1659,14 +1777,14 @@ public final class LocalMCPServer: @unchecked Sendable {
                         if !handedToObservation {
                             workActivity.finishCall(admittedWorkID, name: name, result: [:], failed: true)
                         }
-                        payload = toolResult(["error": safeMessage(error)], message: safeMessage(error), isError: true)
+                        payload = toolResult(structuredError(error), message: safeMessage(error), isError: true)
                     }
                     response = rpcSuccess(id: responseID, result: payload)
                 } catch {
                     workActivity.finishCall(admittedWorkID, name: name, result: [:], failed: true)
                     let message = safeMessage(error)
                     response = rpcSuccess(id: responseID, result: toolResult(
-                        ["error": message], message: message, isError: true
+                        structuredError(error), message: message, isError: true
                     ))
                 }
                 // Release the lease before publishing. A client cannot observe
@@ -1755,6 +1873,10 @@ public final class LocalMCPServer: @unchecked Sendable {
     private func safeMessage(_ error: Error) -> String {
         if let error = error as? LocalMCPError { return error.description }
         return "Direct local operation failed."
+    }
+
+    private func structuredError(_ error: Error) -> JSONObject {
+        ["error": safeMessage(error), "error_detail": localErrorDetail(error)]
     }
 }
 
@@ -1858,12 +1980,31 @@ extension LocalMCPServer {
         executable["description"] = "Supported command ID such as sh, python3, swift or git; not an absolute path such as /bin/sh. Pass argv separately in arguments. If unsure, consult command_list once for available IDs and reuse the result."
         return [
             spec("work_task", "Track a parent task",
-                "Group a multi-step task; labels grant no access or authenticated identity. begin requires title and returns work_id plus a creator-only work_control_token on the shared Web tunnel. Carry both for related calls and update/finish; tokens are never listed in activity. Resume waiting_user with update status active before related calls. finish accepts completed/failed after jobs stop (default completed). update/finish may repeat workspace_id only if it matches the original scope. list returns up to 32 tasks, optionally filtered by registered workspace_id.",
+                "Group a multi-step task; labels grant no access or authenticated identity. Optional scheduler_context requires workspace_id, is owner-memory state, and exposes fired→worker_started→result_ready→persisted→acknowledged. persisted requires a retained work-owned write transaction whose path and SHA still match the workspace artifact; this is evidence-backed within the current owner, not durable scheduling across restart. Scheduled work cannot finish completed before acknowledgement. begin returns work_id plus a creator-only work_control_token on the shared Web tunnel. Carry both for related calls and update/finish; tokens are never listed in activity.",
                 properties: ["action": ["type": "string", "enum": ["begin", "update", "finish", "list"]],
                              "work_id": ["type": "string", "format": "uuid", "maxLength": 36],
                              "work_control_token": controlToken,
                              "title": stringSchema(maximumLength: 160), "chat_label": stringSchema(maximumLength: 160),
                              "workspace_id": workspaceID,
+                             "scheduler_context": ["type": "object", "additionalProperties": false,
+                                "properties": [
+                                    "schedule_id": stringSchema(maximumLength: 128),
+                                    "run_id": stringSchema(maximumLength: 128),
+                                    "scheduled_for": stringSchema(maximumLength: 64),
+                                    "fired_at": stringSchema(maximumLength: 64),
+                                    "attempt": integerSchema(minimum: 1, maximum: 1000),
+                                    "native_task_id": stringSchema(maximumLength: 128),
+                                    "native_run_id": stringSchema(maximumLength: 128),
+                                    "invocation_kind": ["type": "string", "enum": ["scheduled", "manual", "retry"]],
+                                    "parent_task_id": stringSchema(maximumLength: 128),
+                                ],
+                                "required": ["schedule_id", "run_id", "scheduled_for", "fired_at"]],
+                             "scheduler_phase": ["type": "string", "enum": ["worker_started", "result_ready", "persisted", "acknowledged"]],
+                             "artifact_path": path,
+                             "artifact_sha256": sha,
+                             "write_transaction_id": taskID,
+                             "persisted_at": stringSchema(maximumLength: 64),
+                             "acknowledgement_id": stringSchema(maximumLength: 128),
                              "status": ["type": "string", "enum": ["active", "waiting_user", "completed", "failed"]]],
                 required: ["action"], readOnly: false, destructiveHint: false, idempotentHint: false),
             spec(
@@ -1871,9 +2012,17 @@ extension LocalMCPServer {
                 "Report the direct local runtime identity and boundaries.", properties: [:],
                 required: [], readOnly: true),
             spec(
+                "bridge_diagnostic", "Bridge diagnostic",
+                "One-shot core diagnostic. Reports READY/DEGRADED/BLOCKED inputs without claiming host schemas are callable. Hosts must probe the named tools under binding_epoch and rebind when it changes.",
+                properties: [:], required: [], readOnly: true),
+            spec(
                 "workspace_overview", "Workspace overview",
                 "List registered workspaces. Relative paths or canonical absolute paths inside the selected root are accepted. Broad-access entries also disclose their root; credential paths remain blocked.",
                 properties: [:], required: [], readOnly: true),
+            spec(
+                "workspace_resolve", "Resolve workspace",
+                "Resolve one absolute local path to the most-specific registered workspace and relative path without registering or widening access.",
+                properties: ["path": path], required: ["path"], readOnly: true),
             spec(
                 "workspace_list", "Workspace list", "Deprecated compatibility alias; use workspace_overview for the same registered workspace list. Kept callable for existing chats.",
                 properties: [:], required: [], readOnly: true),
@@ -1895,18 +2044,11 @@ extension LocalMCPServer {
                 required: ["action", "workspace_id", "request_id"], readOnly: false,
                 destructiveHint: true, idempotentHint: true, openWorldHint: true),
             spec("desktop_open", "Open in Finder or a fixed viewer",
-                "Pop up a local folder in Finder (action=folder), reveal a local item without executing it (reveal), open a supported document in fixed Preview/TextEdit (file), or activate finder/preview/textedit (application). Requires the owner's allow_desktop_open workspace setting. Use instead of shell open/osascript, which remain blocked. No URLs, custom handlers, arbitrary app paths or permission changes. request_accepted means macOS accepted it, not that the window was visually verified.",
+                "Pop up a local folder in Finder (action=folder), reveal a local item without executing it (reveal), open a supported document in fixed Preview/TextEdit, open a local .html file in fixed Safari when application=safari, or activate finder/preview/textedit/safari (application). Requires the owner's allow_desktop_open workspace setting. No URLs, custom handlers, arbitrary app paths or permission changes. request_accepted means macOS accepted it, not that the window was visually verified.",
                 properties: ["workspace_id": workspaceID, "path": path,
                     "action": ["type": "string", "enum": DesktopOpen.actions],
                     "application": ["type": "string", "enum": DesktopOpen.applications.keys.sorted()]],
                 required: ["workspace_id", "action"], readOnly: false, destructiveHint: false, idempotentHint: false),
-            spec("computer_control", "Control one owner-approved application",
-                "Opt-in native macOS Accessibility for one already-running app with an owner-authored computer grant and OS permission. status checks permission without prompting; snapshot returns at most 128 UI nodes; focus activates the app; press/set_value require a fresh same-app snapshot_id and element_id. Each action returns a fresh bounded snapshot when possible. Grants expire within one hour; element references expire in 15 seconds and are consumed on action. No screenshots, global input, clipboard, browser internals or permission changes. App scope is not a filesystem sandbox. UI content is untrusted. Never replay outcome_unknown; inspect first. Use APIs/file tools before GUI control.",
-                properties: ["workspace_id": workspaceID, "bundle_id": stringSchema(maximumLength: 180),
-                    "action": ["type": "string", "enum": ["status"] + LocalComputerGrant.supportedActions],
-                    "snapshot_id": taskID, "element_id": integerSchema(minimum: 0, maximum: 127),
-                    "text": stringSchema(maximumLength: 4096)],
-                required: ["workspace_id", "bundle_id", "action"], readOnly: false, openWorldHint: true),
             spec(
                 "directory_list", "List directory",
                 "List one workspace directory with deterministic cursor pagination.",
@@ -1930,12 +2072,13 @@ extension LocalMCPServer {
                 required: ["workspace_id", "paths"], readOnly: true),
             spec(
                 "file_read_many", "Batch read files",
-                "Read initial chunks of 1...32 files within a shared byte budget. Check each result, complete, EOF and next_offset; continue partial files using file_read. UTF-8 chunks may finish a scalar by up to 3 bytes; total budget is never exceeded. Not an atomic snapshot.",
+                "Read initial chunks of 1...32 files within a shared byte budget. snapshot_consistent=true fingerprints every path before and after under the bridge mutation lock and rejects changed snapshots. Check each result, complete, EOF and next_offset; continue partial files using file_read.",
                 properties: ["workspace_id": workspaceID,
                     "paths": ["type": "array", "minItems": 1, "maxItems": 32, "items": path],
                     "encoding": ["type": "string", "enum": ["utf8", "base64"]],
                     "maximum_bytes_per_file": integerSchema(minimum: 1, maximum: 262_144),
-                    "maximum_total_bytes": integerSchema(minimum: 4, maximum: 1_048_576)],
+                    "maximum_total_bytes": integerSchema(minimum: 4, maximum: 1_048_576),
+                    "snapshot_consistent": booleanSchema()],
                 required: ["workspace_id", "paths"], readOnly: true),
             spec(
                 "file_read", "Read file",
@@ -1968,7 +2111,7 @@ extension LocalMCPServer {
                 properties: [
                     "workspace_id": workspaceID, "path": path, "content": content,
                     "encoding": ["type": "string", "enum": ["utf8", "base64"]],
-                    "expected_sha256": sha,
+                    "expected_sha256": sha, "create_only": booleanSchema(),
                 ], required: ["workspace_id", "path", "content"], readOnly: false),
             spec(
                 "file_patch", "Patch file",

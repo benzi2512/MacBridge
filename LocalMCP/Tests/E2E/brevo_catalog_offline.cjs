@@ -4,8 +4,12 @@ const fs = require('node:fs'), os = require('node:os'), path = require('node:pat
 const crypto = require('node:crypto'), {spawn} = require('node:child_process');
 const assert = require('node:assert/strict');
 const {RPCSession} = require('./rpc_session.cjs');
-const [binary, expectedHash, output] = process.argv.slice(2);
-assert(binary?.startsWith('/') && output?.startsWith('/'));
+const [binaryArgument, expectedHash, output] = process.argv.slice(2);
+assert(binaryArgument?.startsWith('/') && output?.startsWith('/'));
+// Match the core's own canonical executable identity. SwiftPM's release path
+// can be a symlink; allowing only that alias would deny the exact real file
+// when the reviewed core re-opens itself for its startup hash.
+const binary = fs.realpathSync(binaryArgument);
 assert(/^[0-9a-f]{64}$/.test(expectedHash));
 assert.equal(crypto.createHash('sha256').update(fs.readFileSync(binary)).digest('hex'), expectedHash);
 assert(!fs.existsSync(output), 'Do not overwrite evidence');
@@ -56,9 +60,9 @@ const probes = [
     assert.equal(init.protocolVersion, '2025-06-18');
     session.notify('notifications/initialized');
     const catalog = (await rpc('tools/list')).tools;
-    assert.equal(catalog.length, 72);
+    assert.equal(catalog.length, 76);
     const names = catalog.map(t => t.name), brevo = names.filter(n => n.startsWith('brevo_'));
-    assert.equal(new Set(names).size, 72); assert.equal(brevo.length, 12);
+    assert.equal(new Set(names).size, 76); assert.equal(brevo.length, 12);
     for (const name of brevo) {
       const spec = catalog.find(t => t.name === name);
       assert.equal(spec.inputSchema.additionalProperties, false);
@@ -81,19 +85,17 @@ const probes = [
     assert.equal(rejected.isError, true);
     assert(JSON.stringify(rejected).includes('confirm_write'));
     const identity = await tool('bridge_capabilities');
-    assert.equal(identity.catalog_count, 72);
+    assert.equal(identity.catalog_count, 76);
     assert.equal(identity.network_default, 'loopback_only');
     assert.equal(identity.mcp_executable_sha256, expectedHash);
     assert.equal(identity.desktop_open_enabled, false);
-    assert.equal(identity.computer_grants_configured, 0);
     const workspaceID = '11111111-2222-4333-8444-555555555555';
     for (const [name, args] of [
       ['desktop_open', {workspace_id: workspaceID, action: 'folder', path: '.'}],
-      ['computer_control', {workspace_id: workspaceID, bundle_id: 'com.apple.TextEdit', action: 'status'}],
       ['network_command', {workspace_id: workspaceID, grant_id: 'aaaaaaaa-1111-4222-8333-444444444444', executable: 'sh', arguments: ['-c', 'true']}],
     ]) {
       const result = await rpc('tools/call', {name, arguments: args});
-      assert.equal(result.isError, true, 'New desktop capabilities must be default off');
+      assert.equal(result.isError, true, 'Desktop and network capabilities must be default off');
     }
     assert(!JSON.stringify(evidence).includes('xkeysib-'));
     const ended = await session.stop();
@@ -113,7 +115,7 @@ const probes = [
   // Do not publish a PASS before clean child shutdown and fixture cleanup.
   assert(report);
   fs.writeFileSync(output, JSON.stringify(report, null, 2), {mode: 0o600, flag: 'wx'});
-  console.log(JSON.stringify({status: 'PASS', binary_sha256: expectedHash, catalog_count: 72,
+  console.log(JSON.stringify({status: 'PASS', binary_sha256: expectedHash, catalog_count: 76,
     catalog_sha256: report.identity.catalog_sha256, build_id: report.identity.build_id,
     dry_run_probes: probes.length, rpc_calls: session.sequence, output}));
 })().catch(error => { console.error(JSON.stringify({status: 'FAIL', code: error.code || error.name,

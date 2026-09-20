@@ -27,7 +27,7 @@ final class CatalogRefreshTests: XCTestCase {
         XCTAssertEqual(frames.count, 1)
         let initialized = try XCTUnwrap(frames.first?["result"] as? JSONObject)
         let capabilities = try XCTUnwrap(initialized["capabilities"] as? JSONObject)
-        XCTAssertEqual((capabilities["tools"] as? JSONObject)?["listChanged"] as? Bool, false)
+        XCTAssertEqual((capabilities["tools"] as? JSONObject)?["listChanged"] as? Bool, true)
     }
 
     func testResumedWebTunnelSessionReturnsOnlyOperationalToolResult() throws {
@@ -69,7 +69,7 @@ final class CatalogRefreshTests: XCTestCase {
         XCTAssertEqual(frames.count, 1)
         XCTAssertEqual(frames[0]["id"] as? Int, 9)
         let result = try XCTUnwrap(frames[0]["result"] as? JSONObject)
-        XCTAssertEqual((result["tools"] as? [JSONObject])?.count, 72)
+        XCTAssertEqual((result["tools"] as? [JSONObject])?.count, 76)
     }
 
     func testDesktopLocalDoesNotAdvertiseListChanged() throws {
@@ -89,7 +89,7 @@ final class CatalogRefreshTests: XCTestCase {
         ]))
         let result = try XCTUnwrap(response["result"] as? JSONObject)
         let capabilities = try XCTUnwrap(result["capabilities"] as? JSONObject)
-        XCTAssertEqual((capabilities["tools"] as? JSONObject)?["listChanged"] as? Bool, false)
+        XCTAssertEqual((capabilities["tools"] as? JSONObject)?["listChanged"] as? Bool, true)
     }
 
     private func run(_ server: LocalMCPServer, requests: [JSONObject]) throws -> [JSONObject] {

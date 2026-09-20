@@ -92,8 +92,15 @@ final class CompactSurfaceRenderingTests: XCTestCase {
             controller.show(layer, locked: layer != .rail && layer != .idle)
             // This host represents the settled target canvas. Let the controller
             // finish retaining any wider outgoing canvas before constructing it.
-            try await Task.sleep(nanoseconds: UInt64((MBMetrics.panelDuration + 0.05) * 1_000_000_000))
-            XCTAssertEqual(controller.windowLayer, layer)
+            // Poll the observable state because the transition task and this
+            // test continuation are scheduled independently under load.
+            let transitionDeadline = Date().addingTimeInterval(
+                max(1.0, MBMetrics.panelDuration + 0.5)
+            )
+            while controller.windowLayer != layer && Date() < transitionDeadline {
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            XCTAssertEqual(controller.windowLayer, layer, "transition case: \(name)")
             let size = FloatingDockLayout.size(for: layer, visibleFrame: visible,
                                        taskCount: model.compactSummary.tasks.count, edge: edge)
             let view = FloatingTabView(controller: controller)
@@ -135,9 +142,9 @@ final class CompactSurfaceRenderingTests: XCTestCase {
                     return color.alphaComponent > 0.1 && max(color.redComponent, color.greenComponent, color.blueComponent) > 0.1
                 }
             }
-            guard hasVisibleContent else {
-                throw XCTSkip("\(name): native compositor not captured by cacheDisplay; visual acceptance requires a live app window")
-            }
+            XCTAssertTrue(hasVisibleContent,
+                          "\(name): native compositor was not captured by cacheDisplay")
+            guard hasVisibleContent else { return }
             if let directory = ProcessInfo.processInfo.environment["MB_OBSERVER_RENDER_DIR"] {
                 try png.write(to: URL(fileURLWithPath: directory).appendingPathComponent("compact-\(name).png"), options: .atomic)
             }

@@ -247,6 +247,41 @@ final class WorkActivityTests: XCTestCase {
         XCTAssertEqual(store.list(jobs: nil)[0]["error_count"] as? Int, 129)
     }
 
+    func testLateRunningReceiptCannotReviveTerminalJob() throws {
+        let store = WorkActivity(), id = try begin(store)
+        let job = UUID().uuidString.lowercased()
+        _ = try store.beginCall(name: "command_start", arguments: ["work_id": id])
+        store.linkJob(["task_id": job, "running": true], workID: id)
+        let cancelOwner = try store.beginCall(name: "process_cancel", arguments: ["task_id": job])
+        store.finishCall(cancelOwner, name: "process_cancel",
+                         result: ["task_id": job, "running": false, "cancelled": true], failed: false)
+        // Simulate the older start invocation publishing after the newer
+        // terminal cancellation receipt.
+        store.finishCall(id, name: "command_start",
+                         result: ["task_id": job, "running": true], failed: false)
+        let parent = store.list(jobs: nil)[0]
+        XCTAssertEqual(parent["phase"] as? String, "waiting_next_step")
+        XCTAssertEqual(parent["active_call_count"] as? Int, 0)
+    }
+
+    func testRejectedCommandAtJobCapacityDoesNotEvictRetainedOwnership() throws {
+        let store = WorkActivity(), id = try begin(store)
+        var jobs: [String] = []
+        for _ in 0..<WorkActivity.maximumJobsPerItem {
+            let job = UUID().uuidString.lowercased()
+            jobs.append(job)
+            _ = try store.beginCall(name: "command_start", arguments: ["work_id": id])
+            store.finishCall(id, name: "command_start",
+                             result: ["task_id": job, "running": false], failed: false)
+        }
+        let before = try XCTUnwrap(store.list(jobs: nil)[0]["job_ids"] as? [String])
+        XCTAssertEqual(before, jobs)
+        _ = try store.beginCall(name: "command_start", arguments: ["work_id": id])
+        store.finishCall(id, name: "command_start", result: [:], failed: true)
+        XCTAssertEqual(store.list(jobs: nil)[0]["job_ids"] as? [String], jobs)
+        XCTAssertEqual(try store.beginCall(name: "process_status", arguments: ["task_id": jobs[0]]), id)
+    }
+
     func testMixedOwnerBatchReconcilesOnlySuccessfulMatchingRetainedJobs() throws {
         let store = WorkActivity(), a = try begin(store, title: "A"), b = try begin(store, title: "B")
         let jobA = UUID().uuidString.lowercased(), jobB = UUID().uuidString.lowercased()
@@ -317,7 +352,7 @@ final class WorkActivityTests: XCTestCase {
 
     func testCatalogHasExplicitBoundedGroupingWithoutChangingReadOnlyFlags() throws {
         let specs = LocalMCPServer.toolSpecs
-        XCTAssertEqual(specs.count, 72)
+        XCTAssertEqual(specs.count, 76)
         for spec in specs {
             let name = try XCTUnwrap(spec["name"] as? String)
             let schema = try XCTUnwrap(spec["inputSchema"] as? JSONObject)
@@ -327,6 +362,157 @@ final class WorkActivityTests: XCTestCase {
         }
         let read = try XCTUnwrap(specs.first { $0["name"] as? String == "file_read" })
         XCTAssertEqual((read["annotations"] as? JSONObject)?["readOnlyHint"] as? Bool, true)
+    }
+
+    func testScheduledWorkRequiresPersistedAcknowledgedArtifactBeforeCompletion() throws {
+        let store = WorkActivity()
+        let workspace = UUID().uuidString.lowercased()
+        XCTAssertThrowsError(try store.manage([
+            "action": "begin", "title": "Missing scheduler workspace",
+            "scheduler_context": [
+                "schedule_id": "missing-workspace", "run_id": "run",
+                "scheduled_for": "2026-09-17T00:00:00Z",
+                "fired_at": "2026-09-17T00:00:01Z",
+            ],
+        ], validWorkspaces: Set([workspace]), jobs: [], now: 0))
+        let started = try store.manage([
+            "action": "begin", "title": "Scheduled fixture", "workspace_id": workspace,
+            "scheduler_context": [
+                "schedule_id": "schedule-1", "run_id": "run-1",
+                "scheduled_for": "2026-09-17T00:00:00Z",
+                "fired_at": "2026-09-17T00:00:01Z", "attempt": 1,
+                "native_task_id": "native-task-1", "native_run_id": "native-run-1",
+                "invocation_kind": "scheduled", "parent_task_id": "parent-task-1",
+            ],
+        ], validWorkspaces: Set([workspace]), jobs: [], now: 1)
+        let id = try XCTUnwrap(started["work_id"] as? String)
+        XCTAssertEqual((started["scheduler"] as? JSONObject)?["phase"] as? String, "fired")
+        XCTAssertEqual((started["scheduler"] as? JSONObject)?["native_task_id"] as? String, "native-task-1")
+        XCTAssertThrowsError(try store.manage([
+            "action": "finish", "work_id": id, "status": "completed",
+        ], validWorkspaces: Set([workspace]), jobs: [], now: 2))
+        _ = try store.manage([
+            "action": "update", "work_id": id, "scheduler_phase": "worker_started",
+        ], validWorkspaces: Set([workspace]), jobs: [], now: 3)
+        let hash = String(repeating: "a", count: 64)
+        _ = try store.manage([
+            "action": "update", "work_id": id, "scheduler_phase": "result_ready",
+            "artifact_path": "reports/result.json", "artifact_sha256": hash,
+        ], validWorkspaces: Set([workspace]), jobs: [], now: 4)
+        let beforeRejectedPersist = store.list(jobs: [], now: 4)[0]
+        XCTAssertThrowsError(try store.manage([
+            "action": "update", "work_id": id, "title": "Must not apply",
+            "scheduler_phase": "persisted",
+            "artifact_path": "reports/result.json", "artifact_sha256": hash,
+            "write_transaction_id": UUID().uuidString.lowercased(),
+            "persisted_at": "2026-09-17T00:00:02Z",
+        ], validWorkspaces: Set([workspace]), jobs: [], now: 5))
+        let afterRejectedPersist = store.list(jobs: [], now: 5)[0]
+        XCTAssertEqual(
+            (afterRejectedPersist["scheduler"] as? JSONObject)?["phase"] as? String,
+            (beforeRejectedPersist["scheduler"] as? JSONObject)?["phase"] as? String
+        )
+        XCTAssertEqual(afterRejectedPersist["title"] as? String, "Scheduled fixture")
+        XCTAssertThrowsError(try store.manage([
+            "action": "finish", "work_id": id, "status": "completed",
+            "scheduler_phase": "persisted", "artifact_path": "reports/result.json",
+            "artifact_sha256": hash, "write_transaction_id": UUID().uuidString,
+            "persisted_at": "2026-09-17T00:00:02Z",
+        ], validWorkspaces: Set([workspace]), jobs: [], now: 5,
+           persistenceVerified: true))
+        XCTAssertEqual(
+            (store.list(jobs: [], now: 5)[0]["scheduler"] as? JSONObject)?["phase"] as? String,
+            "result_ready"
+        )
+        _ = try store.manage([
+            "action": "update", "work_id": id, "scheduler_phase": "persisted",
+            "artifact_path": "reports/result.json", "artifact_sha256": hash,
+            "write_transaction_id": UUID().uuidString.lowercased(),
+            "persisted_at": "2026-09-17T00:00:02Z",
+        ], validWorkspaces: Set([workspace]), jobs: [], now: 5, persistenceVerified: true)
+        _ = try store.manage([
+            "action": "update", "work_id": id, "scheduler_phase": "acknowledged",
+            "acknowledgement_id": "ack-1",
+        ], validWorkspaces: Set([workspace]), jobs: [], now: 6)
+        let finished = try store.manage([
+            "action": "finish", "work_id": id, "status": "completed",
+        ], validWorkspaces: Set([workspace]), jobs: [], now: 7)
+        XCTAssertEqual(finished["state"] as? String, "completed")
+        XCTAssertEqual((finished["scheduler"] as? JSONObject)?["phase"] as? String, "acknowledged")
+    }
+
+    func testInvalidBeginAtCapacityDoesNotEvictFinishedWork() throws {
+        let store = WorkActivity()
+        var ids: [String] = []
+        for index in 0..<WorkActivity.maximumItems {
+            ids.append(try begin(store, title: "Item \(index)", now: Int64(index + 1)))
+        }
+        _ = try store.manage(
+            ["action": "finish", "work_id": ids[0], "status": "completed"],
+            validWorkspaces: [], jobs: [], now: 100
+        )
+        XCTAssertThrowsError(try store.manage([
+            "action": "begin", "title": "Invalid scheduled replacement",
+            "scheduler_context": [
+                "schedule_id": "schedule", "run_id": "run",
+                "scheduled_for": "not-a-date", "fired_at": "also-not-a-date",
+            ],
+        ], validWorkspaces: [], jobs: [], now: 101))
+        let retained = store.list(jobs: [], now: 101)
+        XCTAssertEqual(retained.count, WorkActivity.maximumItems)
+        XCTAssertTrue(retained.contains { $0["work_id"] as? String == ids[0] })
+    }
+
+    func testServerRequiresRealWorkOwnedArtifactTransactionForPersistedPhase() throws {
+        let fixture = try Fixture(); defer { fixture.remove() }
+        let package = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        let server = try LocalMCPServer(
+            configurationURL: fixture.config,
+            selfExecutable: package.appendingPathComponent(".build/debug/macbridge-mcp")
+        )
+        let started = try server.callTool(name: "work_task", arguments: [
+            "action": "begin", "title": "Scheduled persisted fixture",
+            "workspace_id": fixture.workspaceID,
+            "scheduler_context": [
+                "schedule_id": "schedule-real", "run_id": "run-real",
+                "scheduled_for": "2026-09-17T00:00:00Z",
+                "fired_at": "2026-09-17T00:00:01Z",
+            ],
+        ])
+        let workID = try XCTUnwrap(started["work_id"] as? String)
+        _ = try server.callTool(name: "work_task", arguments: [
+            "action": "update", "work_id": workID, "scheduler_phase": "worker_started",
+        ])
+        let bytes = Data("verified artifact".utf8), hash = LocalHash.sha256(bytes)
+        _ = try server.callTool(name: "work_task", arguments: [
+            "action": "update", "work_id": workID, "scheduler_phase": "result_ready",
+            "artifact_path": "artifact.txt", "artifact_sha256": hash,
+        ])
+        XCTAssertThrowsError(try server.callTool(name: "work_task", arguments: [
+            "action": "update", "work_id": workID, "workspace_id": fixture.workspaceID,
+            "scheduler_phase": "persisted", "artifact_path": "artifact.txt",
+            "artifact_sha256": hash, "write_transaction_id": UUID().uuidString.lowercased(),
+            "persisted_at": "2026-09-17T00:00:02Z",
+        ]))
+        let write = try server.callTool(name: "file_write", arguments: [
+            "work_id": workID, "workspace_id": fixture.workspaceID,
+            "path": "artifact.txt", "content": "verified artifact", "create_only": true,
+        ])
+        let transactionID = try XCTUnwrap(write["transaction_id"] as? String)
+        _ = try server.callTool(name: "work_task", arguments: [
+            "action": "update", "work_id": workID, "workspace_id": fixture.workspaceID,
+            "scheduler_phase": "persisted", "artifact_path": "artifact.txt",
+            "artifact_sha256": hash, "write_transaction_id": transactionID,
+            "persisted_at": "2026-09-17T00:00:02Z",
+        ])
+        _ = try server.callTool(name: "work_task", arguments: [
+            "action": "update", "work_id": workID, "scheduler_phase": "acknowledged",
+            "acknowledgement_id": "ack-real",
+        ])
+        XCTAssertEqual(try server.callTool(name: "work_task", arguments: [
+            "action": "finish", "work_id": workID, "status": "completed",
+        ])["state"] as? String, "completed")
     }
 
     func testRealCommandFailureAndCachedStatusDoNotInflateParentErrors() throws {

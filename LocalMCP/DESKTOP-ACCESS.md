@@ -1,9 +1,8 @@
 # Desktop access candidate: explicit actions, default off
 
-These three new tools extend the existing MB core; they do not replace Codex's
+These two tools extend the existing MB core; they do not replace Codex's
 computer-use runtime or turn a normal Chat into Codex. There is no extra model,
 new plugin registration, privileged helper or automatic permission grant.
-The source catalog has 72 tools (including the separate opt-in media transfer).
 Deployment, host discovery, actual calls and
 native OS behavior must each be verified separately.
 
@@ -12,6 +11,11 @@ Enabled grants must be loaded from an owner policy file directly inside
 A custom configuration stored in a writable project cannot self-enable these
 capabilities by editing itself and calling `workspace_reload`. The usual owner
 configuration already uses this protected location. No tool creates grants.
+
+Grant additions and renewals become visible only after `workspace_reload`.
+That reload is deliberately refused while retained processes or undo transactions
+exist, so grant renewal may require a maintenance checkpoint; it is not a live
+hot-reload promise.
 
 ## 1. Pop up the requested folder
 
@@ -29,14 +33,16 @@ or undo need to be preserved.
 | --- | --- |
 | `folder` | Existing directory inside the allowed workspace; show its contents in Finder. |
 | `reveal` | Existing regular file or directory; select the item in Finder without opening it. |
-| `file` | Supported non-executable, single-link regular document; fixed Preview/TextEdit. |
-| `application` | No path; `application` must be `finder`, `preview` or `textedit`. |
+| `file` | Supported non-executable, single-link regular document; fixed Preview/TextEdit, plus local `.html` in fixed Safari when explicitly selected. |
+| `application` | No path; `application` must be `finder`, `preview`, `textedit` or `safari`. |
 
 Relative and in-workspace absolute paths are accepted, including spaces and
 Unicode. No shell interpolation. URLs, NUL/control characters, `~`, traversal,
 symlinks and sensitive credential paths are refused. App/document bundles are
 reveal-only. Preview supports PNG/JPEG/HEIC/TIFF/GIF/WebP/PDF; TextEdit supports
 plain text and common source/config extensions listed in `DesktopOpen.swift`.
+Safari support is local-file presentation only. It does not add Chrome control,
+browser tabs, screenshots, cookies, a browser protocol, web navigation or URL opening.
 This does not certify arbitrary document content as safe to parse.
 
 The receipt distinguishes `request_accepted: true` from
@@ -112,77 +118,18 @@ Use existing process status/output/cancel tools with the returned `task_id`.
 Those receipts retain the grant ID/expiry and label relay use even after output
 is drained. They never include the proxy password or process environment by design.
 
-## 3. Selected-application Accessibility control
-
-Prefer MB file/command tools and purpose-built connectors. Use UI control only
-when those cannot fulfill the user's request. No screenshot loop, continuous
-polling, coordinate clicks, keyboard injection, clipboard, browser cookies,
-browser protocol, AppleScript, global event monitor or extra model is included.
-
-The owner first reviews the actual installed app identity and a scoped task.
-The local workspace may then contain an expiring `computer_grants` entry:
-
-```json
-{
-  "bundle_id": "com.apple.TextEdit",
-  "actions": ["snapshot", "focus", "press", "set_value"],
-  "expires_at": "<approved ISO-8601 UTC time within one hour>"
-}
-```
-
-`snapshot` is mandatory even with mutation grants because actions include
-readback. For inspection only, grant just `snapshot`. A bundle ID is a target
-selector, not proof of source/publisher. The app must already be running as one
-unambiguous process. Known shell, system-settings and credential apps are
-blocked; this is not a complete classification of every potentially dangerous
-application. Approving a UI grant can let the approved app affect files/services
-outside the MB workspace using that app's permissions. It is **not** an
-alternative filesystem sandbox. Do not grant a general-purpose browser/editor
-access to unrelated sensitive tabs/documents and assume MB can contain it.
-
-macOS Accessibility approval for the exact MB execution identity is a separate
-user action. `status` returns permission state without prompting; it cannot
-grant permission. Screen Recording and Full Disk Access are not requested.
-
-```json
-{"workspace_id":"<UUID>","bundle_id":"com.apple.TextEdit","action":"snapshot"}
-```
-
-`snapshot` gives at most 128 AX nodes with bounded role/title/value fields, plus
-`snapshot_id`, element IDs, parent IDs and allowed actions. Parent IDs preserve
-window hierarchy so identically labelled controls can be distinguished; do not
-guess a target when the tree is partial or ambiguous. Native traversal aims for a
-350-ms budget with bounded per-AX-message timeouts; this is not a strict bound
-on OS scheduling or a measured end-to-end latency guarantee. Secure AX fields
-are omitted; document/text-area contents are not requested. A custom app may
-mislabel sensitive UI, so only use approved content in scope.
-
-`press` / `set_value` require a same-workspace/app/PID/launch snapshot no older
-than 15 seconds and an approved frontmost app. `set_value` accepts at most
-4,096 UTF-8 bytes. References are consumed before mutations, even on timeout.
-`focus` activates the approved app but does not launch it. Successful actions
-attempt a fresh snapshot in the same tool call to save a second round trip.
-
-An ambiguous timeout returns `outcome_unknown`, protocol `isError: true`,
-`action_performed: null` and `retry_safe: false`. Inspect a fresh snapshot before
-deciding whether to retry. Successful action with unavailable readback reports
-`action_accepted_snapshot_unavailable`, not “nothing happened.” A snapshot is
-UI evidence, not proof the user's overall task is done.
-
 ## Speed, acceptance and deployment
 
-Direct AX operations can avoid repeated screenshots and coordinate inference,
-but an MB-to-ChatGPT tunnel still has host/model/transport overhead. No equality
-with Codex speed is claimed before measured native and normal-Chat tests.
-This v1 cannot handle every graphical app or arbitrary browser UI.
+An MB-to-ChatGPT tunnel still has host/model/transport overhead. No equality
+with Codex speed is claimed before measured normal-Chat tests. MacBridge does
+not expose general browser or computer control.
 
 Qualification separates:
 
-1. Default-off, path, grant, wrong-target, expiry and unknown-outcome unit tests.
+1. Default-off, path, network-grant, expiry and unknown-outcome unit tests.
 2. Synthetic protocol tests and real sandboxed child/proxy tests with no public
    upstream, production credential or GUI-control effects.
-3. Exact approved candidate's native Finder/document test and isolated TextEdit
-   control test, with OS permission decided by the owner.
+3. Exact approved candidate's native Finder/document test.
 4. Explicitly approved public-destination test and normal-Chat host discovery,
    invocation, visible result, cancellation and stale-schema checks.
 

@@ -30,8 +30,9 @@ EXPECTED_TOOLS.update({'tool_catalog', 'workspace_inspect', 'file_read_lines', '
     'git_blame', 'git_file_list', 'brevo_read', 'brevo_campaign',
     'brevo_contacts', 'brevo_lists', 'brevo_segments', 'brevo_automations', 'brevo_templates',
     'brevo_events', 'brevo_transactional', 'brevo_deliverability', 'brevo_webhooks', 'brevo_reports'})
-EXPECTED_TOOLS.update({'media_inspect', 'media_share', 'desktop_open', 'network_command',
-    'computer_control'})
+EXPECTED_TOOLS.update({'media_inspect', 'media_share', 'desktop_open', 'network_command'})
+EXPECTED_TOOLS.update({'bridge_diagnostic', 'workspace_resolve', 'project_read_bundle',
+    'file_json_patch', 'artifact_snapshot'})
 
 def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
@@ -446,6 +447,50 @@ def run_gate(args: argparse.Namespace, evidence: Evidence, root: Path) -> dict[s
                 'arguments': ['-c', 'pwd'], 'cwd': str(workspace), 'timeout_milliseconds': 5000})
             evidence.check(command.get('exit_code') == 0 and command.get('stdout', '').strip() == str(workspace),
                            'absolute cwd resolves within the same scoped workspace')
+        with evidence.section('binding_callability_and_cas_acceptance'):
+            # Mirrors the real-workload acceptance gate: once capabilities and
+            # workspace discovery succeed, the advertised file primitives must
+            # remain callable for the rest of the same binding.
+            for index in range(100):
+                if index % 2 == 0:
+                    result = client.tool('file_stat', {
+                        'workspace_id': workspace_id, 'path': 'sentinel.txt',
+                    })
+                    evidence.check(result.get('path', {}).get('sha256') == sentinel_hash,
+                                   f'file_stat remains callable at iteration {index + 1}')
+                else:
+                    result = client.tool('file_read', {
+                        'workspace_id': workspace_id, 'path': 'sentinel.txt',
+                    })
+                    evidence.check(result.get('file', {}).get('sha256') == sentinel_hash,
+                                   f'file_read remains callable at iteration {index + 1}')
+
+            cas_transactions: list[str] = []
+            initial = client.tool('file_write', {
+                'workspace_id': workspace_id,
+                'path': 'binding-cas-fixture.txt',
+                'content': 'binding-cas-0\n',
+                'create_only': True,
+            })
+            cas_transactions.append(str(initial['transaction_id']))
+            current_sha = str(initial['post_sha256'])
+            for index in range(1, 21):
+                updated = client.tool('file_write', {
+                    'workspace_id': workspace_id,
+                    'path': 'binding-cas-fixture.txt',
+                    'content': f'binding-cas-{index}\n',
+                    'expected_sha256': current_sha,
+                })
+                evidence.check(updated.get('pre_sha256') == current_sha,
+                               f'CAS write {index} used the exact current revision')
+                current_sha = str(updated['post_sha256'])
+                cas_transactions.append(str(updated['transaction_id']))
+            evidence.check(sha256_file(workspace / 'binding-cas-fixture.txt') == current_sha,
+                           '20 CAS writes match independent filesystem hash')
+            for transaction_id in reversed(cas_transactions):
+                client.tool('transaction_restore', {'transaction_id': transaction_id})
+            evidence.check(not (workspace / 'binding-cas-fixture.txt').exists(),
+                           'binding acceptance fixture rolls back without residue')
         with evidence.section('batch_reads_and_completed_status'):
             compact_catalog = client.tool('tool_catalog')
             evidence.check(compact_catalog.get('detail') == 'index'
@@ -493,11 +538,15 @@ def run_gate(args: argparse.Namespace, evidence: Evidence, root: Path) -> dict[s
             evidence.check(any(row['executable'] == 'git' and row['available'] for row in commands), 'typed executable discovery resolves Git')
             created = client.tool('file_write_many', {'workspace_id': workspace_id, 'files': [
                 {'path': 'expanded-a.txt', 'content': 'alpha🙂\r\nbeta\n'},
-                {'path': 'expanded-b.txt', 'content': 'alpha🙂\r\nbeta\n'},
-                {'path': 'missing-dir/fail.txt', 'content': 'not written'}]})
-            evidence.check(created['success_count'] == 2 and created['error_count'] == 1 and created['batch_atomic'] is False,
-                           'batch writes preserve explicit partial receipts')
-            created_ids = [row['receipt']['transaction_id'] for row in created['results'] if row['status'] == 'ok']
+                {'path': 'expanded-b.txt', 'content': 'alpha🙂\r\nbeta\n'}]})
+            evidence.check(
+                created['success_count'] == 2
+                and created['error_count'] == 0
+                and created['batch_atomic'] is False
+                and created['all_or_compensated'] is True
+                and created['crash_atomic'] is False,
+                'batch writes use one undo receipt and honest verified compensation semantics')
+            created_ids = [created['transaction_id']]
             lines = client.tool('file_read_lines', {'workspace_id': workspace_id, 'path': 'expanded-a.txt', 'maximum_lines': 1})
             evidence.check(lines['content'] == 'alpha🙂\r\n' and lines['next_line'] == 2 and lines['total_lines'] == 2,
                            'line reading preserves CRLF and cursor')

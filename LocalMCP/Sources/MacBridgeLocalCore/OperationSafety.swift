@@ -6,6 +6,11 @@ import Foundation
 /// It prevents a broad workspace from turning a routine project command or a
 /// recoverable remove into a machine-wide/home-wide operation.
 enum OperationSafety {
+    struct CommandScopePolicy {
+        let rootURL: URL
+        let readOnly: Bool
+    }
+
     private static var userDataAnchors: [String] {
         let home = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path
         return [home] + ["Desktop", "Documents", "Downloads", "Library", "Movies", "Music", "Pictures", "Public"]
@@ -62,25 +67,70 @@ enum OperationSafety {
         }
     }
 
+    /// Refuse any mutation of a protected object or a directory that contains it.
+    /// The identity walk also catches alternate casing on case-insensitive APFS.
+    static func validateMutationTarget(_ target: URL, protectedPaths: Set<String>) throws {
+        guard !protectedPaths.isEmpty else { return }
+        let targetPath = target.standardizedFileURL.path
+        var targetStatus = stat()
+        let targetExists = lstat(targetPath, &targetStatus) == 0
+        for protectedPath in protectedPaths {
+            let protected = URL(fileURLWithPath: protectedPath).standardizedFileURL
+            let protectedValue = protected.path
+            if targetPath == protectedValue
+                || protectedValue.hasPrefix(targetPath == "/" ? "/" : targetPath + "/") {
+                throw LocalMCPError.sensitivePathBlocked
+            }
+            guard targetExists else { continue }
+            var ancestor = protected
+            while true {
+                var ancestorStatus = stat()
+                if lstat(ancestor.path, &ancestorStatus) == 0,
+                   ancestorStatus.st_dev == targetStatus.st_dev,
+                   ancestorStatus.st_ino == targetStatus.st_ino {
+                    throw LocalMCPError.sensitivePathBlocked
+                }
+                if ancestor.path == "/" { break }
+                ancestor.deleteLastPathComponent()
+            }
+        }
+    }
+
     /// Narrow/bounded workspaces keep their normal project-wide command scope.
     /// A broad root (or a configured top-level data folder) is different: the
     /// command receives only its explicit cwd subtree. The caller can still work
     /// anywhere by choosing a specific project/folder, but not use `/` or the
     /// account home as an implicit machine-wide command sandbox.
-    static func commandScope(
+    static func commandScopePolicy(
         workspace: RegisteredLocalWorkspace,
         workingDirectory: URL
-    ) throws -> URL {
+    ) throws -> CommandScopePolicy {
         let root = workspace.rootURL.standardizedFileURL.path
         guard workspace.allowsBroadAccess || isProtectedAnchor(root) else {
-            return workspace.rootURL
+            return CommandScopePolicy(rootURL: workspace.rootURL, readOnly: false)
         }
         let cwd = workingDirectory.standardizedFileURL.path
+        let downloads = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Downloads", isDirectory: true).standardizedFileURL.path
+        // A caller may explicitly inspect the Downloads root, but that broad
+        // user-data anchor must never become a command-writable workspace.
+        if matchesAnchor(cwd, anchors: [downloads]) {
+            return CommandScopePolicy(rootURL: workingDirectory, readOnly: true)
+        }
         guard !isProtectedAnchor(cwd) else {
             throw LocalMCPError.invalidPath(
                 "broad commands require an explicit cwd below a project or task folder"
             )
         }
-        return workingDirectory
+        return CommandScopePolicy(rootURL: workingDirectory, readOnly: false)
+    }
+
+    static func commandScope(
+        workspace: RegisteredLocalWorkspace,
+        workingDirectory: URL
+    ) throws -> URL {
+        try commandScopePolicy(
+            workspace: workspace, workingDirectory: workingDirectory
+        ).rootURL
     }
 }

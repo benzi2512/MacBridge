@@ -1,14 +1,11 @@
 import XCTest
 @testable import MacBridgeObserver
 
-/// Opt-in, deterministic model-only workload. No windows, sockets, file reads,
-/// owner jobs or wall-clock sleeps. Timings are evidence, not a 120 Hz claim.
+/// Deterministic model-only workload. No windows, sockets, file reads, owner
+/// jobs or wall-clock sleeps. Timings are evidence, not a 120 Hz claim.
 final class ObserverFeedPerformanceTests: XCTestCase {
     @MainActor
     func testRepeatedSurfaceReads() throws {
-        guard ProcessInfo.processInfo.environment["MB_OBSERVER_FEED_BENCHMARK"] == "1" else {
-            throw XCTSkip("Opt-in release-mode activity-feed microbenchmark")
-        }
         let model = ObserverModel()
         model.connected = true
         model.updateSnapshot(Self.fixture, now: Date(timeIntervalSince1970: 1000))

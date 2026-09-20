@@ -17,9 +17,6 @@ final class ObserverFeedSoakTests: XCTestCase {
 
     @MainActor
     func testSustainedSnapshotChurnReleasesOldPayloadsAndKeepsScopesAccurate() throws {
-        guard ProcessInfo.processInfo.environment["MB_OBSERVER_FEED_SOAK"] == "1" else {
-            throw XCTSkip("Opt-in release-mode model memory/churn qualification")
-        }
         var model: ObserverModel? = ObserverModel()
         weak var weakModel = model
         var previous: WeakPayload?

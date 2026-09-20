@@ -10,7 +10,12 @@ let package = Package(
         .executable(name: "macbridge-observer", targets: ["MacBridgeObserver"]),
     ],
     targets: [
-        .target(name: "MacBridgeLocalCore"),
+        .target(
+            name: "MacBridgeLocalCore",
+            linkerSettings: [
+                .linkedFramework("AppKit"),
+            ]
+        ),
         .executableTarget(name: "MacBridgeObserver", dependencies: ["MacBridgeLocalCore"]),
         .executableTarget(
             name: "MacBridgeLocalMCP",

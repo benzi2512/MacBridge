@@ -5,6 +5,82 @@ import XCTest
 @testable import MacBridgeLocalCore
 
 final class WorkspaceMutationBoundaryTests: XCTestCase {
+    func testAtomicWriteAppliesRequestedModeDespiteProcessUmask() throws {
+        let fixture = try Fixture(); defer { fixture.remove() }
+        let directory = try WorkspaceDirectory(fixture.workspace)
+        try directory.atomicWrite(
+            Data("mode".utf8), name: "mode.txt", mode: 0o666, replacing: false
+        )
+        XCTAssertEqual(
+            posixMode(try lstatValue(fixture.workspace.appendingPathComponent("mode.txt").path)),
+            0o666
+        )
+    }
+
+    func testProtectedRuntimeFileAndContainingDirectoryRejectAllMutationPaths() throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let runtimeDirectory = fixture.workspace.appendingPathComponent("runtime")
+        try FileManager.default.createDirectory(at: runtimeDirectory, withIntermediateDirectories: false)
+        let runtime = runtimeDirectory.appendingPathComponent("macbridge-mcp")
+        let original = Data("reviewed runtime".utf8)
+        try original.write(to: runtime)
+        let service = LocalWorkspaceService(
+            registry: try LocalWorkspaceRegistry(configurationURL: fixture.config),
+            protectedMutationPaths: [runtime.path]
+        )
+
+        XCTAssertThrowsError(try service.writeFile(
+            workspaceID: fixture.workspaceID, path: "runtime/macbridge-mcp",
+            content: "replacement", encoding: "utf8",
+            expectedSHA256: LocalHash.sha256(original)
+        ))
+        XCTAssertThrowsError(try service.appendFile(
+            workspaceID: fixture.workspaceID, path: "runtime/macbridge-mcp",
+            content: "append", encoding: "utf8",
+            expectedSHA256: LocalHash.sha256(original)
+        ))
+        XCTAssertThrowsError(try service.patchFile(
+            workspaceID: fixture.workspaceID, path: "runtime/macbridge-mcp",
+            oldText: "reviewed", newText: "replacement", replaceAll: false,
+            expectedSHA256: LocalHash.sha256(original)
+        ))
+        XCTAssertThrowsError(try service.writeFilesAtomic(
+            workspaceID: fixture.workspaceID,
+            requests: [
+                AtomicFileWriteRequest(
+                    path: "ordinary-batch.txt", content: "must not be created",
+                    expectedSHA256: nil, createOnly: true
+                ),
+                AtomicFileWriteRequest(
+                    path: "runtime/macbridge-mcp", content: "replacement",
+                    expectedSHA256: LocalHash.sha256(original), createOnly: false
+                ),
+            ]
+        ))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: fixture.workspace.appendingPathComponent("ordinary-batch.txt").path
+        ))
+        XCTAssertThrowsError(try service.movePath(
+            workspaceID: fixture.workspaceID,
+            sourcePath: "runtime/macbridge-mcp", destinationPath: "moved-core"
+        ))
+        XCTAssertThrowsError(try service.movePath(
+            workspaceID: fixture.workspaceID,
+            sourcePath: "runtime", destinationPath: "moved-runtime"
+        ))
+        XCTAssertThrowsError(try service.removePath(
+            workspaceID: fixture.workspaceID, path: "runtime"
+        ))
+        XCTAssertEqual(try Data(contentsOf: runtime), original)
+        XCTAssertEqual(service.retainedTransactionCount, 0)
+
+        XCTAssertNoThrow(try service.writeFile(
+            workspaceID: fixture.workspaceID, path: "ordinary.txt",
+            content: "allowed", encoding: "utf8", expectedSHA256: nil
+        ))
+    }
+
     func testTreeSnapshotRejectsChildInsertedAfterDirectoryEnumeration() throws {
         let fixture = try Fixture()
         defer { fixture.remove() }
@@ -167,6 +243,374 @@ final class WorkspaceMutationBoundaryTests: XCTestCase {
         XCTAssertEqual(service.retainedTransactionCount, 0)
     }
 
+    func testDirectoryCreateDoesNotAdoptConcurrentAdditionIntoUndo() throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let destination = fixture.workspace.appendingPathComponent("created")
+        let service = LocalWorkspaceService(
+            registry: try LocalWorkspaceRegistry(configurationURL: fixture.config),
+            transactionLimit: 10, undoFileByteLimit: 1_048_576,
+            afterRelocationBeforeSnapshotForTesting: { operation, _, relocated in
+                guard operation == "create" else { return }
+                XCTAssertEqual(relocated, destination)
+                try Data("external".utf8).write(
+                    to: relocated.appendingPathComponent("keep.txt")
+                )
+            }
+        )
+
+        XCTAssertThrowsError(try service.createDirectory(
+            workspaceID: fixture.workspaceID, path: "created"
+        ))
+        let receipt = try XCTUnwrap(
+            (try service.listTransactions()["transactions"] as? [JSONObject])?.first
+        )
+        XCTAssertEqual(receipt["kind"] as? String, "created_path")
+        let transactionID = try XCTUnwrap(receipt["transaction_id"] as? String)
+        XCTAssertThrowsError(try service.restoreTransaction(transactionID))
+        XCTAssertEqual(
+            try String(contentsOf: destination.appendingPathComponent("keep.txt"), encoding: .utf8),
+            "external"
+        )
+        _ = try service.acceptTransactions([transactionID])
+    }
+
+    func testDirectoryCreateSnapshotFailureRestoresUnchangedPublishedDirectory() throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let destination = fixture.workspace.appendingPathComponent("created")
+        let service = LocalWorkspaceService(
+            registry: try LocalWorkspaceRegistry(configurationURL: fixture.config),
+            transactionLimit: 10, undoFileByteLimit: 1_048_576,
+            afterRelocationBeforeSnapshotForTesting: { operation, _, relocated in
+                guard operation == "create" else { return }
+                XCTAssertEqual(relocated, destination)
+                throw LocalMCPError.operationFailed("injected post-publication failure")
+            }
+        )
+
+        XCTAssertThrowsError(try service.createDirectory(
+            workspaceID: fixture.workspaceID, path: "created"
+        ))
+        let receipt = try XCTUnwrap(
+            (try service.listTransactions()["transactions"] as? [JSONObject])?.first
+        )
+        let transactionID = try XCTUnwrap(receipt["transaction_id"] as? String)
+        _ = try service.restoreTransaction(transactionID)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+        XCTAssertEqual(service.retainedTransactionCount, 0)
+    }
+
+    func testDirectoryCreateFallbackDoesNotAdoptRootTimestampChange() throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let destination = fixture.workspace.appendingPathComponent("created")
+        let service = LocalWorkspaceService(
+            registry: try LocalWorkspaceRegistry(configurationURL: fixture.config),
+            transactionLimit: 10, undoFileByteLimit: 1_048_576,
+            afterRelocationBeforeSnapshotForTesting: { operation, _, relocated in
+                guard operation == "create" else { return }
+                XCTAssertEqual(relocated, destination)
+                try FileManager.default.setAttributes(
+                    [.modificationDate: Date(timeIntervalSince1970: 1_000_000)],
+                    ofItemAtPath: relocated.path
+                )
+                throw LocalMCPError.operationFailed("injected post-publication failure")
+            }
+        )
+
+        XCTAssertThrowsError(try service.createDirectory(
+            workspaceID: fixture.workspaceID, path: "created"
+        ))
+        let receipt = try XCTUnwrap(
+            (try service.listTransactions()["transactions"] as? [JSONObject])?.first
+        )
+        let transactionID = try XCTUnwrap(receipt["transaction_id"] as? String)
+        XCTAssertThrowsError(try service.restoreTransaction(transactionID))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: destination.path))
+        XCTAssertEqual(service.retainedTransactionCount, 1)
+        _ = try service.acceptTransactions([transactionID])
+    }
+
+    func testDirectoryCreateSuccessPathDoesNotAdoptRootTimestampChange() throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let destination = fixture.workspace.appendingPathComponent("created")
+        let service = LocalWorkspaceService(
+            registry: try LocalWorkspaceRegistry(configurationURL: fixture.config),
+            transactionLimit: 10, undoFileByteLimit: 1_048_576,
+            afterRelocationBeforeSnapshotForTesting: { operation, _, relocated in
+                guard operation == "create" else { return }
+                try FileManager.default.setAttributes(
+                    [.modificationDate: Date(timeIntervalSince1970: 1_000_000)],
+                    ofItemAtPath: relocated.path
+                )
+            }
+        )
+
+        XCTAssertThrowsError(try service.createDirectory(
+            workspaceID: fixture.workspaceID, path: "created"
+        ))
+        let receipt = try XCTUnwrap(
+            (try service.listTransactions()["transactions"] as? [JSONObject])?.first
+        )
+        let transactionID = try XCTUnwrap(receipt["transaction_id"] as? String)
+        XCTAssertThrowsError(try service.restoreTransaction(transactionID))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: destination.path))
+        XCTAssertEqual(service.retainedTransactionCount, 1)
+        _ = try service.acceptTransactions([transactionID])
+    }
+
+    func testCopySnapshotFailureRestoresUnchangedPublishedCopy() throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let source = fixture.workspace.appendingPathComponent("copy-source")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: false)
+        try Data("source".utf8).write(to: source.appendingPathComponent("source.txt"))
+        let destination = fixture.workspace.appendingPathComponent("copy-destination")
+        let service = LocalWorkspaceService(
+            registry: try LocalWorkspaceRegistry(configurationURL: fixture.config),
+            transactionLimit: 10, undoFileByteLimit: 1_048_576,
+            afterRelocationBeforeSnapshotForTesting: { operation, _, relocated in
+                guard operation == "copy" else { return }
+                XCTAssertEqual(relocated, destination)
+                throw LocalMCPError.operationFailed("injected post-publication failure")
+            }
+        )
+
+        XCTAssertThrowsError(try service.copyPath(
+            workspaceID: fixture.workspaceID,
+            sourcePath: "copy-source", destinationPath: "copy-destination"
+        ))
+        let receipt = try XCTUnwrap(
+            (try service.listTransactions()["transactions"] as? [JSONObject])?.first
+        )
+        let transactionID = try XCTUnwrap(receipt["transaction_id"] as? String)
+        _ = try service.restoreTransaction(transactionID)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+        XCTAssertEqual(
+            try String(contentsOf: source.appendingPathComponent("source.txt"), encoding: .utf8),
+            "source"
+        )
+        XCTAssertEqual(service.retainedTransactionCount, 0)
+    }
+
+    func testCopyFallbackDoesNotAdoptRootTimestampChange() throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let source = fixture.workspace.appendingPathComponent("copy-source")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: false)
+        try Data("source".utf8).write(to: source.appendingPathComponent("source.txt"))
+        let destination = fixture.workspace.appendingPathComponent("copy-destination")
+        let service = LocalWorkspaceService(
+            registry: try LocalWorkspaceRegistry(configurationURL: fixture.config),
+            transactionLimit: 10, undoFileByteLimit: 1_048_576,
+            afterRelocationBeforeSnapshotForTesting: { operation, _, relocated in
+                guard operation == "copy" else { return }
+                XCTAssertEqual(relocated, destination)
+                try FileManager.default.setAttributes(
+                    [.modificationDate: Date(timeIntervalSince1970: 1_000_000)],
+                    ofItemAtPath: relocated.path
+                )
+                throw LocalMCPError.operationFailed("injected post-publication failure")
+            }
+        )
+
+        XCTAssertThrowsError(try service.copyPath(
+            workspaceID: fixture.workspaceID,
+            sourcePath: "copy-source", destinationPath: "copy-destination"
+        ))
+        let receipt = try XCTUnwrap(
+            (try service.listTransactions()["transactions"] as? [JSONObject])?.first
+        )
+        let transactionID = try XCTUnwrap(receipt["transaction_id"] as? String)
+        XCTAssertThrowsError(try service.restoreTransaction(transactionID))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: destination.path))
+        XCTAssertEqual(
+            try String(contentsOf: destination.appendingPathComponent("source.txt"), encoding: .utf8),
+            "source"
+        )
+        XCTAssertEqual(service.retainedTransactionCount, 1)
+        _ = try service.acceptTransactions([transactionID])
+    }
+
+    func testCopySuccessPathDoesNotAdoptRootTimestampChange() throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let source = fixture.workspace.appendingPathComponent("copy-source")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: false)
+        try Data("source".utf8).write(to: source.appendingPathComponent("source.txt"))
+        let destination = fixture.workspace.appendingPathComponent("copy-destination")
+        let service = LocalWorkspaceService(
+            registry: try LocalWorkspaceRegistry(configurationURL: fixture.config),
+            transactionLimit: 10, undoFileByteLimit: 1_048_576,
+            afterRelocationBeforeSnapshotForTesting: { operation, _, relocated in
+                guard operation == "copy" else { return }
+                try FileManager.default.setAttributes(
+                    [.modificationDate: Date(timeIntervalSince1970: 1_000_000)],
+                    ofItemAtPath: relocated.path
+                )
+            }
+        )
+
+        XCTAssertThrowsError(try service.copyPath(
+            workspaceID: fixture.workspaceID,
+            sourcePath: "copy-source", destinationPath: "copy-destination"
+        ))
+        let receipt = try XCTUnwrap(
+            (try service.listTransactions()["transactions"] as? [JSONObject])?.first
+        )
+        let transactionID = try XCTUnwrap(receipt["transaction_id"] as? String)
+        XCTAssertThrowsError(try service.restoreTransaction(transactionID))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: destination.path))
+        XCTAssertEqual(service.retainedTransactionCount, 1)
+        _ = try service.acceptTransactions([transactionID])
+    }
+
+    func testCopySnapshotFailureRetainsConservativeUndoWithoutDeletingConcurrentEntry() throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let source = fixture.workspace.appendingPathComponent("copy-source")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: false)
+        try Data("source".utf8).write(to: source.appendingPathComponent("source.txt"))
+        let destination = fixture.workspace.appendingPathComponent("copy-destination")
+        let service = LocalWorkspaceService(
+            registry: try LocalWorkspaceRegistry(configurationURL: fixture.config),
+            transactionLimit: 10, undoFileByteLimit: 1_048_576,
+            afterRelocationBeforeSnapshotForTesting: { operation, _, relocated in
+                guard operation == "copy" else { return }
+                XCTAssertEqual(relocated, destination)
+                try FileManager.default.createSymbolicLink(
+                    at: relocated.appendingPathComponent("external-link"),
+                    withDestinationURL: source.appendingPathComponent("source.txt")
+                )
+            }
+        )
+
+        XCTAssertThrowsError(try service.copyPath(
+            workspaceID: fixture.workspaceID,
+            sourcePath: "copy-source", destinationPath: "copy-destination"
+        ))
+        let receipt = try XCTUnwrap(
+            (try service.listTransactions()["transactions"] as? [JSONObject])?.first
+        )
+        XCTAssertEqual(receipt["kind"] as? String, "created_path")
+        let transactionID = try XCTUnwrap(receipt["transaction_id"] as? String)
+        XCTAssertThrowsError(try service.restoreTransaction(transactionID))
+        XCTAssertEqual(
+            try FileManager.default.destinationOfSymbolicLink(
+                atPath: destination.appendingPathComponent("external-link").path
+            ),
+            source.appendingPathComponent("source.txt").path
+        )
+        XCTAssertEqual(
+            try String(contentsOf: source.appendingPathComponent("source.txt"), encoding: .utf8),
+            "source"
+        )
+        _ = try service.acceptTransactions([transactionID])
+    }
+
+    func testWebTunnelPartialMutationReturnsUsableRecoveryCapability() throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let source = fixture.workspace.appendingPathComponent("move-source")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: false)
+        try Data("payload".utf8).write(to: source.appendingPathComponent("payload.txt"))
+        let service = LocalWorkspaceService(
+            registry: try LocalWorkspaceRegistry(configurationURL: fixture.config),
+            transactionLimit: 10, undoFileByteLimit: 1_048_576,
+            afterRelocationBeforeSnapshotForTesting: { operation, original, _ in
+                guard operation == "move" else { return }
+                try FileManager.default.createDirectory(
+                    at: original, withIntermediateDirectories: false
+                )
+                throw LocalMCPError.operationFailed("injected post-publication failure")
+            }
+        )
+        let server = try LocalMCPServer(
+            configurationURL: fixture.config,
+            selfExecutable: URL(fileURLWithPath: "/usr/bin/true"),
+            connectorSurface: .webTunnel,
+            observationEnabled: false,
+            searchStartForTesting: nil,
+            workspaceServiceForTesting: service
+        )
+        var transactionID: String?
+        var transactionToken: String?
+        XCTAssertThrowsError(try server.callTool(name: "path_move", arguments: [
+            "workspace_id": fixture.workspaceID,
+            "source_path": "move-source",
+            "destination_path": "move-destination",
+        ])) { error in
+            guard case LocalMCPError.recoveryRequired(_, let receipts) = error else {
+                return XCTFail("expected recoveryRequired, received \(error)")
+            }
+            let receipt = receipts.first
+            transactionID = receipt?.transactionID
+            transactionToken = receipt?.transactionControlToken
+            XCTAssertNotNil(transactionID)
+            XCTAssertNotNil(transactionToken)
+            XCTAssertEqual(
+                (localErrorDetail(error)["recovery_transactions"] as? [JSONObject])?.count,
+                1
+            )
+        }
+        try FileManager.default.removeItem(at: source)
+        _ = try server.callTool(name: "transaction_restore", arguments: [
+            "transaction_id": try XCTUnwrap(transactionID),
+            "transaction_control_token": try XCTUnwrap(transactionToken),
+        ])
+        XCTAssertEqual(
+            try String(contentsOf: source.appendingPathComponent("payload.txt"), encoding: .utf8),
+            "payload"
+        )
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: fixture.workspace.appendingPathComponent("move-destination").path
+        ))
+        XCTAssertEqual(service.retainedTransactionCount, 0)
+    }
+
+    func testWebTunnelCreateSnapshotFailureReturnsUsableRecoveryCapability() throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let service = LocalWorkspaceService(
+            registry: try LocalWorkspaceRegistry(configurationURL: fixture.config),
+            transactionLimit: 10, undoFileByteLimit: 1_048_576,
+            afterRelocationBeforeSnapshotForTesting: { operation, _, _ in
+                guard operation == "create" else { return }
+                throw LocalMCPError.operationFailed("injected post-publication failure")
+            }
+        )
+        let server = try LocalMCPServer(
+            configurationURL: fixture.config,
+            selfExecutable: URL(fileURLWithPath: "/usr/bin/true"),
+            connectorSurface: .webTunnel,
+            observationEnabled: false,
+            searchStartForTesting: nil,
+            workspaceServiceForTesting: service
+        )
+        var transactionID: String?
+        var transactionToken: String?
+        XCTAssertThrowsError(try server.callTool(name: "directory_create", arguments: [
+            "workspace_id": fixture.workspaceID,
+            "path": "created",
+        ])) { error in
+            guard case LocalMCPError.recoveryRequired(_, let receipts) = error else {
+                return XCTFail("expected recoveryRequired, received \(error)")
+            }
+            transactionID = receipts.first?.transactionID
+            transactionToken = receipts.first?.transactionControlToken
+        }
+        _ = try server.callTool(name: "transaction_restore", arguments: [
+            "transaction_id": try XCTUnwrap(transactionID),
+            "transaction_control_token": try XCTUnwrap(transactionToken),
+        ])
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: fixture.workspace.appendingPathComponent("created").path
+        ))
+        XCTAssertEqual(service.retainedTransactionCount, 0)
+    }
+
     func testCopyPreservesFileMetadataAndRestoresOrdinaryTrees() throws {
         let fixture = try Fixture()
         defer { fixture.remove() }
@@ -257,9 +701,9 @@ final class WorkspaceMutationBoundaryTests: XCTestCase {
         try FileManager.default.createDirectory(at: anchor, withIntermediateDirectories: false)
         try Data("preserve".utf8).write(to: anchor.appendingPathComponent("keep"))
         let alternative = fixture.workspace.appendingPathComponent("sYNTHETIC-aNCHOR")
-        guard FileManager.default.fileExists(atPath: alternative.path) else {
-            throw XCTSkip("Alternate-casing regression requires a case-insensitive fixture volume")
-        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: alternative.path),
+                      "Security qualification requires a case-insensitive fixture volume")
+        guard FileManager.default.fileExists(atPath: alternative.path) else { return }
         let service = LocalWorkspaceService(
             registry: try LocalWorkspaceRegistry(configurationURL: fixture.config),
             transactionLimit: 10, undoFileByteLimit: 1_048_576,

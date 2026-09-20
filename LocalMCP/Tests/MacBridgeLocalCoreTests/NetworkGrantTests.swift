@@ -15,10 +15,8 @@ final class NetworkGrantTests: XCTestCase {
     private func binary() throws -> URL {
         let url = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
             .deletingLastPathComponent().appendingPathComponent(".build/debug/macbridge-mcp")
-        guard FileManager.default.isExecutableFile(atPath: url.path) else {
-            throw XCTSkip("Build the actual candidate at LocalMCP/.build before process qualification")
-        }
-        return url
+        return try XCTUnwrap(FileManager.default.isExecutableFile(atPath: url.path) ? url : nil,
+                             "Build the actual candidate before process qualification")
     }
 
     func testGrantSerializationPinsExactAddressPortScopeAndExpiry() throws {

@@ -1,93 +1,97 @@
 # MacBridge
 
-MacBridge is a native macOS execution core with a companion activity observer.
-An MCP client chooses operations; the core performs bounded work against an
-explicit workspace registry and returns evidence. The observer displays the
-same owner's activity rather than operating a second execution engine.
+<img src="Assets/Brand/macbridge-icon.png" alt="MacBridge logo" width="128">
 
-## Current source
+MacBridge is a headless MCP executable for local file operations and background
+processes, with an optional menu-bar, right-edge task surface and full activity
+dashboard. It does not run an AI model.
+Local MCP clients use stdio. Ordinary Chat requires a supported connector and
+transport; the core alone cannot guarantee that a host permits every tool.
 
-This source contains 72 MCP tools, including 12 Brevo tools, a compact discovery
-index, high-level developer workflows, parent activity, process control, guarded
-file changes and bounded undo. See [LocalMCP](LocalMCP/README.md),
-[tool discovery](LocalMCP/TOOL-GUIDE.md), [Brevo](LocalMCP/BREVO-CAPABILITIES.md),
-[Observer](Observer/README.md) and the [security policy](SECURITY.md).
+## Source layout
 
-The desktop tools can open an approved workspace folder in Finder, run a command
-with a short-lived network grant, or operate one explicitly approved application.
-These capabilities are **off by default** and do not grant themselves access.
-See [desktop access and its limits](LocalMCP/DESKTOP-ACCESS.md). The native
-observer uses system glass, a compact monochrome widget and retained task
-selection; it never changes a client's tool permissions.
+- [Current state](CURRENT-STATE.md): serving artifact, proven scope and remaining host boundary.
+- [LocalMCP](LocalMCP/README.md): core, entry point, unit tests and E2E harnesses.
+- [Observer](Observer/README.md): menu bar, edge task tab, same-owner activity,
+  output, file preview and transaction UI.
+- [Inline activity card](LocalMCP/CHAT-UI.md): experimental ChatGPT UI; host
+  template rendering is currently failing in the tested deployment.
+- [MB Operator](Skills/mb-operator/SKILL.md): the thin inspect → act → verify →
+  continue workflow, with optional checkpoint and evidence contracts.
+- [Security policy](SECURITY.md): boundaries and known limitations.
+- [Brand assets](Assets/Brand/README.md): the canonical blue MacBridge logo and derived app/card sizes.
 
-The two media tools prepare a selected local creative and can stage it behind an
-expiring link only after separate owner storage configuration and sharing approval.
-No storage account, credentials or default upload destination are shipped. Meta
-Ads URL ingestion still needs a separate live acceptance test; preparing or
-staging a file is not proof that Meta accepted it. See [media transfer and its
-limits](LocalMCP/MEDIA-TRANSFER.md).
+The source includes listing, reads/search, bounded edits, recoverable
+transactions, and headless process start/status/output/input/cancel.
+Commands retain filesystem, credential and loopback-network limits.
+Use `command_start` for long jobs. `command_run` returns final output, and its
+wait runs off the request loop; up to eight command jobs may run concurrently.
+Neither requires a Terminal window. See CURRENT-STATE.md for the serving build.
 
-The implementation is Swift 6, targets macOS 13 or later and declares no external
-Swift package dependencies. It uses macOS system frameworks and the installed
-toolchain. The optional [MB Operator skill](Skills/mb-operator/SKILL.md) supplies
-workflow guidance, not additional permissions or another model.
+The source catalog includes twelve grouped Brevo tools and the
+separate opt-in media transfer. `developer_inspect` keeps repo inspection and diff review explicitly
+read-only; `developer_task` starts and continues one bounded background task or
+test run. ChatGPT remains the reasoning layer. Compact discovery reduces catalog
+payload; it does not force a host to
+load functions or permit execution. Normal-Chat routing and embedded UI rendering
+remain separate acceptance gates, not completed by passing the local tests.
 
-The current release preparation removes private account, machine and business
-defaults from shared source. It also separates bounded Brevo network work from
-protocol discovery so a slow Brevo operation does not hold the main request
-reader. A second simultaneous Brevo call is rejected, not queued or replayed.
+For multi-step work, `work_task` retains a named parent task across short calls.
+Pass its `work_id` on related actions and explicitly finish it when the work is
+done. The observer groups those actions under the parent and distinguishes a
+running process from waiting for the next step. A caller-provided chat label is
+only a label, not authenticated chat identity or an additional permission.
 
-## Build and configuration
+The core includes the compact MB Operator loop in every MCP initialize response,
+so a normal Chat connection does not depend on loading a separate local skill.
+The packaged skill is the fuller reusable version for clients that support skills.
+It adds instructions only: no model, scheduler, database, permission, or network
+path. Checkpoints are reserved for long or paused work; routine calls stay direct.
 
-Review source and executable build/test paths before using installed Swift tools:
+## Build and verification
+
+Review source and test harnesses before execution. The Swift package has no
+third-party package dependencies. The following are direct developer commands,
+not arguments to MacBridge's command tools. Use an existing compatible toolchain:
 
 ```sh
-swift build --package-path LocalMCP -c release
+swift build --package-path LocalMCP --configuration release --disable-automatic-resolution --disable-keychain --disable-netrc --jobs 2
+swift test --package-path LocalMCP --disable-automatic-resolution --disable-keychain --disable-netrc --jobs 2
 ```
 
-The products are `macbridge-mcp` and `macbridge-observer`. Configure a narrow,
-owner-selected workspace as described in LocalMCP/README.md. No account home,
-whole disk, credential path, login service, tunnel or root privilege is granted
-by building or opening the observer. **Set Up Local Connection** lets a new
-owner explicitly choose one project folder and create a private registry plus
-observer directory. It produces a local-client configuration without starting
-a core, modifying an existing registry, or creating a ChatGPT tunnel. See the
-[first-run guide](Release/FIRST-RUN.md).
+When invoking Swift through MB, use the package's workspace-relative directory
+as `cwd`; MB supplies its own SwiftPM isolation flags. See the
+[tool guide](LocalMCP/TOOL-GUIDE.md#swift-builds-and-tests). Do not copy the direct
+command flags verbatim into `command_start`. The full self-test suite exercises
+MB's own filesystem/process/observer boundaries; running it inside MB also tests
+the compatibility of nested test fixtures with the outer command sandbox. Keep
+that result distinct from direct unit-test results and ordinary project builds.
 
-Setup opens automatically on a new account. After restarting the app, the same
-setup window can recover and copy connection instructions for an existing,
-validated private registry. It preserves that registry's workspace scopes and
-grants; it does not replace configuration or start another runtime.
+Configuration examples in the LocalMCP README are placeholders. Create your own
+configuration locally; do not commit credentials or personal paths.
+The observer packager consumes already-built binaries and refuses overwrites.
+It does not provision a tunnel, install an updater, or replace a running owner.
 
-Every recipient needs their own workspace configuration, credentials and host
-connection. Do not copy an existing user's runtime directory, workspace registry,
-browser session, connection token or credential file into an app or installer.
-Brevo uses a private, explicit per-owner account binding; live calls remain
-disabled until the owner configures it. Offline previews require no credentials.
+Build/local test results do not establish normal-Chat acceptance. Verify
+discovery, actual execution, readback and required restore/lifecycle behavior on
+the intended host and exact artifact. Host approval/mode restrictions are not
+bypassed. Read, job and mutation workflows must be graded separately.
 
-## Release status and verification boundaries
+## Sharing boundary
 
-This is a release-preparation source, not a notarized distribution claim. The
-packagers produce ad-hoc signed development artifacts. The release packager
-builds a DMG only from pinned raw binaries and reviewed resources, then mounts
-it read-only and checks its exact contents, signatures and privacy rules.
-Developer ID signing, notarization and real-user first-run/reboot
-acceptance must be completed before calling installation distribution-ready.
-Never remove quarantine or disable macOS controls to make a test pass.
+This branch is a privacy-filtered source history. Personal author/contact data,
+machine configuration, runtime identifiers, private deployment reports and old
+platform artifacts are excluded or replaced with non-personal examples.
+Original development/recovery history is kept outside this branch.
 
-Use the [release privacy gate](Release/README.md) on source, reachable Git history
-and exact final payloads separately. Keep private markers, caches, logs and
-deployment records outside exported source. A clean working tree is not evidence
-that earlier commits or binary resources are clean.
+Build and identify the exact source revision intended for distribution. Source
+changes do not update a running installation: compare the serving executable hash
+with the tested artifact. A packaged app needs metadata, signing, binary and
+functional checks before sharing. Exclude workspaces, tunnel credentials, observer sockets,
+runtime state, logs, chat exports, recovery bundles and debug symbols.
+The local observer bundle is ad-hoc signed; no production signing, notarization,
+complete Codex/DC parity or universal normal-Chat support is claimed.
 
-Local protocol success, a tunnel connection and host-side tool enablement are
-different observations. A cached, disabled ChatGPT conversation is not proven
-recovered by a local capability response. Do not replay an uncertain write or
-claim a task complete without its actual result.
-
-In `bridge_capabilities`, `active_command_runs` counts active `command_run`
-execution leases, not background jobs or acknowledgement of response delivery.
-`process_activity` separately reports running processes, completed-but-retained
-handles, starting reservations and the shared handle limit. These are runtime-wide
-snapshots, not per-chat identity or permission to restart. A zero running count
-does not mean every output handle or undo transaction has been released.
+Only this branch was filtered. Other branches, tags, cached commit views and
+forks can retain old material. Do not infer whole-repository erasure or change
+repository visibility from this publication.

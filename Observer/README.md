@@ -1,183 +1,65 @@
 # MacBridge menu-bar and activity UI
 
 This native AppKit/SwiftUI companion observes one opt-in headless MCP owner. It
-provides a variable-width menu-bar item, a right/bottom-edge compact task tab and the
+provides a variable-width menu-bar item, a right-edge compact task tab and the
 full Activity/Details dashboard. It does not start MCP, a tunnel, an AI model,
 XPC, a daemon or a terminal window. Closing its windows does not stop the owner.
 Building it does not change the installed normal-Chat runtime.
 
-The current motion/material reference is
-[CodeNotch 8406a27](CODENOTCH-REFERENCE.md). This is an observer-only adaptation:
-no CodeNotch provider integration, dependency, updater or credential access is
-included. A source build is not an authorization to replace a running interface.
-
-Raw packages retain the canonical blue PNG and ICNS for app identity, Dashboard,
-Finder and Spotlight. Compact chrome (menu bar, edge tab and its panel header)
-uses a transparent native ribbon template, black in light appearance and white
-in dark appearance, without a blue square behind it. Template images are cached
-at bounded UI sizes. The app is an `LSUIElement`, so it does not add a permanent
+Raw packages include the canonical blue PNG and ICNS. The mark appears in the
+menu bar, edge tab, panels and dashboard; the full icon remains available to
+Finder and Spotlight. The app is an `LSUIElement`, so it does not add a permanent
 Dock tile. Packaging tests compare both bundled assets to the reviewed source
 hashes; packaging does not download or regenerate artwork.
 
 ## Compact surfaces
 
-The Dashboard's Activity filter has All, Active, Issues and **Ungrouped** tabs.
-Ungrouped shows only retained actions/processes outside both declared tasks and
-display-only context groups, including receipts whose declared parent was
-evicted. Its count follows the selected workspace and search. Saved file changes
-are not mixed into this tab. Existing selected-row reading order stays held while
-new activity arrives; this adds no grouping inference, owner call or permission.
-On narrow panes the filter label yields space to the four options.
-
-- Drag the logo directly to reposition the widget. Moving along the right edge
-  changes its height; moving toward the bottom docks a horizontal rail above the
-  macOS Dock. Icons and text remain upright and cards open upward. A short click
-  still opens Dashboard. A 6pt drag threshold is latched until release, so a drag
-  that returns to its starting point cannot accidentally open Dashboard.
-  Hover/preview transitions pause during dragging; Esc cancels an unsaved drag.
-  Only the drop writes a bounded per-display anchor. Display replacement falls
-  back to the last saved edge/relative position. Settings retains edge and
-  position controls for keyboard/accessibility users. No global mouse monitor,
-  input permission or additional timer is required.
-  Bottom idle is 58×30pt; its expanded painted rail is 196×36pt. The compact
-  horizontal logo/count stays within the first target, clear of Refresh.
-- Rail actions use full 32pt rectangular hit targets while symbols remain 15pt
-  and the painted rail stays 36pt wide. The logo and Refresh targets meet without
-  overlap; other actions retain a 3pt gap. Transparent window corners stay out of
-  the hover region. The nonactivating floating host and logo accept the first
-  mouse click without requiring a focus-only click. Panel close/back/pin buttons
-  and recent-task rows also include the blank space inside their bounds.
 - Launch initializes the menu-bar item and right-edge tab without opening or
-  focusing the dashboard, or restores a saved bottom anchor. `--dashboard` is the
-  explicit developer/test opt-in.
-- The idle edge tab is a static 30×58 organic handle on the main display at a
-  saved per-display vertical position. Its transparent 22pt monochrome mark
-  has a running-count badge underneath, visible without hovering: `0`–`99`,
-  then `99+`. Waiting tasks are reported separately, not counted as running.
-  A disconnected, busy, missing or stale jobs snapshot shows `–`, not a false
-  zero. The badge uses all observed workspaces regardless of the Dashboard
-  filter; it can be hidden with the existing count preference.
-- A 100 ms hover dwell opens one inward 36×196 rail. The 22pt logo opens
-  Dashboard directly; the other four targets are connection refresh, Recent
-  Tasks, Settings and Hide Widget. Quick Actions and its lightning shortcut are
-  removed. Recent Tasks does not duplicate Dashboard with a View all footer,
-  and Settings opens its own controls rather than a dashboard alias. A
+  focusing the dashboard. `--dashboard` is the explicit developer/test opt-in.
+- The idle edge tab is a static 66×112 organic handle on the main display at a
+  saved per-display vertical position. It shows the blue mark and only shows a
+  task badge for a positive running count (`1`–`99`, then `99+`).
+- A 100 ms hover dwell opens one inward rail. Four actions plus the logo expose
+  connection refresh, Quick Actions, Recent Tasks, Settings and Dashboard. A
   single retained panel grows left for recent tasks, task detail or settings;
   it never creates a panel per task.
 - The logo stays at the same screen position when the rail opens. All panels
   share that fixed rail anchor, including near display edges; changing task
-  counts does not move it. Its center remains 15pt from the right edge. The
-  upper curve keeps its compact height as the rail grows below the logo, so
-  neither the mark nor its badge crosses the glass silhouette during the morph.
-  The display remains pinned until it disconnects.
-- Only Recent Tasks offers a 100 ms icon-hover preview. Connection, Settings
-  and Hide Widget are click-only, so crossing them does not switch panels or
-  perform an action. Clicking a preview pins it; hover cannot replace a pinned
-  panel or task detail. Clicking the same pinned icon again closes it to the rail.
-  Hover tracks the visible silhouette and panel; the transparent corners of the
-  retained window canvas do not keep the UI open. Its hit shape uses the same
-  morph progress; fading panels remain in the hover region until their exit
-  completes. Reduced-motion crossfades retain the union of their silhouettes.
-  Canvas shrink decisions compare full window extents, not panel-only heights:
-  opening a wider task detail expands immediately, while a smaller Recent Tasks
-  panel retains the outgoing bounds until its exit completes. A pending icon
-  dwell rechecks Hover previews before opening.
-- The visual outline uses a native spring (response 0.42, damping 0.78).
-  The 36×196 rail remains narrow; its transparent backing reserves 4pt across
-  and 16pt vertically for a small settle without clipping. One retained logo
-  button stays fixed. Window geometry is not animated. Closing retains its
-  canvas for 640ms and a smaller panel for 720ms; reopening cancels the shrink.
-  Icons enter with a capped 45ms stagger; exits are not staggered. Reduced
-  motion uses 100ms crossfades without shape or offset interpolation.
-  Context panels fade and enter 12pt from the rail; Reduce Motion uses opacity
-  only. The canvas remains until the panel exit finishes, and reopening cancels
-  its pending shrink. The logo and window frame have no implicit animation.
-  Native pointer/compositor acceptance is separate from geometry unit tests;
-  these timings are not a measured 120 Hz frame-rate claim.
-- On macOS 26+, expanded edge and context surfaces use native SwiftUI Liquid
-  Glass without a custom tint, navy wash or cyan glow. The system's material
-  supplies the surface; no colored overlay overrides Clear/Tinted appearance.
-  The idle handle uses a neutral translucent fill with no glass contribution.
-  The dashboard uses a transparent native window and behind-window material,
-  a neutral reading backing and an inset glass workspace sidebar.
-  Older systems use standard material. Floating Tab glass opacity is adjustable
-  from 35% to 100% and defaults to 55%; it changes material and shadow, never
-  labels or controls. Existing saved choices are preserved.
-  Reduce Transparency uses an opaque neutral system background.
-  Label colors adapt to light/dark appearance. Dashboard and
-  floating UI share the same System / Light / Dark preference, applied to both
-  SwiftUI and AppKit windows.
-  Dashboard and settings controllers own the native window appearance from
-  creation through preference changes. Their background extends under the
-  transparent full-size title bar; controls continue to respect its safe area.
-  A separate Reduce transparency preference respects the system setting too.
-  The nonactivating floating panel explicitly requests active visual appearance
-  so native controls retain their contrast while another application has focus;
-  this does not activate MacBridge. Changes to these material values still
-  require exact-binary native acceptance; offscreen arithmetic or layout tests
-  do not establish visual equivalence to a mockup or compositor smoothness.
-- The menu-bar item shows the monochrome template and the same optional running
-  count, including zero. Count visibility changes apply immediately.
-  Its native menu contains at most two task rows, then Dashboard, Recent Tasks,
-  Show/Hide Widget, connection, Settings and Quit Interface.
+  counts does not move it. The display remains pinned until it disconnects.
+- Icon previews require a 100 ms dwell. Crossing an icon does not immediately
+  switch panels. Clicking a preview pins it; hover cannot replace a pinned panel
+  or task detail. Clicking the same pinned icon again closes it to the rail.
+- Window and SwiftUI geometry changes are atomic rather than doubly animated:
+  moving tracking regions under a stationary pointer caused unintended panel
+  switching. A finite opacity reveal uses 200 ms opening, 240 ms closing and
+  120 ms with Reduce Motion; it does not move tracking geometry. This is a
+  compositing transition, not a claim of matched morph/expansion animation.
+- On macOS 26+, edge and context surfaces use native SwiftUI Liquid Glass, with
+  a light tint rather than an opaque navy cover. Older systems use standard
+  material; Reduce Transparency uses an opaque system background. Label colors
+  adapt to light/dark appearance. Dashboard and floating UI share the same
+  Follow system appearance preference.
+- The menu-bar title expands from `MacBridge` to a concise running/waiting/error
+  count. Its native menu contains at most two task rows, then Dashboard, Recent,
+  Quick Actions, connection, Settings and Quit.
 - Compact task state is derived from the same bounded owner snapshot as the
   dashboard. A returned start receipt and its live job are one displayed task;
   disconnected data is paused/last-known rather than falsely called running.
-  The attached panel retains at most 64 meaningful parent/context/job IDs in a
-  lazy scrolling list. Panel height grows only from 224 to 416pt, with at most
-  six rows in the viewport; more history does not create a taller window.
-  Reading order stays fixed while the
-  panel is open, while row payloads remain live. A missing task keeps its slot;
-  Show updates explicitly adopts newer ordering. Completed one-shot receipts
-  stay in Dashboard rather than appearing as fake tasks in the edge switcher.
-- Hide Widget cancels pending hover/close work and releases its reading IDs.
-  It keeps or restores the menu-bar item so Show Widget remains reachable.
-  Hiding the widget does not quit the interface, stop the core or cancel jobs.
+  The attached panel shows at most three meaningful parent/context/job cards and
+  shrinks with that count. Completed one-shot receipts stay in Dashboard rather
+  than appearing as fake tasks in the edge switcher.
 - The compact UI follows system light/dark appearance by default and responds to
   Reduce Motion, Reduce Transparency and Increase Contrast. Motion is one-shot;
   there is no visual timer, display link, repeating animation, telemetry or new
-  network client. It reuses one observer model polling loop, without duplicate
-  per-view polling or duplicate forwarding of model redraws. Connected automatic
-  reads remain visibility-aware. Foreground cadence is 1s during active work or
-  3s otherwise, and background cadence is 5s. Low Power Mode enforces at least
-  5s between cycles; repeated offline failures increase the retry interval up
-  to 30s.
-  These bounds reduce avoidable work, but are not measured CPU, RAM or battery
-  savings. No periodic polling is created for an unattached model.
-- Rendering tests inject the exact canonical PNG from source, rather than the
-  source-binary fallback mark, for full-color app surfaces. Compact branding is
-  separately rendered from its native template in both appearances and checked
-  for transparent corners, no blue tile, count visibility and shape containment.
-  Opaque layout snapshots exercise accessibility fallback only; they must not
-  be presented as native glass acceptance.
+  network client. It reuses the observer model's visibility-aware polling loop.
 - Full-screen display is off by default. The tab and panels clamp to the actual
   `visibleFrame`, including offset displays and space reserved by the Dock/menu
   bar. Keyboard Escape closes the deepest layer first; hover never activates or
   steals focus from the current app.
-- Compact controls remain observer/navigation actions only; they do not add
-  an independent shell or file-mutation path.
+- Quick Actions intentionally expose observer/navigation actions only. They do
+  not add a second unreviewed shell or file-mutation path.
 
 ## Connection
-
-### First-time local configuration
-
-The menu's **Set Up Local Connection…** opens an explicit first-run flow. It
-previews one selected project folder, then creates an owner-only workspace
-registry and observer directory only after the user clicks **Create local
-configuration**. The same core registry validator checks the scope. Existing
-configuration, symlink ancestors, unsafe permissions and broad roots are
-refused, not repaired or overwritten. The app must first be in a permanent
-Applications folder, not on a mounted image or a translocated launch path.
-
-The resulting JSON is for a local stdio MCP client. It contains the recipient's
-own paths, never credentials or another installation's defaults. Copy happens
-only on an explicit button click. Setup starts no core, tunnel, login service,
-network request or cloud registration. Ordinary launches keep their menu-only
-behavior; `--setup` explicitly opens the setup window for onboarding. Existing
-owners keep **Choose connection** and **Refresh Connection** unchanged.
-
-The [first-run guide](../Release/FIRST-RUN.md) distinguishes this local setup
-from the separately reviewed normal-Chat adapter and reboot deployment.
 
 An owner must be started with its usual reviewed configuration plus
 `--observer-directory /absolute/private/directory`. The directory must already
@@ -191,65 +73,13 @@ and approving that deployment change.
 Open the preview and use Connect to select that directory, or pass the same
 `--observer-directory` argument to the app. The UI canonicalizes a selected alias
 with realpath; the server still validates the canonical private directory.
-At launch, without an explicit override, the app retains the known private path
-`~/.config/macbridge/observer` even if its socket is not present yet. Bounded
-offline retries wait for the existing owner to publish a valid endpoint; this
-also works when only the menu bar is shown. The normal private-directory,
-same-user and peer-identity checks still apply. The UI does not create that
-directory, remove sockets, start the core or start a tunnel. Choose connection
-remains available for a non-default owner. Refresh reopens the selected local
-observer connection. It does not restart MCP or
+At launch the app attaches to the canonical private observer socket when it is
+present; Choose connection remains available for a non-default owner. Refresh
+reopens the selected local observer connection. It does not restart MCP or
 force ChatGPT to reload a conversation's tool registry.
 Refresh connection explicitly reattaches to the current directory, clears stale
 selection/handles and reads the current owner. It does not restart MCP or cancel
 jobs. Selecting a different directory remains a separate Connect action.
-An explicit refresh resets the offline backoff and performs one immediate read,
-without a duplicate snapshot request in the same polling cycle.
-
-Wake and application activation request an immediate, single-flight, read-only
-snapshot; they do not cancel a pending snapshot or replay a control. When only
-the menu bar is visible, the existing observer loop checks every 30 seconds so
-the status item cannot retain a stale Connected state indefinitely. Opening the
-status menu requests a current read. There is no second periodic timer or new
-network connection. With no visible status surface, connected hidden UI still
-does not fetch snapshots.
-
-Closing the edge widget keeps the menu bar available. Restore it with **Show
-Widget** in the status menu or the dashboard toolbar; the toolbar button appears
-only while the widget is hidden. Dashboard More also opens the real Settings
-window. Explicitly reopening an already-running MacBridge app through
-Finder/Spotlight restores the widget even if the dashboard is already open.
-The `--show-widget` launch argument explicitly restores it on a fresh launch;
-ordinary login launch continues to respect the saved visibility preference.
-
-Waiting for a late socket fixes UI/core launch ordering; it is not a promise
-that the core and tunnel will start after reboot. Observer does not install a
-login item or service. If those processes are stopped, the UI remains honestly
-Disconnected while retrying; boot startup requires a separately reviewed
-runtime deployment. A core-side stale-socket repair is separate from UI
-reattachment and must pass its own checks before deployment.
-
-### Lifecycle acceptance for a deployment
-
-Do not mark a release operational based on one successful capabilities call.
-Record the result and evidence level for each applicable case:
-
-| Case | Required check |
-| --- | --- |
-| User login / reboot | Approved login service is loaded, uses absolute reviewed paths, has bounded restart throttling; then verify a real reboot separately when no work is at risk. |
-| UI starts before core | UI remains offline and then adopts the valid owner without manual Connect. |
-| Core exits / changes instance | UI drops stale control handles and reconnects by read-only discovery; no command replay. |
-| Sleep / wake or app reactivation | One coalesced immediate read, including with only the menu bar visible. |
-| Quit / reopen ChatGPT | Existing independent tunnel/core remain alive; verify a read-only call in an existing chat after reopening the host. |
-| UI-only update | Packaged core hash is byte-identical to the installed standalone core; no tunnel/core restart or undo loss. |
-| Core / tool update | Verify the profile's actual executable, the installed app core and live reported core hashes. Refresh metadata on the existing ChatGPT plugin connection when its schema changes, then verify the affected tools in normal Chat. |
-| Hide widget | Restore from dashboard or status menu without a running core; explicit app reopen also restores it. |
-
-Schema refresh is part of release acceptance, not a reason to create another
-plugin registration or a new tunnel. Tool count alone is insufficient: compare
-the tool names and schemas/fingerprint and exercise changed tools safely. A
-simulated owner restart or static login-service check must never be reported as
-a successful physical reboot, network outage, or ChatGPT restart.
 
 ## ChatGPT chat recovery
 
@@ -303,8 +133,6 @@ claiming its local Refresh control can repair ChatGPT.
   followed by concise state and context. Full paths, commands, timestamps and
   counters remain in Details and accessibility descriptions; expanding a parent
   reveals its child rows without making every row a tall metadata card.
-  New task/context groups start collapsed. Expanded stable IDs remain expanded
-  across snapshot refreshes and reset when the selected owner changes.
 - Selecting a row holds the existing parent/child positions while statuses and
   counts remain live. New rows wait for **Show latest**; they do not push the
   reader down inside an earlier expanded task. The reading view stores at most
@@ -327,7 +155,7 @@ claiming its local Refresh control can repair ChatGPT.
   explicitly, not the executable or a potentially executing default association.
   Reveal shows the owner-confirmed path in Finder. Both require a fresh validated
   selection and remain subject to ordinary macOS permissions.
-- All 50 non-UI tools have human-readable activity labels. The two read-only
+- All 75 non-UI tools have human-readable activity labels. The two read-only
   activity-card tools are not added to their own feed. Batch returns are labeled
   as batch receipts, not a claim that every item succeeded.
 - Owners that retain outcome counters mark incomplete/budget-skipped results and
@@ -364,9 +192,6 @@ claiming its local Refresh control can repair ChatGPT.
 - Details (Cmd-Shift-D) separates summary fields, stdout/stderr pages and colored
   +/- comparisons. Technical metadata starts collapsed. Color is supplementary;
   status words, icons and diff markers retain the meaning without color.
-- Inspector tabs separate Activity, File, Diff and Output. File Live can pause
-  selected-file polling without pausing the owner's work. The compact task panel
-  also holds up to 64 scrolling IDs while open; Show updates releases that order.
 - Cmd-R refreshes selected detail. Output is explicitly a snapshot: opening UI
   does not add an output-draining poller or release ChatGPT's process handle.
 - Owner acknowledgements use plain-language receipts; the exact technical
@@ -416,11 +241,9 @@ synchronous file/command operations and output backpressure can still delay the
 owner; this is not universal operation isolation.
 
 History and undo are in memory. Restart loses them. Graceful stdio EOF cleans
-the socket. A crash/kill may leave the socket pathname. Recovery accepts only
-an owned private socket that predates boot or matches the private owner receipt,
-after a bounded refused-connection probe and unchanged-identity checks. Live,
-ambiguous or unrecognized same-boot sockets are preserved. Do not delete a socket
-solely because a connection failed.
+the socket. A crash/kill may leave the socket pathname; a new owner refuses to
+overwrite it. Choose a fresh private directory after checking the old owner has
+ended. Do not delete a socket solely because a connection failed.
 
 ## Bounded request-identity diagnostic (not automatic grouping)
 
@@ -455,6 +278,8 @@ toolchain (the package targets macOS 13+):
 swift build --package-path LocalMCP --configuration release --disable-automatic-resolution --disable-keychain --disable-netrc --jobs 2
 swift test --package-path LocalMCP --disable-automatic-resolution --disable-keychain --disable-netrc --jobs 2
 python3 -B Observer/Tests/ui-source-policy.py
+swiftc -parse-as-library LocalMCP/Sources/MacBridgeObserver/ActivityPresentation.swift Observer/Tests/activity-presentation.swift -o /tmp/macbridge-activity-presentation-test
+/tmp/macbridge-activity-presentation-test
 ```
 
 `package-observer.sh` takes an absolute release-binary directory and an absolute

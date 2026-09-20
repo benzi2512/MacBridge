@@ -26,7 +26,6 @@ enum ToolDiscovery {
         "workspace_reload": "reload workspace configuration nap lai cau hinh",
         "directory_list": "list directory folder contents liet ke thu muc",
         "desktop_open": "open folder Finder pop show reveal file Preview TextEdit mo thu muc hien len man hinh application",
-        "computer_control": "computer app UI accessibility snapshot press click button type text dieu khien ung dung bam nut",
         "media_inspect": "creative image video prepare inspect hash transfer upload meta ads media anh quang cao",
         "media_share": "creative image video temporary URL upload meta ads R2 publish revoke link tam chia se thu hoi",
         "directory_summary": "directory totals count size thong ke thu muc",

@@ -8,40 +8,157 @@ private struct ResolvedWorkspacePath {
     let status: stat?
 }
 
-private enum UndoAction {
+private indirect enum UndoAction {
     case restoreFile(
         workspaceID: String,
         relativePath: String,
         previousData: Data?,
         previousMode: Int,
-        expectedCurrentSHA256: String
+        expectedCurrentStamp: FileRevisionStamp
     )
     case removeCreatedPath(
         workspaceID: String,
         relativePath: String,
-        expectedTreeSHA256: String
+        expectedTreeSHA256: String,
+        expectedTreeRevisionSHA256: String,
+        expectedTreeRevisionRows: [String: String],
+        expectedStableMetadataRows: [String: String],
+        expectedRootMetadataSHA256: String,
+        expectedRootStamp: TreeRootStamp
     )
     case moveBack(
         workspaceID: String,
         sourceRelativePath: String,
         destinationRelativePath: String,
-        expectedDestinationTreeSHA256: String
+        expectedDestinationTreeSHA256: String,
+        expectedDestinationTreeRevisionSHA256: String,
+        expectedRootStamp: TreeRootStamp
     )
     case restoreRemovedPath(
         workspaceID: String,
         originalRelativePath: String,
         recoveryRelativePath: String,
-        expectedRecoveryTreeSHA256: String
+        expectedRecoveryTreeSHA256: String,
+        expectedRecoveryTreeRevisionSHA256: String,
+        expectedRootStamp: TreeRootStamp
     )
+    /// Recovery-only receipt used when a rename completed but a complete tree
+    /// snapshot could not be obtained. It may move the same root inode back to
+    /// its original spelling, but never authorizes deleting its contents.
+    case restoreRelocatedPath(
+        workspaceID: String,
+        originalRelativePath: String,
+        recoveryRelativePath: String,
+        expectedRootStamp: TreeRootStamp
+    )
+    case composite([UndoAction])
 }
 
 private struct StoredTransaction {
-    let action: UndoAction
+    var action: UndoAction
     let sequence: Int
+    var workID: String?
 
     var retainedFileBytes: Int {
-        if case .restoreFile(_, _, let data, _, _) = action { return data?.count ?? 0 }
-        return 0
+        func bytes(_ action: UndoAction) -> Int {
+            switch action {
+            case .restoreFile(_, _, let data, _, _): return data?.count ?? 0
+            case .composite(let actions): return actions.reduce(0) { $0 + bytes($1) }
+            default: return 0
+            }
+        }
+        return bytes(action)
+    }
+}
+
+public struct AtomicFileWriteRequest: Sendable {
+    public let path: String
+    public let content: String
+    public let expectedSHA256: String?
+    public let createOnly: Bool
+
+    public init(path: String, content: String, expectedSHA256: String?, createOnly: Bool) {
+        self.path = path
+        self.content = content
+        self.expectedSHA256 = expectedSHA256
+        self.createOnly = createOnly
+    }
+}
+
+private struct PreparedAtomicFileWrite {
+    let workspaceID: String
+    let relativePath: String
+    let url: URL
+    let parent: WorkspaceDirectory
+    let data: Data
+    let previousData: Data?
+    let previousMode: Int
+    let previousStamp: FileRevisionStamp?
+    let postSHA256: String
+}
+
+private struct FileRevisionStamp: Equatable {
+    let device: dev_t
+    let inode: ino_t
+    let size: off_t
+    let modifiedSeconds: Int
+    let modifiedNanoseconds: Int
+    let changedSeconds: Int
+    let changedNanoseconds: Int
+    let sha256: String
+
+    init(_ status: stat, sha256: String) {
+        device = status.st_dev
+        inode = status.st_ino
+        size = status.st_size
+        modifiedSeconds = status.st_mtimespec.tv_sec
+        modifiedNanoseconds = status.st_mtimespec.tv_nsec
+        changedSeconds = status.st_ctimespec.tv_sec
+        changedNanoseconds = status.st_ctimespec.tv_nsec
+        self.sha256 = sha256
+    }
+
+    var modifiedMilliseconds: Int64 {
+        Int64(modifiedSeconds) * 1_000 + Int64(modifiedNanoseconds / 1_000_000)
+    }
+}
+
+private struct TreeRootStamp: Equatable {
+    let device: dev_t
+    let inode: ino_t
+    let mode: mode_t
+    let links: nlink_t
+    let owner: uid_t
+    let group: gid_t
+    let size: off_t
+    let flags: UInt32
+    let modifiedSeconds: Int
+    let modifiedNanoseconds: Int
+    let changedSeconds: Int
+    let changedNanoseconds: Int
+
+    init(_ value: stat) {
+        device = value.st_dev; inode = value.st_ino; mode = value.st_mode
+        links = value.st_nlink; owner = value.st_uid; group = value.st_gid
+        size = value.st_size; flags = value.st_flags
+        modifiedSeconds = value.st_mtimespec.tv_sec
+        modifiedNanoseconds = value.st_mtimespec.tv_nsec
+        changedSeconds = value.st_ctimespec.tv_sec
+        changedNanoseconds = value.st_ctimespec.tv_nsec
+    }
+
+    /// Child creation/removal legitimately changes a directory's link count,
+    /// size and timestamps. These fields identify metadata that the child
+    /// mutation itself cannot explain and therefore must never be blessed by
+    /// retargeting an older bridge-owned tree undo.
+    func hasSameStableRoot(as other: TreeRootStamp) -> Bool {
+        device == other.device && inode == other.inode && mode == other.mode
+            && owner == other.owner && group == other.group && flags == other.flags
+    }
+
+    func hasSameIdentity(as other: TreeRootStamp) -> Bool {
+        device == other.device && inode == other.inode
+            && mode & S_IFMT == other.mode & S_IFMT
     }
 }
 
@@ -116,7 +233,11 @@ public final class LocalWorkspaceService: @unchecked Sendable {
     private let undoFileByteLimit: Int
     // Internal deterministic race injection; never configured by CLI or MCP.
     private let beforeCopyPublicationForTesting: (() throws -> Void)?
+    private let afterRelocationBeforeSnapshotForTesting: ((String, URL, URL) throws -> Void)?
+    private let afterQuarantineRenameForTesting: ((WorkspaceDirectory, String, String) throws -> Void)?
+    private let beforeQuarantineEntryRemovalForTesting: ((String) throws -> Void)?
     private let relocationProtectedPathsForTesting: Set<String>
+    private let protectedMutationPaths: Set<String>
     // One bounded name index, never file content or cached file metadata. It is
     // only a flat-directory fast path; recursive traversal keeps its existing
     // semantics. A new registry/owner starts empty. No timer or background work.
@@ -125,20 +246,31 @@ public final class LocalWorkspaceService: @unchecked Sendable {
     private static let maximumDirectoryNameBytes = 4 * 1_024 * 1_024
     private let observerFilePreviews = ObserverFilePreview()
 
-    public convenience init(registry: LocalWorkspaceRegistry) {
+    public convenience init(registry: LocalWorkspaceRegistry, protectedMutationPaths: Set<String> = []) {
         self.init(registry: registry, transactionLimit: Self.maximumRetainedTransactions,
-                  undoFileByteLimit: Self.maximumRetainedUndoFileBytes)
+                  undoFileByteLimit: Self.maximumRetainedUndoFileBytes,
+                  protectedMutationPaths: protectedMutationPaths)
     }
 
     init(registry: LocalWorkspaceRegistry, transactionLimit: Int, undoFileByteLimit: Int,
          beforeCopyPublicationForTesting: (() throws -> Void)? = nil,
-         relocationProtectedPathsForTesting: Set<String> = []) {
+         afterRelocationBeforeSnapshotForTesting: ((String, URL, URL) throws -> Void)? = nil,
+         afterQuarantineRenameForTesting: ((WorkspaceDirectory, String, String) throws -> Void)? = nil,
+         beforeQuarantineEntryRemovalForTesting: ((String) throws -> Void)? = nil,
+         relocationProtectedPathsForTesting: Set<String> = [],
+         protectedMutationPaths: Set<String> = []) {
         precondition(transactionLimit >= 0 && undoFileByteLimit >= 0)
         self.registry = registry
         self.transactionLimit = transactionLimit
         self.undoFileByteLimit = undoFileByteLimit
         self.beforeCopyPublicationForTesting = beforeCopyPublicationForTesting
+        self.afterRelocationBeforeSnapshotForTesting = afterRelocationBeforeSnapshotForTesting
+        self.afterQuarantineRenameForTesting = afterQuarantineRenameForTesting
+        self.beforeQuarantineEntryRemovalForTesting = beforeQuarantineEntryRemovalForTesting
         self.relocationProtectedPathsForTesting = Set(relocationProtectedPathsForTesting.map {
+            URL(fileURLWithPath: $0).standardizedFileURL.path
+        })
+        self.protectedMutationPaths = Set(protectedMutationPaths.map {
             URL(fileURLWithPath: $0).standardizedFileURL.path
         })
     }
@@ -149,8 +281,130 @@ public final class LocalWorkspaceService: @unchecked Sendable {
         return transactions.count
     }
 
+    func retainedTransactionIDs() -> Set<String> {
+        transactionLock.lock()
+        defer { transactionLock.unlock() }
+        return Set(transactions.keys)
+    }
+
+    func associateTransactions(_ rawIDs: [String], workID: String?) {
+        guard let workID else { return }
+        transactionLock.lock()
+        defer { transactionLock.unlock() }
+        for raw in rawIDs {
+            guard let id = UUID(uuidString: raw)?.uuidString.lowercased(),
+                  var stored = transactions[id] else { continue }
+            stored.workID = workID
+            transactions[id] = stored
+        }
+    }
+
+    /// Confirm that a retained, work-owned write transaction describes the
+    /// exact artifact bytes still present at the requested workspace path.
+    /// This is runtime-local evidence, not durable scheduler storage.
+    func verifyArtifactPersistence(
+        workspaceID: String,
+        path: String,
+        sha256: String,
+        transactionID rawTransactionID: String,
+        workID: String
+    ) throws {
+        guard LocalHash.isSHA256(sha256),
+              let transactionID = UUID(uuidString: rawTransactionID)?.uuidString.lowercased(),
+              let normalizedWorkID = UUID(uuidString: workID)?.uuidString.lowercased() else {
+            throw LocalMCPError.invalidRequest("artifact persistence evidence is malformed")
+        }
+        transactionLock.lock()
+        defer { transactionLock.unlock() }
+        guard let stored = transactions[transactionID], stored.workID == normalizedWorkID else {
+            throw LocalMCPError.conflict("write transaction is not retained by this work item")
+        }
+        let resolved = try resolveExisting(workspaceID: workspaceID, path: path)
+        let expectedPath = resolved.relativePath
+        func proves(_ action: UndoAction) -> Bool {
+            switch action {
+            case .restoreFile(let candidateWorkspace, let candidatePath, _, _, let postStamp):
+                return candidateWorkspace.lowercased() == workspaceID.lowercased()
+                    && candidatePath == expectedPath && postStamp.sha256 == sha256.lowercased()
+            case .composite(let actions): return actions.contains(where: proves)
+            default: return false
+            }
+        }
+        guard proves(stored.action) else {
+            throw LocalMCPError.conflict("transaction does not prove this artifact path and hash")
+        }
+        guard try LocalHash.sha256(fileAt: resolved.url) == sha256.lowercased() else {
+            throw LocalMCPError.casConflict(
+                expectedSHA256: sha256.lowercased(),
+                currentSHA256: try LocalHash.sha256(fileAt: resolved.url),
+                modifiedMilliseconds: Int64((resolved.status?.st_mtimespec.tv_sec ?? 0)) * 1_000
+            )
+        }
+    }
+
     public func workspaceOverview() -> JSONObject {
         ["workspaces": registry.workspaces.map(\.json)]
+    }
+
+    /// Deterministically choose the most-specific registered workspace for one
+    /// canonical local path. This never registers or widens access.
+    public func resolveWorkspace(path: String) throws -> JSONObject {
+        guard path.hasPrefix("/"), path.utf8.count <= 4_096,
+              !path.contains("\0"), !path.contains("\n"), !path.hasPrefix("~") else {
+            throw LocalMCPError.invalidPath("workspace_resolve requires one absolute local path")
+        }
+        let standardized = URL(fileURLWithPath: path).standardizedFileURL.path
+        var status = stat()
+        let exists = lstat(path, &status) == 0
+        let canonical: String
+        if exists {
+            canonical = try canonicalExistingPath(path)
+            guard status.st_mode & S_IFMT != S_IFLNK else {
+                throw LocalMCPError.invalidPath("symbolic links are not workspace identities")
+            }
+        } else {
+            guard errno == ENOENT else { throw LocalMCPError.operationFailed(String(cString: strerror(errno))) }
+            canonical = standardized
+        }
+        guard !LocalFilesystemAccess.isSensitive(canonical) else {
+            throw LocalMCPError.sensitivePathBlocked
+        }
+        let matches = registry.workspaces.filter { workspace in
+            let root = workspace.rootURL.path
+            return canonical == root || canonical.hasPrefix(root == "/" ? "/" : root + "/")
+        }.sorted { $0.rootURL.path.count > $1.rootURL.path.count }
+        guard let workspace = matches.first else { throw LocalMCPError.unknownWorkspace }
+        let root = workspace.rootURL.path
+        let relative = canonical == root ? "." : String(canonical.dropFirst(root == "/" ? 1 : root.count + 1))
+        return [
+            "workspace_id": workspace.id, "display_name": workspace.name,
+            "relative_path": relative, "canonical_path": canonical,
+            "exists": exists, "match_policy": "most_specific_registered_root",
+            "access_changed": false,
+        ]
+    }
+
+    /// A bridge-mutation-consistent batch read. Each path is fingerprinted
+    /// before and after the read; any external change rejects the whole result.
+    public func readFilesSnapshot(workspaceID: String, paths: [String], encoding: String,
+                                  maximumBytesPerFile: Int, maximumTotalBytes: Int) throws -> JSONObject {
+        transactionLock.lock()
+        defer { transactionLock.unlock() }
+        let before = try statPaths(workspaceID: workspaceID, paths: paths, includeSHA256: true)
+        var result = try readFiles(workspaceID: workspaceID, paths: paths, encoding: encoding,
+                                   maximumBytesPerFile: maximumBytesPerFile,
+                                   maximumTotalBytes: maximumTotalBytes)
+        let after = try statPaths(workspaceID: workspaceID, paths: paths, includeSHA256: true)
+        let beforeRows = try LocalJSON.encode(before["results"] ?? [])
+        let afterRows = try LocalJSON.encode(after["results"] ?? [])
+        guard beforeRows == afterRows else {
+            throw LocalMCPError.conflict("one or more files changed during snapshot read")
+        }
+        result["snapshot_atomic"] = true
+        result["snapshot_consistent"] = true
+        result["snapshot_token"] = LocalHash.sha256(beforeRows)
+        result["consistency_scope"] = "bridge mutation lock plus pre/post filesystem fingerprints"
+        return result
     }
 
     // Metadata only: never reads files or exposes the retained before-content.
@@ -184,7 +438,11 @@ public final class LocalWorkspaceService: @unchecked Sendable {
             "complete": eligible.count <= maximumTransactions,
             "latest_sequence": nextTransactionSequence,
             "scope": "owner-local metadata; no file reads; not a durable or fixed snapshot",
+            "blocking_reload_count": transactions.count,
+            "warning": transactions.isEmpty ? "none" : "Retained undo blocks workspace reload and shared-runtime restart decisions until each transaction is classified.",
         ]
+        let grouped = Dictionary(grouping: transactions.values.compactMap { $0.workID }, by: { $0 })
+        result["work_groups"] = grouped.keys.sorted().map { ["work_id": $0, "transaction_count": grouped[$0]?.count ?? 0] as JSONObject }
         if eligible.count > maximumTransactions, let last = page.last {
             result["next_cursor"] = "\(transactionCursorNamespace):\(last.value.sequence)"
         }
@@ -195,19 +453,37 @@ public final class LocalWorkspaceService: @unchecked Sendable {
         var result: JSONObject = [
             "transaction_id": id, "sequence": stored.sequence,
             "retained_undo_file_bytes": stored.retainedFileBytes,
+            "recoverable": true, "blocks_reload": true,
+            "review_classification": "requires_review",
+            "automatic_accept_allowed": false,
         ]
+        if let workID = stored.workID { result["work_id"] = workID }
         switch stored.action {
-        case .restoreFile(let workspace, let path, _, _, _):
+        case .restoreFile(let workspace, let path, let before, _, let after):
             result["workspace_id"] = workspace; result["path"] = path; result["kind"] = "file"
-        case .removeCreatedPath(let workspace, let path, _):
+            result["pre_sha256"] = before.map(LocalHash.sha256) ?? "absent"
+            result["post_sha256"] = after.sha256
+        case .removeCreatedPath(let workspace, let path, _, _, _, _, _, _):
             result["workspace_id"] = workspace; result["path"] = path; result["kind"] = "created_path"
-        case .moveBack(let workspace, let source, let destination, _):
+        case .moveBack(let workspace, let source, let destination, _, _, _):
             result["workspace_id"] = workspace; result["path"] = source; result["kind"] = "moved_path"
             result["destination_path"] = destination
-        case .restoreRemovedPath(let workspace, let path, let recovery, let digest):
+        case .restoreRemovedPath(let workspace, let path, let recovery, let digest, _, _):
             result["workspace_id"] = workspace; result["path"] = path; result["kind"] = "removed_path"
             result["recovery_path"] = recovery
             result["expected_recovery_tree_sha256"] = digest
+        case .restoreRelocatedPath(let workspace, let path, let recovery, _):
+            result["workspace_id"] = workspace; result["path"] = path
+            result["kind"] = "relocated_recovery"
+            result["recovery_path"] = recovery
+            result["recovery_preserves_current_tree"] = true
+        case .composite(let actions):
+            result["kind"] = "file_batch"
+            result["operation_count"] = actions.count
+            result["paths"] = actions.compactMap { action -> String? in
+                if case .restoreFile(_, let path, _, _, _) = action { return path }
+                return nil
+            }
         }
         return result
     }
@@ -243,6 +519,9 @@ public final class LocalWorkspaceService: @unchecked Sendable {
             if case .restoreRemovedPath = stored.action {
                 receipt["recovery_payload_preserved"] = true
                 receipt["manual_recovery_required"] = true
+            } else if case .restoreRelocatedPath = stored.action {
+                receipt["recovery_payload_preserved"] = true
+                receipt["manual_recovery_required"] = true
             }
             return receipt
         }
@@ -275,9 +554,20 @@ public final class LocalWorkspaceService: @unchecked Sendable {
         let kind: String
         switch action {
         case .restoreFile(let w, let p, _, _, _): workspace = w; path = p; kind = "file"
-        case .removeCreatedPath(let w, let p, _): workspace = w; path = p; kind = "created path"
-        case .moveBack(let w, let p, _, _): workspace = w; path = p; kind = "moved path"
-        case .restoreRemovedPath(let w, let p, _, _): workspace = w; path = p; kind = "removed path"
+        case .removeCreatedPath(let w, let p, _, _, _, _, _, _): workspace = w; path = p; kind = "created path"
+        case .moveBack(let w, let p, _, _, _, _): workspace = w; path = p; kind = "moved path"
+        case .restoreRemovedPath(let w, let p, _, _, _, _): workspace = w; path = p; kind = "removed path"
+        case .restoreRelocatedPath(let w, let p, _, _): workspace = w; path = p; kind = "relocated recovery"
+        case .composite(let actions):
+            workspace = actions.compactMap { action -> String? in
+                if case .restoreFile(let w, _, _, _, _) = action { return w }
+                return nil
+            }.first ?? ""
+            path = actions.compactMap { action -> String? in
+                if case .restoreFile(_, let p, _, _, _) = action { return p }
+                return nil
+            }.joined(separator: ", ")
+            kind = "file batch"
         }
         return ["transaction_id": id, "workspace_id": workspace,
                 "path": String(path.prefix(512)), "kind": kind,
@@ -320,7 +610,7 @@ public final class LocalWorkspaceService: @unchecked Sendable {
             detail["before_is_text"] = before.1
             detail["after_is_text"] = after.1
             detail["before_sha256"] = previous.map(LocalHash.sha256) ?? "absent"
-            detail["expected_after_sha256"] = expected
+            detail["expected_after_sha256"] = expected.sha256
             detail["current_sha256"] = file["sha256"] ?? NSNull()
             detail["before_truncated"] = (previous?.count ?? 0) > 8192
             detail["after_truncated"] = (file["total_byte_count"] as? Int ?? Int.max) > 8192
@@ -341,29 +631,45 @@ public final class LocalWorkspaceService: @unchecked Sendable {
             throw LocalMCPError.conflict("unknown transaction or wrong workspace")
         }
         var result = try perform()
-        var verified = false
+        let verified = try verifyRestoredUndo(action, result: &result)
+        result["readback_verified"] = verified
+        if !verified { throw LocalMCPError.conflict("restore completed but independent readback did not match; inspect state") }
+        return result
+    }
+
+    private func verifyRestoredUndo(_ action: UndoAction, result: inout JSONObject) throws -> Bool {
         switch action {
         case .restoreFile(let w, let p, let previous, _, _):
             if let previous {
                 let current = try statPath(workspaceID: w, path: p)["path"] as? JSONObject
                 let digest = current?["sha256"] as? String
-                verified = digest == LocalHash.sha256(previous)
+                let verified = digest == LocalHash.sha256(previous)
                 result["readback_sha256"] = digest ?? NSNull()
+                return verified
             } else {
-                verified = try resolveDestination(workspaceID: w, path: p).status == nil
+                return try resolveDestination(workspaceID: w, path: p).status == nil
             }
-        case .removeCreatedPath(let w, let p, _):
-            verified = try resolveDestination(workspaceID: w, path: p).status == nil
-        case .moveBack(let w, let source, let destination, let digest):
+        case .removeCreatedPath(let w, let p, _, _, _, _, _, _):
+            return try resolveDestination(workspaceID: w, path: p).status == nil
+        case .moveBack(let w, let source, let destination, let digest, _, _):
             let restored = try resolveExisting(workspaceID: w, path: source)
-            verified = try treeDigest(restored.url) == digest
+            return try treeDigest(restored.url) == digest
                 && resolveDestination(workspaceID: w, path: destination).status == nil
-        case .restoreRemovedPath(let w, let p, _, let digest):
-            verified = try treeDigest(resolveExisting(workspaceID: w, path: p).url) == digest
+        case .restoreRemovedPath(let w, let p, _, let digest, _, _):
+            return try treeDigest(resolveExisting(workspaceID: w, path: p).url) == digest
+        case .restoreRelocatedPath(let w, let original, let recovery, let stamp):
+            let restored = try resolveExisting(workspaceID: w, path: original)
+            let recoveryMissing = try resolveDestination(
+                workspaceID: w, path: recovery
+            ).status == nil
+            return TreeRootStamp(try lstatValue(restored.url.path))
+                .hasSameStableRoot(as: stamp) && recoveryMissing
+        case .composite(let actions):
+            for item in actions {
+                if try !verifyRestoredUndo(item, result: &result) { return false }
+            }
+            return true
         }
-        result["readback_verified"] = verified
-        if !verified { throw LocalMCPError.conflict("restore completed but independent readback did not match; inspect state") }
-        return result
     }
 
     public func listDirectory(
@@ -651,6 +957,26 @@ public final class LocalWorkspaceService: @unchecked Sendable {
         }
         let nextOffset = offset + data.count
         let chunkSHA256 = LocalHash.sha256(data)
+        // A bounded page read must not turn into an implicit multi-gigabyte scan.
+        // Preserve the whole-file digest for ordinary project files, but report
+        // it as unavailable for files beyond the existing mutation/hash limit.
+        let wholeSHA256 = totalBytes <= Self.maximumFileBytes
+            ? try LocalHash.sha256(
+                descriptor: descriptor, maximumBytes: Int64(Self.maximumFileBytes)
+            ) : nil
+        var after = stat()
+        guard fstat(descriptor, &after) == 0,
+              after.st_dev == status.st_dev, after.st_ino == status.st_ino,
+              after.st_size == status.st_size,
+              after.st_mtimespec.tv_sec == status.st_mtimespec.tv_sec,
+              after.st_mtimespec.tv_nsec == status.st_mtimespec.tv_nsec else {
+            throw LocalMCPError.conflict("file changed during read")
+        }
+        let modifiedMilliseconds = Int64(status.st_mtimespec.tv_sec) * 1_000
+            + Int64(status.st_mtimespec.tv_nsec / 1_000_000)
+        let versionToken = LocalHash.sha256(Data(
+            "\(status.st_dev):\(status.st_ino):\(status.st_size):\(status.st_mtimespec.tv_sec):\(status.st_mtimespec.tv_nsec):\(wholeSHA256 ?? "unavailable")".utf8
+        ))
         var file: JSONObject = [
             "relative_path": resolved.relativePath,
             "byte_offset": offset,
@@ -661,8 +987,13 @@ public final class LocalWorkspaceService: @unchecked Sendable {
             "encoding": encoding,
             "content": content,
             "chunk_sha256": chunkSHA256,
+            "whole_sha256_available": wholeSHA256 != nil,
+            "modified_milliseconds": modifiedMilliseconds,
+            "inode": UInt64(status.st_ino),
+            "device": UInt64(status.st_dev),
+            "version_token": versionToken,
         ]
-        if offset == 0, nextOffset == totalBytes { file["sha256"] = chunkSHA256 }
+        if let wholeSHA256 { file["sha256"] = wholeSHA256 }
         return ["file": file]
     }
 
@@ -934,7 +1265,8 @@ public final class LocalWorkspaceService: @unchecked Sendable {
         path: String,
         content: String,
         encoding: String,
-        expectedSHA256: String?
+        expectedSHA256: String?,
+        createOnly: Bool = false
     ) throws -> JSONObject {
         transactionLock.lock()
         defer { transactionLock.unlock() }
@@ -952,6 +1284,7 @@ public final class LocalWorkspaceService: @unchecked Sendable {
             throw LocalMCPError.limitExceeded("file write")
         }
         let resolved = try resolveDestination(workspaceID: workspaceID, path: path)
+        try OperationSafety.validateMutationTarget(resolved.url, protectedPaths: protectedMutationPaths)
         guard !isSensitive(resolved.relativePath) else {
             throw LocalMCPError.sensitivePathBlocked
         }
@@ -959,18 +1292,30 @@ public final class LocalWorkspaceService: @unchecked Sendable {
         let previousMode: Int
         let parent = try WorkspaceDirectory(resolved.url.deletingLastPathComponent())
         let name = resolved.url.lastPathComponent
-        if let status = try parent.status(name) {
+        var previousStamp: FileRevisionStamp?
+        if try parent.status(name) != nil {
+            let revision = try fileRevision(parent: parent, name: name)
+            let status = revision.status
             guard status.st_mode & S_IFMT == S_IFREG, status.st_nlink == 1,
                 status.st_size >= 0, status.st_size <= Self.maximumFileBytes
             else { throw LocalMCPError.wrongFileType }
+            let currentSHA = revision.stamp.sha256
+            let modified = revision.stamp.modifiedMilliseconds
+            if createOnly {
+                throw LocalMCPError.createOnlyConflict(
+                    currentSHA256: currentSHA, modifiedMilliseconds: modified
+                )
+            }
             guard let expectedSHA256, LocalHash.isSHA256(expectedSHA256) else {
                 throw LocalMCPError.conflict("expected_sha256 is required when replacing a file")
             }
-            let fd = try parent.openFile(name)
-            defer { close(fd) }
-            previousData = try LocalFileReader.read(descriptor: fd, maximumBytes: Self.maximumFileBytes)
-            guard LocalHash.sha256(previousData!) == expectedSHA256 else {
-                throw LocalMCPError.conflict("expected_sha256 does not match current content")
+            previousData = revision.data
+            previousStamp = revision.stamp
+            guard currentSHA == expectedSHA256.lowercased() else {
+                throw LocalMCPError.casConflict(
+                    expectedSHA256: expectedSHA256.lowercased(),
+                    currentSHA256: currentSHA, modifiedMilliseconds: modified
+                )
             }
             previousMode = posixMode(status)
         } else {
@@ -981,15 +1326,20 @@ public final class LocalWorkspaceService: @unchecked Sendable {
             previousMode = 0o644
         }
         try requireUndoCapacity(fileBytes: previousData?.count ?? 0)
-        try parent.atomicWrite(data, name: name, mode: previousMode, replacing: previousData != nil)
+        let published = try parent.atomicWrite(
+            data, name: name, mode: previousMode, replacing: previousData != nil
+        ) { [self] in
+            try verifyPreimage(parent: parent, name: name, expected: previousStamp)
+        }
         let finalSHA256 = LocalHash.sha256(data)
+        let finalStamp = FileRevisionStamp(published, sha256: finalSHA256)
         let transactionID = storeTransaction(
             .restoreFile(
                 workspaceID: resolved.workspace.id,
                 relativePath: resolved.relativePath,
                 previousData: previousData,
                 previousMode: previousMode,
-                expectedCurrentSHA256: finalSHA256
+                expectedCurrentStamp: finalStamp
             )
         )
         return mutationResult(
@@ -999,7 +1349,224 @@ public final class LocalWorkspaceService: @unchecked Sendable {
                 "relative_path": resolved.relativePath,
                 "byte_count": data.count,
                 "sha256": finalSHA256,
+                "pre_sha256": previousData.map(LocalHash.sha256) ?? "absent",
+                "post_sha256": finalSHA256,
                 "created": previousData == nil,
+                "create_only": createOnly,
+            ]
+        )
+    }
+
+    /// Preflights every destination before publishing any write and retains one
+    /// composite undo transaction for the complete batch. A write-time failure
+    /// is compensated in reverse order before the error is returned.
+    public func writeFilesAtomic(
+        workspaceID: String,
+        requests: [AtomicFileWriteRequest]
+    ) throws -> JSONObject {
+        guard (1...16).contains(requests.count) else {
+            throw LocalMCPError.invalidRequest("select between 1 and 16 files")
+        }
+        transactionLock.lock()
+        defer { transactionLock.unlock() }
+
+        var prepared: [PreparedAtomicFileWrite] = []
+        var destinationKeys = Set<String>()
+        var totalWriteBytes = 0
+        var totalUndoBytes = 0
+        for request in requests {
+            let data = Data(request.content.utf8)
+            guard data.count <= 262_144 else {
+                throw LocalMCPError.limitExceeded("one batch file exceeds 256 KiB")
+            }
+            totalWriteBytes += data.count
+            guard totalWriteBytes <= 1_048_576 else {
+                throw LocalMCPError.limitExceeded("batch content exceeds 1 MiB")
+            }
+            let resolved = try resolveDestination(workspaceID: workspaceID, path: request.path)
+            try OperationSafety.validateMutationTarget(
+                resolved.url, protectedPaths: protectedMutationPaths
+            )
+            let parent = try WorkspaceDirectory(resolved.url.deletingLastPathComponent())
+            let name = resolved.url.lastPathComponent
+            let parentPath = resolved.url.deletingLastPathComponent()
+            let parentStatus = try lstatValue(parentPath.path)
+            let caseSensitive = (try? parentPath.resourceValues(
+                forKeys: [.volumeSupportsCaseSensitiveNamesKey]
+            ).volumeSupportsCaseSensitiveNames) ?? true
+            let normalizedName = name.precomposedStringWithCanonicalMapping
+            let destinationKey = "\(parentStatus.st_dev):\(parentStatus.st_ino)\0"
+                + (caseSensitive ? normalizedName : normalizedName.folding(
+                    options: [.caseInsensitive], locale: Locale(identifier: "en_US_POSIX")
+                ))
+            guard destinationKeys.insert(destinationKey).inserted else {
+                throw LocalMCPError.invalidRequest("duplicate or aliased destination paths")
+            }
+            let previousData: Data?
+            let previousMode: Int
+            let previousStamp: FileRevisionStamp?
+            if try parent.status(name) != nil {
+                let revision = try fileRevision(parent: parent, name: name)
+                let status = revision.status
+                guard status.st_mode & S_IFMT == S_IFREG, status.st_nlink == 1,
+                      status.st_size >= 0, status.st_size <= Self.maximumFileBytes else {
+                    throw LocalMCPError.wrongFileType
+                }
+                let currentSHA = revision.stamp.sha256
+                let modified = revision.stamp.modifiedMilliseconds
+                if request.createOnly {
+                    throw LocalMCPError.createOnlyConflict(
+                        currentSHA256: currentSHA, modifiedMilliseconds: modified
+                    )
+                }
+                guard let expected = request.expectedSHA256, LocalHash.isSHA256(expected) else {
+                    throw LocalMCPError.conflict("expected_sha256 is required when replacing a file")
+                }
+                guard currentSHA == expected.lowercased() else {
+                    throw LocalMCPError.casConflict(
+                        expectedSHA256: expected.lowercased(),
+                        currentSHA256: currentSHA, modifiedMilliseconds: modified
+                    )
+                }
+                previousData = revision.data
+                previousMode = posixMode(status)
+                previousStamp = revision.stamp
+            } else {
+                guard request.expectedSHA256 == nil else {
+                    throw LocalMCPError.conflict("expected_sha256 supplied for a new file")
+                }
+                previousData = nil
+                previousMode = 0o644
+                previousStamp = nil
+            }
+            totalUndoBytes += previousData?.count ?? 0
+            prepared.append(PreparedAtomicFileWrite(
+                workspaceID: resolved.workspace.id,
+                relativePath: resolved.relativePath,
+                url: resolved.url,
+                parent: parent,
+                data: data,
+                previousData: previousData,
+                previousMode: previousMode,
+                previousStamp: previousStamp,
+                postSHA256: LocalHash.sha256(data)
+            ))
+        }
+        try requireUndoCapacity(fileBytes: totalUndoBytes)
+
+        var committed: [(item: PreparedAtomicFileWrite, stamp: FileRevisionStamp)] = []
+        do {
+            for item in prepared {
+                let parent = item.parent
+                let published = try parent.atomicWrite(
+                    item.data,
+                    name: item.url.lastPathComponent,
+                    mode: item.previousMode,
+                    replacing: item.previousData != nil
+                ) { [self] in
+                    try verifyPreimage(
+                        parent: parent,
+                        name: item.url.lastPathComponent,
+                        expected: item.previousStamp
+                    )
+                }
+                committed.append((item, FileRevisionStamp(published, sha256: item.postSHA256)))
+            }
+        } catch {
+            var failures: [(action: UndoAction, error: Error)] = []
+            for committedItem in committed.reversed() {
+                let item = committedItem.item
+                do {
+                    let parent = item.parent
+                    let written = try fileRevision(
+                        parent: parent, name: item.url.lastPathComponent
+                    )
+                    guard written.stamp == committedItem.stamp else {
+                        throw LocalMCPError.conflict("batch rollback refused because a written file changed")
+                    }
+                    if let previous = item.previousData {
+                        let restored = try parent.atomicWrite(
+                            previous, name: item.url.lastPathComponent,
+                            mode: item.previousMode, replacing: true
+                        ) { [self] in
+                            try verifyPreimage(
+                                parent: parent, name: item.url.lastPathComponent,
+                                expected: written.stamp
+                            )
+                        }
+                        retargetRetainedFileUndo(
+                            workspaceID: item.workspaceID,
+                            relativePath: item.relativePath,
+                            restoredStamp: FileRevisionStamp(
+                                restored, sha256: LocalHash.sha256(previous)
+                            )
+                        )
+                    } else {
+                        try verifyPreimage(
+                            parent: parent, name: item.url.lastPathComponent,
+                            expected: written.stamp
+                        )
+                        try parent.unlink(item.url.lastPathComponent)
+                    }
+                } catch {
+                    failures.append((
+                        .restoreFile(
+                            workspaceID: item.workspaceID,
+                            relativePath: item.relativePath,
+                            previousData: item.previousData,
+                            previousMode: item.previousMode,
+                            expectedCurrentStamp: committedItem.stamp
+                        ), error
+                    ))
+                }
+            }
+            if !failures.isEmpty {
+                let transactionID = storeTransaction(.composite(failures.map(\.action)))
+                throw LocalMCPError.partial(
+                    "batch publication failed; compensation recovered every still-safe write and retained \(failures.count) conflicted write(s) under transaction_id \(transactionID). First failure: \(failures[0].error)"
+                )
+            }
+            if committed.isEmpty { throw error }
+            throw LocalMCPError.compensated(
+                "batch publication failed; earlier file contents and POSIX modes were restored, but inode, extended attributes, ACLs or other filesystem metadata may differ. Original failure: \(error)"
+            )
+        }
+
+        let actions = committed.map {
+            UndoAction.restoreFile(
+                workspaceID: $0.item.workspaceID,
+                relativePath: $0.item.relativePath,
+                previousData: $0.item.previousData,
+                previousMode: $0.item.previousMode,
+                expectedCurrentStamp: $0.stamp
+            )
+        }
+        let transactionID = storeTransaction(.composite(actions))
+        let rows: [JSONObject] = prepared.map {
+            [
+                "path": $0.relativePath,
+                "status": "ok",
+                "byte_count": $0.data.count,
+                "pre_sha256": $0.previousData.map(LocalHash.sha256) ?? "absent",
+                "post_sha256": $0.postSHA256,
+                "created": $0.previousData == nil,
+            ]
+        }
+        return mutationResult(
+            operation: "file_write_many",
+            transactionID: transactionID,
+            details: [
+                "results": rows,
+                "success_count": rows.count,
+                "error_count": 0,
+                "complete": true,
+                "batch_atomic": false,
+                "all_or_compensated": true,
+                "compensation_scope": "file content and POSIX mode; inode, extended attributes, ACLs and other filesystem metadata are not preserved",
+                "crash_atomic": false,
+                "external_writer_isolation": false,
+                "atomicity_scope": "serialized in this runtime; every publication revalidates its preimage and a detected failure triggers verified compensation",
+                "total_byte_count": totalWriteBytes,
             ]
         )
     }
@@ -1023,9 +1590,17 @@ public final class LocalWorkspaceService: @unchecked Sendable {
             maximumBytes: Self.maximumFileBytes
         )
         guard let file = read["file"] as? JSONObject,
-            let current = file["content"] as? String,
-            file["sha256"] as? String == expectedSHA256
-        else { throw LocalMCPError.conflict("patch base does not match expected_sha256") }
+              let current = file["content"] as? String,
+              let currentSHA = file["sha256"] as? String else {
+            throw LocalMCPError.operationFailed("unexpected file revision response")
+        }
+        guard currentSHA == expectedSHA256.lowercased() else {
+            throw LocalMCPError.casConflict(
+                expectedSHA256: expectedSHA256.lowercased(),
+                currentSHA256: currentSHA,
+                modifiedMilliseconds: file["modified_milliseconds"] as? Int64 ?? 0
+            )
+        }
         var occurrences = 0
         var removedBytes = 0
         var searchStart = current.startIndex
@@ -1092,17 +1667,21 @@ public final class LocalWorkspaceService: @unchecked Sendable {
         default: throw LocalMCPError.invalidRequest("encoding must be utf8 or base64")
         }
         let resolved = try resolveExisting(workspaceID: workspaceID, path: path)
+        try OperationSafety.validateMutationTarget(resolved.url, protectedPaths: protectedMutationPaths)
         guard !isSensitive(resolved.relativePath), let status = resolved.status,
             status.st_mode & S_IFMT == S_IFREG, status.st_nlink == 1,
             status.st_size >= 0, status.st_size <= Self.maximumFileBytes
         else { throw LocalMCPError.wrongFileType }
         let parent = try WorkspaceDirectory(resolved.url.deletingLastPathComponent())
         let name = resolved.url.lastPathComponent
-        let fd = try parent.openFile(name)
-        defer { close(fd) }
-        let previousData = try LocalFileReader.read(descriptor: fd, maximumBytes: Self.maximumFileBytes)
-        guard LocalHash.sha256(previousData) == expectedSHA256 else {
-            throw LocalMCPError.conflict("expected_sha256 does not match current content")
+        let revision = try fileRevision(parent: parent, name: name)
+        let previousData = revision.data
+        guard revision.stamp.sha256 == expectedSHA256.lowercased() else {
+            throw LocalMCPError.casConflict(
+                expectedSHA256: expectedSHA256.lowercased(),
+                currentSHA256: revision.stamp.sha256,
+                modifiedMilliseconds: revision.stamp.modifiedMilliseconds
+            )
         }
         let (finalCount, overflow) = previousData.count.addingReportingOverflow(
             appendedData.count
@@ -1113,15 +1692,20 @@ public final class LocalWorkspaceService: @unchecked Sendable {
         try requireUndoCapacity(fileBytes: previousData.count)
         var finalData = previousData
         finalData.append(appendedData)
-        try parent.atomicWrite(finalData, name: name, mode: posixMode(status), replacing: true)
+        let published = try parent.atomicWrite(
+            finalData, name: name, mode: posixMode(status), replacing: true
+        ) { [self] in
+            try verifyPreimage(parent: parent, name: name, expected: revision.stamp)
+        }
         let finalSHA256 = LocalHash.sha256(finalData)
+        let finalStamp = FileRevisionStamp(published, sha256: finalSHA256)
         let transactionID = storeTransaction(
             .restoreFile(
                 workspaceID: resolved.workspace.id,
                 relativePath: resolved.relativePath,
                 previousData: previousData,
                 previousMode: posixMode(status),
-                expectedCurrentSHA256: finalSHA256
+                expectedCurrentStamp: finalStamp
             )
         )
         return mutationResult(
@@ -1136,26 +1720,141 @@ public final class LocalWorkspaceService: @unchecked Sendable {
         )
     }
 
+    private func storeCreatedPathUndo(
+        workspaceID: String,
+        relativePath: String,
+        expected: WorkspaceDirectory.TreeSnapshot,
+        currentRootStatus: stat
+    ) -> String {
+        storeTransaction(
+            .removeCreatedPath(
+                workspaceID: workspaceID,
+                relativePath: relativePath,
+                expectedTreeSHA256: expected.digest,
+                expectedTreeRevisionSHA256: expected.revisionDigest,
+                expectedTreeRevisionRows: expected.revisionRows,
+                expectedStableMetadataRows: expected.stableMetadataRows,
+                expectedRootMetadataSHA256: expected.root.metadataDigest,
+                expectedRootStamp: TreeRootStamp(currentRootStatus)
+            )
+        )
+    }
+
+    private func publishedTreeMatchesPreparedTree(
+        _ published: WorkspaceDirectory.TreeSnapshot,
+        expected: WorkspaceDirectory.TreeSnapshot
+    ) -> Bool {
+        published.digest == expected.digest
+            && published.descendantRevisionDigest == expected.descendantRevisionDigest
+            && published.stableMetadataRows == expected.stableMetadataRows
+            && published.root.metadataDigest == expected.root.metadataDigest
+            && TreeRootStamp(published.root.version).hasSameStableRoot(
+                as: TreeRootStamp(expected.root.version)
+            )
+    }
+
+    /// A conservative created-path receipt intentionally combines the exact
+    /// post-publication root stamp with a tree captured before the bridge-owned
+    /// rename. The rename may change volatile root revision fields, but it must
+    /// not authorize any descendant or stable-metadata change.
+    private func createdPathSnapshotMatchesUndo(
+        _ snapshot: WorkspaceDirectory.TreeSnapshot,
+        expectedDigest: String,
+        expectedRevisionDigest: String,
+        expectedRevisionRows: [String: String],
+        expectedStableMetadataRows: [String: String],
+        expectedRootMetadataDigest: String,
+        expectedRootStamp: TreeRootStamp
+    ) -> Bool {
+        guard snapshot.digest == expectedDigest,
+              snapshot.root.metadataDigest == expectedRootMetadataDigest,
+              TreeRootStamp(snapshot.root.version) == expectedRootStamp else {
+            return false
+        }
+        if snapshot.revisionDigest == expectedRevisionDigest { return true }
+        let expectedDescendantRevisionDigest = LocalHash.sha256(Data(
+            expectedRevisionRows.filter { $0.key != "." }.map(\.value).sorted()
+                .joined(separator: "\n").utf8
+        ))
+        return snapshot.descendantRevisionDigest == expectedDescendantRevisionDigest
+            && snapshot.stableMetadataRows == expectedStableMetadataRows
+    }
+
     public func createDirectory(workspaceID: String, path: String) throws -> JSONObject {
         transactionLock.lock()
         defer { transactionLock.unlock() }
         let resolved = try resolveDestination(workspaceID: workspaceID, path: path)
+        try OperationSafety.validateMutationTarget(resolved.url, protectedPaths: protectedMutationPaths)
         guard resolved.status == nil else { throw LocalMCPError.conflict("path already exists") }
         try requireUndoCapacity(fileBytes: 0)
         let parent = try WorkspaceDirectory(resolved.url.deletingLastPathComponent())
-        try parent.makeDirectory(resolved.url.lastPathComponent, mode: 0o755)
-        let digest = try parent.digest(resolved.url.lastPathComponent, logicalPath: resolved.url.path)
-        let transactionID = storeTransaction(
-            .removeCreatedPath(
+        let target = resolved.url.lastPathComponent
+        let staged = ".macbridge-directory-" + UUID().uuidString.lowercased()
+        try parent.makeDirectory(staged, mode: 0o755)
+        guard let stagedStatus = try parent.status(staged) else { throw LocalMCPError.notFound }
+        var published = false
+        defer { if !published { try? parent.removeTree(staged, expected: stagedStatus) } }
+        let stagedSnapshot = try parent.snapshot(staged, logicalPath: resolved.url.path)
+        try parent.requireIdentity(staged, expected: stagedStatus)
+        try parent.rename(staged, to: parent, as: target)
+        published = true
+        guard let publicationRootStatus = try? parent.status(target),
+              TreeRootStamp(publicationRootStatus).hasSameIdentity(
+                as: TreeRootStamp(stagedSnapshot.root.version)
+              ) else {
+            throw LocalMCPError.partial(
+                "directory was published but its initial identity could not be proven; no automatic recovery receipt was issued"
+            )
+        }
+        var publicationError: Error?
+        var publishedSnapshot: WorkspaceDirectory.TreeSnapshot?
+        do {
+            try afterRelocationBeforeSnapshotForTesting?(
+                "create",
+                resolved.url.deletingLastPathComponent().appendingPathComponent(staged),
+                resolved.url
+            )
+            publishedSnapshot = try parent.snapshot(target, logicalPath: resolved.url.path)
+        } catch {
+            publicationError = error
+        }
+        guard let currentRootStatus = try? parent.status(target),
+              TreeRootStamp(currentRootStatus).hasSameIdentity(
+                as: TreeRootStamp(stagedSnapshot.root.version)
+              ) else {
+            throw LocalMCPError.partial(
+                "directory was published but its current identity could not be proven; no automatic recovery receipt was issued"
+            )
+        }
+        if let publishedSnapshot,
+           publishedTreeMatchesPreparedTree(publishedSnapshot, expected: stagedSnapshot),
+           TreeRootStamp(publishedSnapshot.root.version) == TreeRootStamp(publicationRootStatus),
+           TreeRootStamp(currentRootStatus) == TreeRootStamp(publicationRootStatus) {
+            let transactionID = storeCreatedPathUndo(
                 workspaceID: resolved.workspace.id,
                 relativePath: resolved.relativePath,
-                expectedTreeSHA256: digest
+                expected: publishedSnapshot,
+                currentRootStatus: currentRootStatus
             )
+            return mutationResult(
+                operation: "directory_create",
+                transactionID: transactionID,
+                details: [
+                    "relative_path": resolved.relativePath,
+                    "tree_sha256": publishedSnapshot.digest,
+                ]
+            )
+        }
+        let transactionID = storeCreatedPathUndo(
+            workspaceID: resolved.workspace.id,
+            relativePath: resolved.relativePath,
+            expected: stagedSnapshot,
+            currentRootStatus: publicationRootStatus
         )
-        return mutationResult(
-            operation: "directory_create",
-            transactionID: transactionID,
-            details: ["relative_path": resolved.relativePath, "tree_sha256": digest]
+        let reason = publicationError.map(String.init(describing:))
+            ?? "the public directory changed before verification"
+        throw LocalMCPError.partial(
+            "directory was published but not adopted into undo; conservative recovery transaction retained as \(transactionID). Inspect current contents before accepting or restoring. Cause: \(reason)"
         )
     }
 
@@ -1172,6 +1871,7 @@ public final class LocalWorkspaceService: @unchecked Sendable {
             workspace: source.workspace
         )
         let destination = try resolveDestination(workspaceID: workspaceID, path: destinationPath)
+        try OperationSafety.validateMutationTarget(destination.url, protectedPaths: protectedMutationPaths)
         guard !destination.relativePath.hasPrefix(source.relativePath + "/") else {
             throw LocalMCPError.conflict("destination cannot be inside the source")
         }
@@ -1192,19 +1892,77 @@ public final class LocalWorkspaceService: @unchecked Sendable {
         var budget = WorkspaceDirectory.TreeBudget()
         try sourceParent.copy(source.url.lastPathComponent, to: staging, as: "payload",
                               logicalPath: source.url.path, budget: &budget)
-        guard try staging.digest("payload", logicalPath: destination.url.path) == digest else {
+        let preparedSnapshot = try staging.snapshot(
+            "payload", logicalPath: destination.url.path
+        )
+        guard preparedSnapshot.digest == digest else {
             throw LocalMCPError.conflict("source changed during copy; destination was not published")
         }
         try beforeCopyPublicationForTesting?()
         try destinationParent.requireIdentity(stagingName, expected: stagingIdentity)
         try staging.rename("payload", to: destinationParent, as: destination.url.lastPathComponent)
-        let transactionID = storeTransaction(
-            .removeCreatedPath(workspaceID: destination.workspace.id,
-                relativePath: destination.relativePath, expectedTreeSHA256: digest)
+        guard let publicationRootStatus = try? destinationParent.status(
+                destination.url.lastPathComponent
+              ),
+              TreeRootStamp(publicationRootStatus).hasSameIdentity(
+                as: TreeRootStamp(preparedSnapshot.root.version)
+              ) else {
+            throw LocalMCPError.partial(
+                "copy was published but its initial identity could not be proven; no automatic recovery receipt was issued"
+            )
+        }
+        var publicationError: Error?
+        var destinationSnapshot: WorkspaceDirectory.TreeSnapshot?
+        do {
+            try afterRelocationBeforeSnapshotForTesting?(
+                "copy", source.url, destination.url
+            )
+            destinationSnapshot = try destinationParent.snapshot(
+                destination.url.lastPathComponent, logicalPath: destination.url.path
+            )
+        } catch {
+            publicationError = error
+        }
+        guard let currentRootStatus = try? destinationParent.status(
+                destination.url.lastPathComponent
+              ),
+              TreeRootStamp(currentRootStatus).hasSameIdentity(
+                as: TreeRootStamp(preparedSnapshot.root.version)
+              ) else {
+            throw LocalMCPError.partial(
+                "copy was published but its current identity could not be proven; no automatic recovery receipt was issued"
+            )
+        }
+        if let destinationSnapshot,
+           publishedTreeMatchesPreparedTree(destinationSnapshot, expected: preparedSnapshot),
+           TreeRootStamp(destinationSnapshot.root.version) == TreeRootStamp(publicationRootStatus),
+           TreeRootStamp(currentRootStatus) == TreeRootStamp(publicationRootStatus) {
+            let transactionID = storeCreatedPathUndo(
+                workspaceID: destination.workspace.id,
+                relativePath: destination.relativePath,
+                expected: destinationSnapshot,
+                currentRootStatus: currentRootStatus
+            )
+            return mutationResult(
+                operation: "path_copy", transactionID: transactionID,
+                details: [
+                    "source_path": source.relativePath,
+                    "destination_path": destination.relativePath,
+                    "tree_sha256": digest,
+                ]
+            )
+        }
+        let transactionID = storeCreatedPathUndo(
+            workspaceID: destination.workspace.id,
+            relativePath: destination.relativePath,
+            expected: preparedSnapshot,
+            currentRootStatus: publicationRootStatus
         )
-        return mutationResult(operation: "path_copy", transactionID: transactionID,
-            details: ["source_path": source.relativePath, "destination_path": destination.relativePath,
-                      "tree_sha256": digest])
+        let reason = publicationError.map(String.init(describing:))
+            ?? "the public copy changed before verification"
+        throw LocalMCPError.partial(
+            "copy was published but not adopted into undo; conservative recovery transaction retained as \(transactionID). Inspect current contents before accepting or restoring. Cause: \(reason)"
+        )
     }
 
     public func movePath(
@@ -1215,9 +1973,11 @@ public final class LocalWorkspaceService: @unchecked Sendable {
         transactionLock.lock()
         defer { transactionLock.unlock() }
         let source = try resolveExisting(workspaceID: workspaceID, path: sourcePath)
+        try OperationSafety.validateMutationTarget(source.url, protectedPaths: protectedMutationPaths)
         try OperationSafety.validateRelocation(source: source.url, workspace: source.workspace,
                                                additionalProtectedPaths: relocationProtectedPathsForTesting)
         let destination = try resolveDestination(workspaceID: workspaceID, path: destinationPath)
+        try OperationSafety.validateMutationTarget(destination.url, protectedPaths: protectedMutationPaths)
         guard !destination.relativePath.hasPrefix(source.relativePath + "/") else {
             throw LocalMCPError.conflict("destination cannot be inside the source")
         }
@@ -1227,14 +1987,106 @@ public final class LocalWorkspaceService: @unchecked Sendable {
         try requireUndoCapacity(fileBytes: 0)
         let sourceParent = try WorkspaceDirectory(source.url.deletingLastPathComponent())
         let destinationParent = try WorkspaceDirectory(destination.url.deletingLastPathComponent())
-        let digest = try sourceParent.digest(source.url.lastPathComponent, logicalPath: source.url.path)
+        let sourceSnapshot = try sourceParent.snapshot(
+            source.url.lastPathComponent, logicalPath: source.url.path
+        )
+        let digest = sourceSnapshot.digest
         try sourceParent.rename(source.url.lastPathComponent, to: destinationParent, as: destination.url.lastPathComponent)
+        let destinationSnapshot: WorkspaceDirectory.TreeSnapshot
+        do {
+            try afterRelocationBeforeSnapshotForTesting?("move", source.url, destination.url)
+            destinationSnapshot = try destinationParent.snapshot(
+                destination.url.lastPathComponent, logicalPath: destination.url.path
+            )
+        } catch let snapshotError {
+            var reversedAndVerified = false
+            var reversalRenameSucceeded = false
+            do {
+                try destinationParent.rename(
+                    destination.url.lastPathComponent, to: sourceParent,
+                    as: source.url.lastPathComponent
+                )
+                reversalRenameSucceeded = true
+                if let restored = try sourceParent.status(source.url.lastPathComponent),
+                   TreeRootStamp(restored).hasSameStableRoot(
+                        as: TreeRootStamp(sourceSnapshot.root.version)
+                   ),
+                   try destinationParent.status(destination.url.lastPathComponent) == nil {
+                    reversedAndVerified = true
+                }
+            } catch {
+                // Fall through to an identity-bound recovery receipt below.
+            }
+            if reversedAndVerified {
+                throw LocalMCPError.conflict(
+                    "move snapshot failed after publication; move was reversed: \(snapshotError)"
+                )
+            }
+            if reversalRenameSucceeded {
+                throw LocalMCPError.partial(
+                    "move snapshot failed after publication; the object was renamed back to its public source, but concurrent metadata changes prevented exact reversal verification; no receipt was issued for the now-empty destination"
+                )
+            }
+            guard let recoveryStatus = try? destinationParent.status(
+                    destination.url.lastPathComponent
+                  ),
+                  TreeRootStamp(recoveryStatus).hasSameIdentity(
+                    as: TreeRootStamp(sourceSnapshot.root.version)
+                  ) else {
+                throw LocalMCPError.partial(
+                    "move snapshot and automatic reversal failed; the destination could not be identity-proven, so no automatic recovery receipt was issued"
+                )
+            }
+            let recoveryTransactionID = storeTransaction(
+                .restoreRelocatedPath(
+                    workspaceID: source.workspace.id,
+                    originalRelativePath: source.relativePath,
+                    recoveryRelativePath: destination.relativePath,
+                    expectedRootStamp: TreeRootStamp(recoveryStatus)
+                )
+            )
+            throw LocalMCPError.partial(
+                "move snapshot failed after publication and automatic reversal failed; "
+                + "identity-bound recovery transaction retained as \(recoveryTransactionID): \(snapshotError)"
+            )
+        }
+        guard destinationSnapshot.digest == sourceSnapshot.digest,
+              destinationSnapshot.descendantRevisionDigest == sourceSnapshot.descendantRevisionDigest,
+              destinationSnapshot.root.metadataDigest == sourceSnapshot.root.metadataDigest,
+              TreeRootStamp(destinationSnapshot.root.version)
+                .hasSameStableRoot(as: TreeRootStamp(sourceSnapshot.root.version)) else {
+            do {
+                try destinationParent.rename(
+                    destination.url.lastPathComponent, to: sourceParent,
+                    as: source.url.lastPathComponent
+                )
+            } catch {
+                let recoveryTransactionID = storeTransaction(
+                    .moveBack(
+                        workspaceID: source.workspace.id,
+                        sourceRelativePath: source.relativePath,
+                        destinationRelativePath: destination.relativePath,
+                        expectedDestinationTreeSHA256: destinationSnapshot.digest,
+                        expectedDestinationTreeRevisionSHA256: destinationSnapshot.revisionDigest,
+                        expectedRootStamp: TreeRootStamp(destinationSnapshot.root.version)
+                    )
+                )
+                throw LocalMCPError.partial(
+                    "move source changed during publication and automatic reversal failed; "
+                    + "recovery transaction retained as \(recoveryTransactionID): \(error)"
+                )
+            }
+            throw LocalMCPError.conflict("move source changed during publication; move was reversed")
+        }
+        let destinationStatus = destinationSnapshot.root.version
         let transactionID = storeTransaction(
             .moveBack(
                 workspaceID: source.workspace.id,
                 sourceRelativePath: source.relativePath,
                 destinationRelativePath: destination.relativePath,
-                expectedDestinationTreeSHA256: digest
+                expectedDestinationTreeSHA256: digest,
+                expectedDestinationTreeRevisionSHA256: destinationSnapshot.revisionDigest,
+                expectedRootStamp: TreeRootStamp(destinationStatus)
             )
         )
         return mutationResult(
@@ -1252,6 +2104,7 @@ public final class LocalWorkspaceService: @unchecked Sendable {
         transactionLock.lock()
         defer { transactionLock.unlock() }
         let source = try resolveExisting(workspaceID: workspaceID, path: path)
+        try OperationSafety.validateMutationTarget(source.url, protectedPaths: protectedMutationPaths)
         try OperationSafety.validateRecoverableRemoval(
             target: source.url,
             workspace: source.workspace
@@ -1260,7 +2113,10 @@ public final class LocalWorkspaceService: @unchecked Sendable {
         else { throw LocalMCPError.invalidPath(".macbridge is reserved runtime state") }
         try requireUndoCapacity(fileBytes: 0)
         let sourceParent = try WorkspaceDirectory(source.url.deletingLastPathComponent())
-        let digest = try sourceParent.digest(source.url.lastPathComponent, logicalPath: source.url.path)
+        let sourceSnapshot = try sourceParent.snapshot(
+            source.url.lastPathComponent, logicalPath: source.url.path
+        )
+        let digest = sourceSnapshot.digest
         let transactionID = UUID().uuidString.lowercased()
         // Broad roots may be read-only or on another volume. Keep recovery
         // alongside the removed item, so no write to /.macbridge is needed.
@@ -1278,13 +2134,100 @@ public final class LocalWorkspaceService: @unchecked Sendable {
         try sourceParent.rename(source.url.lastPathComponent, to: recoveryHandle, as: transactionID)
         let prefix = source.workspace.rootURL.path == "/" ? "/" : source.workspace.rootURL.path + "/"
         let recoveryRelativePath = String(recovery.path.dropFirst(prefix.count))
+        let recoverySnapshot: WorkspaceDirectory.TreeSnapshot
+        do {
+            try afterRelocationBeforeSnapshotForTesting?("remove", source.url, recovery)
+            recoverySnapshot = try recoveryHandle.snapshot(
+                transactionID, logicalPath: recovery.path
+            )
+        } catch let snapshotError {
+            var reversedAndVerified = false
+            var reversalRenameSucceeded = false
+            do {
+                try recoveryHandle.rename(
+                    transactionID, to: sourceParent, as: source.url.lastPathComponent
+                )
+                reversalRenameSucceeded = true
+                if let restored = try sourceParent.status(source.url.lastPathComponent),
+                   TreeRootStamp(restored).hasSameStableRoot(
+                        as: TreeRootStamp(sourceSnapshot.root.version)
+                   ),
+                   try recoveryHandle.status(transactionID) == nil {
+                    reversedAndVerified = true
+                }
+            } catch {
+                // Fall through to an identity-bound recovery receipt below.
+            }
+            if reversedAndVerified {
+                throw LocalMCPError.conflict(
+                    "removal snapshot failed after publication; removal was reversed: \(snapshotError)"
+                )
+            }
+            if reversalRenameSucceeded {
+                throw LocalMCPError.partial(
+                    "removal snapshot failed after publication; the object was renamed back to its public path, but concurrent metadata changes prevented exact reversal verification; no receipt was issued for the now-empty recovery path"
+                )
+            }
+            guard let recoveryStatus = try? recoveryHandle.status(transactionID),
+                  TreeRootStamp(recoveryStatus).hasSameIdentity(
+                    as: TreeRootStamp(sourceSnapshot.root.version)
+                  ) else {
+                throw LocalMCPError.partial(
+                    "removal snapshot and automatic reversal failed; the recovery entry could not be identity-proven, so no automatic recovery receipt was issued"
+                )
+            }
+            storeTransaction(
+                id: transactionID,
+                action: .restoreRelocatedPath(
+                    workspaceID: source.workspace.id,
+                    originalRelativePath: source.relativePath,
+                    recoveryRelativePath: recoveryRelativePath,
+                    expectedRootStamp: TreeRootStamp(recoveryStatus)
+                )
+            )
+            throw LocalMCPError.partial(
+                "removal snapshot failed after publication and automatic reversal failed; "
+                + "identity-bound recovery transaction retained as \(transactionID) at \(recoveryRelativePath): \(snapshotError)"
+            )
+        }
+        guard recoverySnapshot.digest == sourceSnapshot.digest,
+              recoverySnapshot.descendantRevisionDigest == sourceSnapshot.descendantRevisionDigest,
+              recoverySnapshot.root.metadataDigest == sourceSnapshot.root.metadataDigest,
+              TreeRootStamp(recoverySnapshot.root.version)
+                .hasSameStableRoot(as: TreeRootStamp(sourceSnapshot.root.version)) else {
+            do {
+                try recoveryHandle.rename(
+                    transactionID, to: sourceParent, as: source.url.lastPathComponent
+                )
+            } catch {
+                storeTransaction(
+                    id: transactionID,
+                    action: .restoreRemovedPath(
+                        workspaceID: source.workspace.id,
+                        originalRelativePath: source.relativePath,
+                        recoveryRelativePath: recoveryRelativePath,
+                        expectedRecoveryTreeSHA256: recoverySnapshot.digest,
+                        expectedRecoveryTreeRevisionSHA256: recoverySnapshot.revisionDigest,
+                        expectedRootStamp: TreeRootStamp(recoverySnapshot.root.version)
+                    )
+                )
+                throw LocalMCPError.partial(
+                    "removal source changed during publication and automatic reversal failed; "
+                    + "recovery transaction retained as \(transactionID) at \(recoveryRelativePath): \(error)"
+                )
+            }
+            throw LocalMCPError.conflict("removal source changed during publication; removal was reversed")
+        }
+        let recoveryStatus = recoverySnapshot.root.version
         storeTransaction(
             id: transactionID,
             action: .restoreRemovedPath(
                 workspaceID: source.workspace.id,
                 originalRelativePath: source.relativePath,
                 recoveryRelativePath: recoveryRelativePath,
-                expectedRecoveryTreeSHA256: digest
+                expectedRecoveryTreeSHA256: digest,
+                expectedRecoveryTreeRevisionSHA256: recoverySnapshot.revisionDigest,
+                expectedRootStamp: TreeRootStamp(recoveryStatus)
             )
         )
         return mutationResult(
@@ -1313,73 +2256,30 @@ public final class LocalWorkspaceService: @unchecked Sendable {
         }
         transactionLock.unlock()
 
-        switch transaction.action {
-        case .restoreFile(
-            let workspaceID, let relativePath, let previousData, let previousMode,
-            let expectedCurrentSHA256
-        ):
-            let current = try resolveExisting(workspaceID: workspaceID, path: relativePath)
-            let parent = try WorkspaceDirectory(current.url.deletingLastPathComponent())
-            let name = current.url.lastPathComponent
-            let fd = try parent.openFile(name)
-            defer { close(fd) }
-            guard let status = current.status, status.st_mode & S_IFMT == S_IFREG,
-                status.st_nlink == 1,
-                try LocalHash.sha256(descriptor: fd) == expectedCurrentSHA256
-            else { throw LocalMCPError.conflict("file changed after the transaction") }
-            if let previousData {
-                try parent.atomicWrite(previousData, name: name, mode: previousMode, replacing: true)
-            } else {
-                try parent.unlink(name)
+        if case .composite(let actions) = transaction.action {
+            var failures: [(action: UndoAction, error: Error)] = []
+            var restoredCount = 0
+            for action in actions.reversed() {
+                do {
+                    try validateUndoRestorable(action)
+                    try restoreUndo(action)
+                    restoredCount += 1
+                } catch {
+                    failures.append((action, error))
+                }
             }
-        case .removeCreatedPath(let workspaceID, let relativePath, let expectedDigest):
-            let current = try resolveExisting(workspaceID: workspaceID, path: relativePath)
-            let parent = try WorkspaceDirectory(current.url.deletingLastPathComponent())
-            let snapshot = try parent.snapshot(current.url.lastPathComponent, logicalPath: current.url.path)
-            guard snapshot.digest == expectedDigest else {
-                throw LocalMCPError.conflict("created path changed after the transaction")
+            if !failures.isEmpty {
+                var updated = transaction
+                updated.action = .composite(failures.map(\.action).reversed())
+                transactions[id] = updated
+                retainedUndoFileBytes -= transaction.retainedFileBytes - updated.retainedFileBytes
+                throw LocalMCPError.partial(
+                    "composite restore recovered \(restoredCount) safe member(s); \(failures.count) conflicted member(s) remain under the same transaction_id. First failure: \(failures[0].error)"
+                )
             }
-            try parent.removeVerifiedTree(snapshot)
-        case .moveBack(
-            let workspaceID, let sourceRelativePath, let destinationRelativePath,
-            let expectedDigest
-        ):
-            let source = try resolveDestination(workspaceID: workspaceID, path: sourceRelativePath)
-            guard source.status == nil else {
-                throw LocalMCPError.conflict("original move source is no longer empty")
-            }
-            let destination = try resolveExisting(
-                workspaceID: workspaceID, path: destinationRelativePath
-            )
-            let sourceParent = try WorkspaceDirectory(source.url.deletingLastPathComponent())
-            let destinationParent = try WorkspaceDirectory(destination.url.deletingLastPathComponent())
-            guard try destinationParent.digest(destination.url.lastPathComponent, logicalPath: destination.url.path) == expectedDigest else {
-                throw LocalMCPError.conflict("moved path changed after the transaction")
-            }
-            try destinationParent.rename(destination.url.lastPathComponent, to: sourceParent, as: source.url.lastPathComponent)
-        case .restoreRemovedPath(
-            let workspaceID, let originalRelativePath, let recoveryRelativePath,
-            let expectedDigest
-        ):
-            let original = try resolveDestination(
-                workspaceID: workspaceID, path: originalRelativePath
-            )
-            guard original.status == nil else {
-                throw LocalMCPError.conflict("removed path destination is no longer empty")
-            }
-            let recovery = try resolveExisting(
-                workspaceID: workspaceID, path: recoveryRelativePath
-            )
-            let originalParent = try WorkspaceDirectory(original.url.deletingLastPathComponent())
-            let recoveryParent = try WorkspaceDirectory(recovery.url.deletingLastPathComponent())
-            guard try recoveryParent.digest(recovery.url.lastPathComponent, logicalPath: recovery.url.path) == expectedDigest else {
-                throw LocalMCPError.conflict("recovery path changed after removal")
-            }
-            try recoveryParent.rename(recovery.url.lastPathComponent, to: originalParent, as: original.url.lastPathComponent)
-            let recoveryRoot = recovery.url.deletingLastPathComponent()
-            let state = recoveryRoot.deletingLastPathComponent()
-            try? WorkspaceDirectory(state).unlink(recoveryRoot.lastPathComponent, directory: true)
-            try? WorkspaceDirectory(state.deletingLastPathComponent()).unlink(state.lastPathComponent, directory: true)
+        } else {
+            try validateUndoRestorable(transaction.action)
+            try restoreUndo(transaction.action)
         }
 
         transactionLock.lock()
@@ -1395,10 +2295,685 @@ public final class LocalWorkspaceService: @unchecked Sendable {
         ]
     }
 
+    private func restoreUndo(_ action: UndoAction) throws {
+        switch action {
+        case .restoreFile(
+            let workspaceID, let relativePath, let previousData, let previousMode,
+            let expectedCurrentStamp
+        ):
+            let current = try resolveExisting(workspaceID: workspaceID, path: relativePath)
+            try OperationSafety.validateMutationTarget(
+                current.url, protectedPaths: protectedMutationPaths
+            )
+            let parent = try WorkspaceDirectory(current.url.deletingLastPathComponent())
+            let name = current.url.lastPathComponent
+            let revision = try fileRevision(parent: parent, name: name)
+            guard revision.status.st_mode & S_IFMT == S_IFREG,
+                revision.status.st_nlink == 1,
+                revision.stamp == expectedCurrentStamp
+            else { throw LocalMCPError.conflict("file changed after the transaction") }
+            if let previousData {
+                let published = try parent.atomicWrite(
+                    previousData, name: name, mode: previousMode, replacing: true
+                ) { [self] in
+                    try verifyPreimage(parent: parent, name: name, expected: revision.stamp)
+                }
+                let restoredStamp = FileRevisionStamp(
+                    published, sha256: LocalHash.sha256(previousData)
+                )
+                retargetRetainedFileUndo(
+                    workspaceID: workspaceID, relativePath: relativePath,
+                    restoredStamp: restoredStamp
+                )
+            } else {
+                try verifyPreimage(parent: parent, name: name, expected: revision.stamp)
+                try parent.unlink(name)
+            }
+            retargetMatchingCreatedAncestorUndo(
+                workspaceID: workspaceID, changedRelativePath: relativePath
+            )
+        case .removeCreatedPath(let workspaceID, let relativePath, let expectedDigest,
+                                let expectedRevision, let expectedRevisionRows,
+                                let expectedStableMetadataRows, let expectedMetadata,
+                                let expectedRootStamp):
+            let current = try resolveExisting(workspaceID: workspaceID, path: relativePath)
+            try OperationSafety.validateMutationTarget(
+                current.url, protectedPaths: protectedMutationPaths
+            )
+            let parent = try WorkspaceDirectory(current.url.deletingLastPathComponent())
+            let snapshot = try parent.snapshot(current.url.lastPathComponent, logicalPath: current.url.path)
+            guard createdPathSnapshotMatchesUndo(
+                snapshot,
+                expectedDigest: expectedDigest,
+                expectedRevisionDigest: expectedRevision,
+                expectedRevisionRows: expectedRevisionRows,
+                expectedStableMetadataRows: expectedStableMetadataRows,
+                expectedRootMetadataDigest: expectedMetadata,
+                expectedRootStamp: expectedRootStamp
+            ) else {
+                throw LocalMCPError.conflict("created path changed after the transaction")
+            }
+            do {
+                try parent.quarantineAndRemoveVerifiedTree(
+                    snapshot,
+                    afterRenameForTesting: afterQuarantineRenameForTesting,
+                    beforeEntryRemovalForTesting: beforeQuarantineEntryRemovalForTesting
+                )
+            } catch let rollback as QuarantineRemovalRolledBack {
+                throw LocalMCPError.partial(
+                    "tree cleanup changed during undo; the residual tree was restored to its public path, but the original receipt was deliberately not widened to include concurrent additions: \(rollback.cause)"
+                )
+            } catch let relocated as QuarantineRemovalRelocated {
+                let parentComponents = relativePath.split(separator: "/").dropLast()
+                let recoveryRelativePath = (parentComponents.map(String.init)
+                    + [relocated.recoveryName]).joined(separator: "/")
+                let converted = retargetRelocatedCreatedPathUndo(
+                    workspaceID: workspaceID, relativePath: relativePath,
+                    recoveryRelativePath: recoveryRelativePath,
+                    originalStamp: expectedRootStamp,
+                    recoveryStamp: TreeRootStamp(relocated.rootVersion)
+                )
+                guard converted else {
+                    throw LocalMCPError.partial(
+                        "tree cleanup and public rollback both failed; the residual tree was preserved at \(recoveryRelativePath), but the original receipt could not be converted automatically"
+                    )
+                }
+                throw LocalMCPError.partial(
+                    "tree cleanup and public rollback both failed; the residual tree was preserved at \(recoveryRelativePath) under an identity-bound recovery receipt"
+                )
+            }
+            retargetMatchingCreatedAncestorUndo(
+                workspaceID: workspaceID, changedRelativePath: relativePath
+            )
+        case .moveBack(
+            let workspaceID, let sourceRelativePath, let destinationRelativePath,
+            let expectedDigest, let expectedRevision, let expectedRootStamp
+        ):
+            let source = try resolveDestination(workspaceID: workspaceID, path: sourceRelativePath)
+            try OperationSafety.validateMutationTarget(
+                source.url, protectedPaths: protectedMutationPaths
+            )
+            guard source.status == nil else {
+                throw LocalMCPError.conflict("original move source is no longer empty")
+            }
+            let destination = try resolveExisting(
+                workspaceID: workspaceID, path: destinationRelativePath
+            )
+            try OperationSafety.validateMutationTarget(
+                destination.url, protectedPaths: protectedMutationPaths
+            )
+            let sourceParent = try WorkspaceDirectory(source.url.deletingLastPathComponent())
+            let destinationParent = try WorkspaceDirectory(destination.url.deletingLastPathComponent())
+            let destinationSnapshot = try destinationParent.snapshot(
+                destination.url.lastPathComponent, logicalPath: destination.url.path
+            )
+            guard TreeRootStamp(destinationSnapshot.root.version) == expectedRootStamp,
+                  destinationSnapshot.digest == expectedDigest,
+                  destinationSnapshot.revisionDigest == expectedRevision else {
+                throw LocalMCPError.conflict("moved path changed after the transaction")
+            }
+            try destinationParent.rename(destination.url.lastPathComponent, to: sourceParent, as: source.url.lastPathComponent)
+            let restored = try sourceParent.snapshot(
+                source.url.lastPathComponent, logicalPath: source.url.path
+            )
+            retargetRetainedTreeUndo(
+                workspaceID: workspaceID, relativePath: sourceRelativePath,
+                digest: expectedDigest, revisionDigest: restored.revisionDigest,
+                revisionRows: restored.revisionRows,
+                stableMetadataRows: restored.stableMetadataRows,
+                rootMetadataDigest: restored.root.metadataDigest,
+                restoredStamp: TreeRootStamp(restored.root.version)
+            )
+            if restored.root.version.st_mode & S_IFMT == S_IFREG,
+               restored.root.version.st_size >= 0,
+               restored.root.version.st_size <= Self.maximumFileBytes,
+               hasRetainedFileUndo(
+                    workspaceID: workspaceID, relativePath: sourceRelativePath
+               ) {
+                let revision = try fileRevision(
+                    parent: sourceParent, name: source.url.lastPathComponent
+                )
+                retargetRetainedFileUndo(
+                    workspaceID: workspaceID, relativePath: sourceRelativePath,
+                    restoredStamp: revision.stamp
+                )
+            }
+            retargetMatchingCreatedAncestorUndo(
+                workspaceID: workspaceID, changedRelativePath: destinationRelativePath
+            )
+            retargetMatchingCreatedAncestorUndo(
+                workspaceID: workspaceID, changedRelativePath: sourceRelativePath
+            )
+        case .restoreRemovedPath(
+            let workspaceID, let originalRelativePath, let recoveryRelativePath,
+            let expectedDigest, let expectedRevision, let expectedRootStamp
+        ):
+            let original = try resolveDestination(
+                workspaceID: workspaceID, path: originalRelativePath
+            )
+            try OperationSafety.validateMutationTarget(
+                original.url, protectedPaths: protectedMutationPaths
+            )
+            guard original.status == nil else {
+                throw LocalMCPError.conflict("removed path destination is no longer empty")
+            }
+            let recovery = try resolveExisting(
+                workspaceID: workspaceID, path: recoveryRelativePath
+            )
+            try OperationSafety.validateMutationTarget(
+                recovery.url, protectedPaths: protectedMutationPaths
+            )
+            let originalParent = try WorkspaceDirectory(original.url.deletingLastPathComponent())
+            let recoveryParent = try WorkspaceDirectory(recovery.url.deletingLastPathComponent())
+            let recoverySnapshot = try recoveryParent.snapshot(
+                recovery.url.lastPathComponent, logicalPath: recovery.url.path
+            )
+            guard TreeRootStamp(recoverySnapshot.root.version) == expectedRootStamp,
+                  recoverySnapshot.digest == expectedDigest,
+                  recoverySnapshot.revisionDigest == expectedRevision else {
+                throw LocalMCPError.conflict("recovery path changed after removal")
+            }
+            try recoveryParent.rename(recovery.url.lastPathComponent, to: originalParent, as: original.url.lastPathComponent)
+            let restored = try originalParent.snapshot(
+                original.url.lastPathComponent, logicalPath: original.url.path
+            )
+            retargetRetainedTreeUndo(
+                workspaceID: workspaceID, relativePath: originalRelativePath,
+                digest: expectedDigest, revisionDigest: restored.revisionDigest,
+                revisionRows: restored.revisionRows,
+                stableMetadataRows: restored.stableMetadataRows,
+                rootMetadataDigest: restored.root.metadataDigest,
+                restoredStamp: TreeRootStamp(restored.root.version)
+            )
+            if restored.root.version.st_mode & S_IFMT == S_IFREG,
+               restored.root.version.st_size >= 0,
+               restored.root.version.st_size <= Self.maximumFileBytes,
+               hasRetainedFileUndo(
+                    workspaceID: workspaceID, relativePath: originalRelativePath
+               ) {
+                let revision = try fileRevision(
+                    parent: originalParent, name: original.url.lastPathComponent
+                )
+                retargetRetainedFileUndo(
+                    workspaceID: workspaceID, relativePath: originalRelativePath,
+                    restoredStamp: revision.stamp
+                )
+            }
+            retargetMatchingCreatedAncestorUndo(
+                workspaceID: workspaceID, changedRelativePath: originalRelativePath
+            )
+            let recoveryRoot = recovery.url.deletingLastPathComponent()
+            let state = recoveryRoot.deletingLastPathComponent()
+            try? WorkspaceDirectory(state).unlink(recoveryRoot.lastPathComponent, directory: true)
+            try? WorkspaceDirectory(state.deletingLastPathComponent()).unlink(state.lastPathComponent, directory: true)
+        case .restoreRelocatedPath(
+            let workspaceID, let originalRelativePath, let recoveryRelativePath,
+            let expectedRootStamp
+        ):
+            let original = try resolveDestination(
+                workspaceID: workspaceID, path: originalRelativePath
+            )
+            try OperationSafety.validateMutationTarget(
+                original.url, protectedPaths: protectedMutationPaths
+            )
+            guard original.status == nil else {
+                throw LocalMCPError.conflict("recovery destination is no longer empty")
+            }
+            let recovery = try resolveExisting(
+                workspaceID: workspaceID, path: recoveryRelativePath
+            )
+            try OperationSafety.validateMutationTarget(
+                recovery.url, protectedPaths: protectedMutationPaths
+            )
+            let currentStamp = TreeRootStamp(try lstatValue(recovery.url.path))
+            guard currentStamp.hasSameStableRoot(as: expectedRootStamp) else {
+                throw LocalMCPError.conflict("relocated recovery root identity changed")
+            }
+            let originalParent = try WorkspaceDirectory(original.url.deletingLastPathComponent())
+            let recoveryParent = try WorkspaceDirectory(recovery.url.deletingLastPathComponent())
+            try recoveryParent.rename(
+                recovery.url.lastPathComponent, to: originalParent,
+                as: original.url.lastPathComponent
+            )
+            // Recovery-only receipts deliberately preserve arbitrary current
+            // contents and metadata. They therefore cannot prove that an older
+            // destructive undo is safe to retarget.
+        case .composite(let actions):
+            for action in actions.reversed() { try restoreUndo(action) }
+        }
+    }
+
+    /// An earlier bridge transaction may become current again after a later
+    /// bridge-owned undo publishes its exact bytes on a new inode. Retarget
+    /// only that known internal transition; an external same-byte replacement
+    /// never passes through this path and remains a conflict.
+    private func retargetRetainedFileUndo(
+        workspaceID: String, relativePath: String, restoredStamp: FileRevisionStamp
+    ) {
+        func retarget(_ action: UndoAction) -> UndoAction {
+            switch action {
+            case .restoreFile(let workspace, let path, let data, let mode, let expected)
+                where workspace.lowercased() == workspaceID.lowercased()
+                    && expected.sha256 == restoredStamp.sha256:
+                guard sameResolvedEntry(
+                    workspaceID: workspace, first: path, second: relativePath
+                ) else { return action }
+                return .restoreFile(
+                    workspaceID: workspace, relativePath: path, previousData: data,
+                    previousMode: mode, expectedCurrentStamp: restoredStamp
+                )
+            case .composite(let actions):
+                return .composite(actions.map(retarget))
+            default: return action
+            }
+        }
+        for (id, stored) in transactions {
+            var updated = stored
+            updated.action = retarget(stored.action)
+            transactions[id] = updated
+        }
+    }
+
+    private func retargetRetainedTreeUndo(
+        workspaceID: String, relativePath: String, digest: String, revisionDigest: String,
+        revisionRows: [String: String],
+        stableMetadataRows: [String: String],
+        rootMetadataDigest: String,
+        restoredStamp: TreeRootStamp
+    ) {
+        func retarget(_ action: UndoAction) -> UndoAction {
+            switch action {
+            case .removeCreatedPath(let workspace, let path, let expected, _, _, _, _, _)
+                where workspace.lowercased() == workspaceID.lowercased() && expected == digest:
+                guard sameResolvedEntry(
+                    workspaceID: workspace, first: path, second: relativePath
+                ) else { return action }
+                return .removeCreatedPath(
+                    workspaceID: workspace, relativePath: path,
+                    expectedTreeSHA256: expected,
+                    expectedTreeRevisionSHA256: revisionDigest,
+                    expectedTreeRevisionRows: revisionRows,
+                    expectedStableMetadataRows: stableMetadataRows,
+                    expectedRootMetadataSHA256: rootMetadataDigest,
+                    expectedRootStamp: restoredStamp
+                )
+            case .moveBack(let workspace, let source, let destination, let expected, _, _)
+                where workspace.lowercased() == workspaceID.lowercased() && expected == digest:
+                guard sameResolvedEntry(
+                    workspaceID: workspace, first: destination, second: relativePath
+                ) else { return action }
+                return .moveBack(
+                    workspaceID: workspace, sourceRelativePath: source,
+                    destinationRelativePath: destination,
+                    expectedDestinationTreeSHA256: expected,
+                    expectedDestinationTreeRevisionSHA256: revisionDigest,
+                    expectedRootStamp: restoredStamp
+                )
+            case .restoreRemovedPath(let workspace, let original, let recovery, let expected, _, _)
+                where workspace.lowercased() == workspaceID.lowercased() && expected == digest:
+                guard sameResolvedEntry(
+                    workspaceID: workspace, first: recovery, second: relativePath
+                ) else { return action }
+                return .restoreRemovedPath(
+                    workspaceID: workspace, originalRelativePath: original,
+                    recoveryRelativePath: recovery,
+                    expectedRecoveryTreeSHA256: expected,
+                    expectedRecoveryTreeRevisionSHA256: revisionDigest,
+                    expectedRootStamp: restoredStamp
+                )
+            case .composite(let actions): return .composite(actions.map(retarget))
+            default: return action
+            }
+        }
+        for (id, stored) in transactions {
+            var updated = stored
+            updated.action = retarget(stored.action)
+            transactions[id] = updated
+        }
+    }
+
+    /// When bridge-owned file undos return a created ancestor to the exact tree
+    /// digest recorded by its older undo, refresh only the volatile directory
+    /// revision fields. Stable root identity and metadata must still match, so
+    /// an unrelated replacement, chmod, chown or flags change remains a conflict.
+    private func retargetMatchingCreatedAncestorUndo(
+        workspaceID: String, changedRelativePath: String
+    ) {
+        func retarget(_ action: UndoAction) -> UndoAction {
+            switch action {
+            case .removeCreatedPath(
+                let workspace, let path, let expected, _, let expectedRows, let expectedStableRows,
+                let expectedMetadata, let oldStamp
+            )
+                where workspace.lowercased() == workspaceID.lowercased():
+                guard isResolvedAncestor(
+                    workspaceID: workspace, ancestor: path,
+                    descendant: changedRelativePath
+                ) else { return action }
+                guard let current = try? resolveExisting(workspaceID: workspace, path: path),
+                      let parent = try? WorkspaceDirectory(current.url.deletingLastPathComponent()),
+                      let snapshot = try? parent.snapshot(
+                        current.url.lastPathComponent, logicalPath: current.url.path
+                      ),
+                      snapshot.digest == expected,
+                      unaffectedTreeRowsMatch(
+                        expected: expectedRows, current: snapshot.revisionRows,
+                        expectedStable: expectedStableRows,
+                        currentStable: snapshot.stableMetadataRows,
+                        ancestorPath: path, changedPath: changedRelativePath,
+                        ancestorURL: current.url
+                      ),
+                      snapshot.root.metadataDigest == expectedMetadata else { return action }
+                let newStamp = TreeRootStamp(snapshot.root.version)
+                guard newStamp.hasSameStableRoot(as: oldStamp) else { return action }
+                return .removeCreatedPath(
+                    workspaceID: workspace, relativePath: path,
+                    expectedTreeSHA256: expected,
+                    expectedTreeRevisionSHA256: snapshot.revisionDigest,
+                    expectedTreeRevisionRows: snapshot.revisionRows,
+                    expectedStableMetadataRows: snapshot.stableMetadataRows,
+                    expectedRootMetadataSHA256: expectedMetadata,
+                    expectedRootStamp: newStamp
+                )
+            case .composite(let actions): return .composite(actions.map(retarget))
+            default: return action
+            }
+        }
+        for (id, stored) in transactions {
+            var updated = stored
+            updated.action = retarget(stored.action)
+            transactions[id] = updated
+        }
+    }
+
+    @discardableResult
+    private func retargetRelocatedCreatedPathUndo(
+        workspaceID: String, relativePath: String, recoveryRelativePath: String,
+        originalStamp: TreeRootStamp, recoveryStamp: TreeRootStamp
+    ) -> Bool {
+        var converted = false
+        func retarget(_ action: UndoAction) -> UndoAction {
+            switch action {
+            case .removeCreatedPath(let workspace, let path, _, _, _, _, _, let stamp)
+                where workspace.lowercased() == workspaceID.lowercased():
+                guard path == relativePath, stamp == originalStamp,
+                recoveryStamp.hasSameIdentity(as: originalStamp) else { return action }
+                converted = true
+                return .restoreRelocatedPath(
+                    workspaceID: workspace,
+                    originalRelativePath: path,
+                    recoveryRelativePath: recoveryRelativePath,
+                    expectedRootStamp: recoveryStamp
+                )
+            case .composite(let actions): return .composite(actions.map(retarget))
+            default: return action
+            }
+        }
+        for (id, stored) in transactions {
+            var updated = stored
+            updated.action = retarget(stored.action)
+            transactions[id] = updated
+        }
+        return converted
+    }
+
+    private func hasRetainedFileUndo(
+        workspaceID: String, relativePath: String
+    ) -> Bool {
+        func matches(_ action: UndoAction) -> Bool {
+            switch action {
+            case .restoreFile(let workspace, let path, _, _, _):
+                return workspace.lowercased() == workspaceID.lowercased()
+                    && sameResolvedEntry(
+                        workspaceID: workspace, first: path, second: relativePath
+                    )
+            case .composite(let actions): return actions.contains(where: matches)
+            default: return false
+            }
+        }
+        return transactions.values.contains { matches($0.action) }
+    }
+
+    private func sameResolvedEntry(
+        workspaceID: String, first: String, second: String
+    ) -> Bool {
+        guard let lhs = try? resolveExisting(workspaceID: workspaceID, path: first),
+              let rhs = try? resolveExisting(workspaceID: workspaceID, path: second),
+              let a = lhs.status, let b = rhs.status else { return false }
+        return a.st_dev == b.st_dev && a.st_ino == b.st_ino
+    }
+
+    private func isResolvedAncestor(
+        workspaceID: String, ancestor: String, descendant: String
+    ) -> Bool {
+        guard let root = try? resolveExisting(workspaceID: workspaceID, path: ancestor),
+              let rootStatus = root.status,
+              let changed = try? resolveDestination(workspaceID: workspaceID, path: descendant)
+        else { return false }
+        var candidate = changed.url.deletingLastPathComponent()
+        let boundary = changed.workspace.rootURL.standardizedFileURL.path
+        while candidate.standardizedFileURL.path.hasPrefix(boundary) {
+            var value = stat()
+            if lstat(candidate.path, &value) == 0,
+               value.st_dev == rootStatus.st_dev, value.st_ino == rootStatus.st_ino {
+                return true
+            }
+            if candidate.standardizedFileURL.path == boundary { break }
+            let parent = candidate.deletingLastPathComponent()
+            if parent.path == candidate.path { break }
+            candidate = parent
+        }
+        return false
+    }
+
+    private func unaffectedTreeRowsMatch(
+        expected: [String: String], current: [String: String],
+        expectedStable: [String: String], currentStable: [String: String],
+        ancestorPath: String, changedPath: String, ancestorURL: URL
+    ) -> Bool {
+        let ancestorParts = ancestorPath.split(separator: "/")
+        let changedParts = changedPath.split(separator: "/")
+        guard changedParts.count > ancestorParts.count else { return false }
+        let relativeChanged = changedParts.dropFirst(ancestorParts.count)
+            .map(String.init).joined(separator: "/")
+        let caseSensitive = (try? ancestorURL.resourceValues(
+            forKeys: [.volumeSupportsCaseSensitiveNamesKey]
+        ).volumeSupportsCaseSensitiveNames) ?? true
+        func key(_ value: String) -> String {
+            let normalized = value.precomposedStringWithCanonicalMapping
+            return caseSensitive ? normalized : LocalFilesystemAccess.policyFold(normalized)
+        }
+        let changedKey = key(relativeChanged)
+        func causallyChanged(_ rowPath: String) -> Bool {
+            let rowKey = key(rowPath)
+            return rowKey == "." || rowKey == changedKey
+                || rowKey.hasPrefix(changedKey + "/")
+                || changedKey.hasPrefix(rowKey + "/")
+        }
+        let expectedUnchanged = expected.filter { !causallyChanged($0.key) }
+        let currentUnchanged = current.filter { !causallyChanged($0.key) }
+        guard expectedUnchanged.count == currentUnchanged.count else { return false }
+        for (path, value) in expectedUnchanged {
+            guard let pair = currentUnchanged.first(where: { key($0.key) == key(path) }),
+                  pair.value == value else { return false }
+        }
+        // Directories on the causal path legitimately change size/link/time,
+        // but their identity, ownership, flags, xattrs and ACLs must not.
+        func insideChangedSubtree(_ rowPath: String) -> Bool {
+            let rowKey = key(rowPath)
+            return rowKey == changedKey || rowKey.hasPrefix(changedKey + "/")
+        }
+        let expectedMetadata = expectedStable.filter { !insideChangedSubtree($0.key) }
+        let currentMetadata = currentStable.filter { !insideChangedSubtree($0.key) }
+        guard expectedMetadata.count == currentMetadata.count else { return false }
+        for (path, value) in expectedMetadata {
+            guard let pair = currentMetadata.first(where: { key($0.key) == key(path) }),
+                  pair.value == value else { return false }
+        }
+        return true
+    }
+
+    private func validateUndoRestorable(_ action: UndoAction) throws {
+        switch action {
+        case .restoreFile(let workspaceID, let relativePath, _, _, let expected):
+            let current = try resolveExisting(workspaceID: workspaceID, path: relativePath)
+            try OperationSafety.validateMutationTarget(
+                current.url, protectedPaths: protectedMutationPaths
+            )
+            let parent = try WorkspaceDirectory(current.url.deletingLastPathComponent())
+            let revision = try fileRevision(parent: parent, name: current.url.lastPathComponent)
+            guard revision.status.st_mode & S_IFMT == S_IFREG,
+                  revision.status.st_nlink == 1, revision.stamp == expected else {
+                throw LocalMCPError.conflict("file changed after the transaction")
+            }
+        case .removeCreatedPath(let workspaceID, let relativePath, let expected,
+                                let expectedRevision, let expectedRevisionRows,
+                                let expectedStableMetadataRows, let expectedMetadata, let stamp):
+            let current = try resolveExisting(workspaceID: workspaceID, path: relativePath)
+            try OperationSafety.validateMutationTarget(
+                current.url, protectedPaths: protectedMutationPaths
+            )
+            let parent = try WorkspaceDirectory(current.url.deletingLastPathComponent())
+            let snapshot = try parent.snapshot(current.url.lastPathComponent, logicalPath: current.url.path)
+            guard createdPathSnapshotMatchesUndo(
+                snapshot,
+                expectedDigest: expected,
+                expectedRevisionDigest: expectedRevision,
+                expectedRevisionRows: expectedRevisionRows,
+                expectedStableMetadataRows: expectedStableMetadataRows,
+                expectedRootMetadataDigest: expectedMetadata,
+                expectedRootStamp: stamp
+            ) else {
+                throw LocalMCPError.conflict("created path changed after the transaction")
+            }
+        case .moveBack(let workspaceID, let source, let destination, let expected,
+                       let expectedRevision, let stamp):
+            let sourcePath = try resolveDestination(workspaceID: workspaceID, path: source)
+            try OperationSafety.validateMutationTarget(
+                sourcePath.url, protectedPaths: protectedMutationPaths
+            )
+            guard sourcePath.status == nil else {
+                throw LocalMCPError.conflict("original move source is no longer empty")
+            }
+            let current = try resolveExisting(workspaceID: workspaceID, path: destination)
+            try OperationSafety.validateMutationTarget(
+                current.url, protectedPaths: protectedMutationPaths
+            )
+            let parent = try WorkspaceDirectory(current.url.deletingLastPathComponent())
+            let snapshot = try parent.snapshot(current.url.lastPathComponent, logicalPath: current.url.path)
+            guard TreeRootStamp(snapshot.root.version) == stamp,
+                  snapshot.digest == expected, snapshot.revisionDigest == expectedRevision else {
+                throw LocalMCPError.conflict("moved path changed after the transaction")
+            }
+        case .restoreRemovedPath(let workspaceID, let original, let recovery, let expected,
+                                 let expectedRevision, let stamp):
+            let originalPath = try resolveDestination(workspaceID: workspaceID, path: original)
+            try OperationSafety.validateMutationTarget(
+                originalPath.url, protectedPaths: protectedMutationPaths
+            )
+            guard originalPath.status == nil else {
+                throw LocalMCPError.conflict("removed path destination is no longer empty")
+            }
+            let current = try resolveExisting(workspaceID: workspaceID, path: recovery)
+            try OperationSafety.validateMutationTarget(
+                current.url, protectedPaths: protectedMutationPaths
+            )
+            let parent = try WorkspaceDirectory(current.url.deletingLastPathComponent())
+            let snapshot = try parent.snapshot(current.url.lastPathComponent, logicalPath: current.url.path)
+            guard TreeRootStamp(snapshot.root.version) == stamp,
+                  snapshot.digest == expected, snapshot.revisionDigest == expectedRevision else {
+                throw LocalMCPError.conflict("recovery path changed after removal")
+            }
+        case .restoreRelocatedPath(
+            let workspaceID, let original, let recovery, let stamp
+        ):
+            let originalPath = try resolveDestination(
+                workspaceID: workspaceID, path: original
+            )
+            try OperationSafety.validateMutationTarget(
+                originalPath.url, protectedPaths: protectedMutationPaths
+            )
+            guard originalPath.status == nil else {
+                throw LocalMCPError.conflict("recovery destination is no longer empty")
+            }
+            let current = try resolveExisting(workspaceID: workspaceID, path: recovery)
+            try OperationSafety.validateMutationTarget(
+                current.url, protectedPaths: protectedMutationPaths
+            )
+            guard TreeRootStamp(try lstatValue(current.url.path))
+                .hasSameStableRoot(as: stamp) else {
+                throw LocalMCPError.conflict("relocated recovery root identity changed")
+            }
+        case .composite(let actions):
+            for item in actions { try validateUndoRestorable(item) }
+        }
+    }
+
     public func workspaceURL(workspaceID: String, relativePath: String) throws -> URL {
         try resolveExisting(
             workspaceID: workspaceID, path: relativePath, allowRoot: true
         ).url
+    }
+
+    func diagnosticAvailability() -> (registered: Int, available: Int) {
+        let workspaces = registry.workspaces
+        let available = workspaces.reduce(into: 0) { count, workspace in
+            var status = stat()
+            if lstat(workspace.rootURL.path, &status) == 0,
+               status.st_mode & S_IFMT == S_IFDIR,
+               (try? WorkspaceDirectory(workspace.rootURL)) != nil {
+                count += 1
+            }
+        }
+        return (workspaces.count, available)
+    }
+
+    private func fileRevision(
+        parent: WorkspaceDirectory,
+        name: String
+    ) throws -> (data: Data, status: stat, stamp: FileRevisionStamp) {
+        let fd = try parent.openFile(name)
+        defer { close(fd) }
+        var status = stat()
+        guard fstat(fd, &status) == 0,
+              status.st_mode & S_IFMT == S_IFREG,
+              status.st_nlink == 1,
+              status.st_size >= 0,
+              status.st_size <= Self.maximumFileBytes else {
+            throw LocalMCPError.wrongFileType
+        }
+        let data = try LocalFileReader.read(
+            descriptor: fd, maximumBytes: Self.maximumFileBytes
+        )
+        let stamp = FileRevisionStamp(status, sha256: LocalHash.sha256(data))
+        return (data, status, stamp)
+    }
+
+    private func verifyPreimage(
+        parent: WorkspaceDirectory,
+        name: String,
+        expected: FileRevisionStamp?
+    ) throws {
+        guard let expected else {
+            guard try parent.status(name) == nil else {
+                if let current = try? fileRevision(parent: parent, name: name) {
+                    throw LocalMCPError.createOnlyConflict(
+                        currentSHA256: current.stamp.sha256,
+                        modifiedMilliseconds: current.stamp.modifiedMilliseconds
+                    )
+                }
+                throw LocalMCPError.conflict("new-file destination appeared before publication")
+            }
+            return
+        }
+        let current = try fileRevision(parent: parent, name: name)
+        guard current.stamp == expected else {
+            throw LocalMCPError.casConflict(
+                expectedSHA256: expected.sha256,
+                currentSHA256: current.stamp.sha256,
+                modifiedMilliseconds: current.stamp.modifiedMilliseconds
+            )
+        }
     }
 
     private func resolveExisting(
@@ -1597,7 +3172,7 @@ public final class LocalWorkspaceService: @unchecked Sendable {
     private func storeTransaction(id: String, action: UndoAction) {
         transactionLock.lock()
         nextTransactionSequence += 1
-        let transaction = StoredTransaction(action: action, sequence: nextTransactionSequence)
+        let transaction = StoredTransaction(action: action, sequence: nextTransactionSequence, workID: nil)
         transactions[id] = transaction
         retainedUndoFileBytes += transaction.retainedFileBytes
         transactionLock.unlock()
@@ -1614,6 +3189,8 @@ public final class LocalWorkspaceService: @unchecked Sendable {
         result["backend_called"] = true
         result["mutation_performed"] = true
         result["execution_backend"] = "direct_filesystem"
+        result["recoverable"] = true
+        result["blocks_reload"] = true
         return result
     }
 }

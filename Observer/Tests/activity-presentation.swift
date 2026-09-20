@@ -52,8 +52,8 @@ enum ActivityPresentationTests {
         let large = ActivityPresentation.event(["tool": "file_read", "state": "returned", "path": String(repeating: "x", count: 5000)], connected: true)
         check("Subject display bounded", large.subtitle.count < 200)
         check("Raw content never rendered", !ActivityPresentation.event(["tool": "file_write", "state": "returned", "content": "PRIVATE_CONTENT"], connected: true).subtitle.contains("PRIVATE_CONTENT"))
-        let expanded = "tool_catalog workspace_inspect file_read_lines file_tail file_compare file_search_many directory_summary directory_find file_apply_edits file_write_many command_list process_wait process_status_many process_output_tail process_output_many git_status git_diff git_log git_show git_branches git_worktrees git_blame git_file_list".split(separator: " ").map(String.init)
-        check("Exactly 52 tool labels", ActivityPresentation.knownTools.count == 52)
+        let expanded = "tool_catalog workspace_inspect file_read_lines file_tail file_compare file_search_many directory_summary directory_find file_apply_edits file_write_many command_list process_wait process_status_many process_output_tail process_output_many git_status git_diff git_log git_show git_branches git_worktrees git_blame git_file_list work_task bridge_diagnostic workspace_resolve project_read_bundle file_json_patch artifact_snapshot brevo_read brevo_campaign brevo_automations brevo_contacts brevo_deliverability brevo_events brevo_lists brevo_reports brevo_segments brevo_templates brevo_transactional brevo_webhooks".split(separator: " ").map(String.init)
+        check("Exactly 74 tool labels", ActivityPresentation.knownTools.count == 74)
         for tool in ["developer_inspect", "developer_task"] + expanded {
             check("Human label " + tool, !event(tool).title.contains(tool))
             check("Known action " + tool, ActivityPresentation.knownTools.contains(tool))

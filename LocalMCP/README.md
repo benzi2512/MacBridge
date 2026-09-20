@@ -1,7 +1,7 @@
 # MacBridge Direct Local MCP
 
-The current source catalog contains 72 tools, including twelve grouped Brevo
-tools. See [Brevo capabilities and acceptance](BREVO-CAPABILITIES.md) for the
+The current source catalog includes twelve grouped Brevo tools. See
+[Brevo capabilities and acceptance](BREVO-CAPABILITIES.md) for the
 fixed-account API coverage, typed actions, gates and known API limits. This
 describes source functionality; verify installed build and host discovery.
 
@@ -10,8 +10,8 @@ existing Meta Ads connector's URL route. They do not access Meta credentials or
 create ads. See [media transfer candidate and deployment gates](MEDIA-TRANSFER.md).
 No storage or sharing is enabled by installing source alone.
 
-The candidate also adds three opt-in tools for Finder/document opening, scoped
-shell networking and selected-app Accessibility. They are off in existing
+The candidate also adds two opt-in tools for Finder/document opening and scoped
+shell networking. They are off in existing
 configurations. See [Desktop access and permission boundaries](DESKTOP-ACCESS.md)
 before enabling them; native and normal-Chat acceptance are separate gates.
 
@@ -92,10 +92,11 @@ reconnect supervisor. The existing outbound adapter owns remote transport and
 reconnect behavior. The Web surface accepts a resumed negotiated remote session
 without requiring another local initialization handshake; Desktop Local still
 requires `initialize` followed by `notifications/initialized`. The immutable
-catalog advertises `tools.listChanged=false` and sends no unsolicited catalog
-notifications. ChatGPT owns its conversation-local registry; a local notification
-cannot repair a host-disabled app and must not make a stable catalog appear dynamic.
-Neither build ID nor uptime alone proves the remote connector is reachable.
+catalog advertises `tools.listChanged=true`; hosts must reload schemas when the
+catalog digest or `binding_epoch` changes. ChatGPT owns its conversation-local
+registry, so this signal and a successful core health call cannot by themselves
+repair a host-disabled app. Neither build ID nor uptime alone proves the remote
+connector or host binding is callable. See `HOST-BINDING-RECOVERY.md`.
 
 ### Explicit access across the Mac
 
@@ -121,7 +122,8 @@ volume, and removes empty recovery directories after restoration.
 This matrix records the earlier functional baseline and test coverage, not a
 fresh acceptance result for every rebuilt release. Revalidate the exact final
 artifact; source or fixture results do not establish host-side or clean-machine
-readiness. The first-run UI is described in the [release guide](../Release/FIRST-RUN.md).
+readiness. Local setup and connection behavior are described in the
+[observer guide](../Observer/README.md#connection).
 
 | Workflow | Implementation/tool | Fixed evidence | Current status | Declared limit |
 |---|---|---|---|---|
@@ -136,7 +138,7 @@ readiness. The first-run UI is described in the [release guide](../Release/FIRST
 
 ## Operational limits
 
-- The source catalog contains 72 tools, including twelve Brevo tools, `developer_inspect`, `developer_task`, `work_task`, `transaction_list`,
+- The source catalog includes twelve Brevo tools, `developer_inspect`, `developer_task`, `work_task`, `transaction_list`,
   `transaction_accept`, `bridge_activity_view` and `bridge_activity`. See current deployment (private deployment notes excluded) for
   the installed artifact and its acceptance limits. A Chat client can cache an
   older schema or load tools on demand. Use the host's available tool discovery
@@ -144,16 +146,17 @@ readiness. The first-run UI is described in the [release guide](../Release/FIRST
   same as not discoverable. Capability counts alone do not prove callability.
   `initialize.instructions` describes direct use and selective discovery without
   repeating all names; `bridge_capabilities.tool_names` exposes the live index.
-  `tool_catalog` defaults to 13 starter tools (explicitly truncated); `limit=72`
-  gives the full 71-entry canonical index. All 72 tools remain in `tools/list`. Bounded
+  `tool_catalog` defaults to 13 starter tools (explicitly truncated); set its
+  limit to the live `catalog_count` for the complete canonical index. All tools remain in `tools/list`. Bounded
   `query`/`category` filters return up to 5 suggestions by default. `names`
   preserves exact-schema lookup, and explicit `detail: "schemas"` still returns
-  the complete 72-tool catalog. `workspace_list` remains a deprecated callable
+  the complete live tool catalog. `workspace_list` remains a deprecated callable
   alias for compatibility. All schemas derive from `tools/list`; none of these
   metadata lookups force host loading or override approvals. See TOOL-GUIDE.md.
   `file_read_many` reads up to 32 initial file chunks with a shared 1 MiB raw-byte
   ceiling, explicit per-item errors, EOF and next offsets. Check `complete`; a
-  returned batch is not necessarily complete or an atomic snapshot. Continue
+  returned batch is not necessarily complete; set `snapshot_consistent=true`
+  for pre/post fingerprint validation under the bridge mutation lock. Continue
   partial files with `file_read`. `file_stat_many` makes content hashing opt-in.
   Both tools reuse the existing workspace, credential and symlink boundaries.
   `file_read` uses byte offsets, `next_offset`,

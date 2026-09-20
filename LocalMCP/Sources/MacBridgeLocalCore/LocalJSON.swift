@@ -4,6 +4,23 @@ import Foundation
 
 public typealias JSONObject = [String: Any]
 
+public struct RecoveryTransactionReceipt: Sendable {
+    public let transactionID: String
+    public let transactionControlToken: String
+
+    public init(transactionID: String, transactionControlToken: String) {
+        self.transactionID = transactionID
+        self.transactionControlToken = transactionControlToken
+    }
+
+    var jsonObject: JSONObject {
+        [
+            "transaction_id": transactionID,
+            "transaction_control_token": transactionControlToken,
+        ]
+    }
+}
+
 public enum LocalMCPError: Error, CustomStringConvertible {
     case invalidRequest(String)
     case invalidConfiguration(String)
@@ -13,9 +30,14 @@ public enum LocalMCPError: Error, CustomStringConvertible {
     case notFound
     case wrongFileType
     case conflict(String)
+    case casConflict(expectedSHA256: String, currentSHA256: String, modifiedMilliseconds: Int64)
+    case createOnlyConflict(currentSHA256: String, modifiedMilliseconds: Int64)
     case limitExceeded(String)
     case unsupportedCommand
     case processNotFound
+    case compensated(String)
+    case partial(String)
+    case recoveryRequired(String, recoveryTransactions: [RecoveryTransactionReceipt])
     case operationFailed(String)
 
     public var description: String {
@@ -28,12 +50,76 @@ public enum LocalMCPError: Error, CustomStringConvertible {
         case .notFound: "Path not found."
         case .wrongFileType: "Path has an unsupported file type."
         case .conflict(let value): "State conflict: \(value)"
+        case .casConflict: "State conflict: expected_sha256 does not match current content"
+        case .createOnlyConflict: "State conflict: create_only target already exists"
         case .limitExceeded(let value): "Limit exceeded: \(value)"
         case .unsupportedCommand: "Command is not in the local executable allowlist."
         case .processNotFound: "Unknown process task."
+        case .compensated(let value): "Operation was compensated after starting: \(value)"
+        case .partial(let value): "Operation completed only in part: \(value)"
+        case .recoveryRequired(let value, _): value
         case .operationFailed(let value): "Operation failed: \(value)"
         }
     }
+
+    /// Stable, machine-readable error metadata. The legacy string remains in
+    /// tool results for older clients; new clients should branch on `code` and
+    /// `operation_outcome`, never on localized prose.
+    public var detail: JSONObject {
+        let code: String
+        let retrySafe: Bool
+        let action: String
+        let outcome: String
+        switch self {
+        case .invalidRequest: code = "INVALID_REQUEST"; retrySafe = false; action = "correct_request"; outcome = "not_started"
+        case .invalidConfiguration: code = "INVALID_CONFIGURATION"; retrySafe = false; action = "repair_owner_configuration"; outcome = "not_started"
+        case .unknownWorkspace: code = "WORKSPACE_NOT_FOUND"; retrySafe = false; action = "call_workspace_overview_or_workspace_resolve"; outcome = "not_started"
+        case .invalidPath: code = "INVALID_PATH"; retrySafe = false; action = "correct_scoped_path"; outcome = "not_started"
+        case .sensitivePathBlocked: code = "PERMISSION_DENIED"; retrySafe = false; action = "choose_noncredential_path"; outcome = "not_started"
+        case .notFound: code = "PATH_NOT_FOUND"; retrySafe = true; action = "refresh_path_state"; outcome = "not_started"
+        case .wrongFileType: code = "UNSUPPORTED_FILE_TYPE"; retrySafe = false; action = "choose_supported_regular_file_or_directory"; outcome = "not_started"
+        case .conflict: code = "STATE_CONFLICT"; retrySafe = false; action = "read_current_state"; outcome = "not_started"
+        case .casConflict: code = "CAS_CONFLICT"; retrySafe = false; action = "read_current_revision"; outcome = "not_started"
+        case .createOnlyConflict: code = "CREATE_ONLY_CONFLICT"; retrySafe = false; action = "choose_new_path_or_read_current_revision"; outcome = "not_started"
+        case .limitExceeded: code = "LIMIT_EXCEEDED"; retrySafe = false; action = "reduce_scope_or_release_retained_state"; outcome = "not_started"
+        case .unsupportedCommand: code = "COMMAND_NOT_ALLOWED"; retrySafe = false; action = "call_command_list"; outcome = "not_started"
+        case .processNotFound: code = "PROCESS_NOT_FOUND"; retrySafe = false; action = "call_process_list"; outcome = "not_started"
+        case .compensated: code = "OPERATION_COMPENSATED"; retrySafe = false; action = "inspect_content_and_metadata_before_retry"; outcome = "compensated_content_and_mode_metadata_identity_may_differ"
+        case .partial, .recoveryRequired: code = "OPERATION_PARTIAL"; retrySafe = false; action = "inspect_then_use_recovery_transaction"; outcome = "partially_completed_remaining_undo_retained"
+        case .operationFailed: code = "OPERATION_FAILED"; retrySafe = false; action = "inspect_before_retry"; outcome = "unknown"
+        }
+        var value: JSONObject = [
+            "code": code,
+            "layer": "core",
+            "message": description,
+            "retry_safe": retrySafe,
+            "recommended_action": action,
+            "operation_outcome": outcome,
+        ]
+        if case .casConflict(let expected, let current, let modified) = self {
+            value["expected_sha256"] = expected
+            value["current_sha256"] = current
+            value["current_modified_milliseconds"] = modified
+        }
+        if case .createOnlyConflict(let hash, let modified) = self {
+            value["current_sha256"] = hash
+            value["current_modified_milliseconds"] = modified
+        }
+        if case .recoveryRequired(_, let transactions) = self {
+            value["recovery_transactions"] = transactions.map(\.jsonObject)
+        }
+        return value
+    }
+}
+
+public func localErrorDetail(_ error: Error) -> JSONObject {
+    if let error = error as? LocalMCPError { return error.detail }
+    return [
+        "code": "INTERNAL_ERROR", "layer": "core",
+        "message": "Direct local operation failed.",
+        "retry_safe": false, "recommended_action": "inspect_before_retry",
+        "operation_outcome": "unknown",
+    ]
 }
 
 public enum LocalJSON {

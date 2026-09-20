@@ -31,6 +31,7 @@ checks = []
 sequence = 0
 p = None
 identity = None
+process_tokens = {}
 
 def check(name, condition):
     checks.append({"name": name, "pass": bool(condition)})
@@ -39,6 +40,11 @@ def check(name, condition):
 
 def rpc(name, **arguments):
     global sequence
+    arguments = dict(arguments)
+    task_id = arguments.get("task_id")
+    if name in {"process_wait", "process_output", "process_output_tail", "process_input", "process_cancel"} \
+            and isinstance(task_id, str) and task_id in process_tokens:
+        arguments.setdefault("process_control_token", process_tokens[task_id])
     sequence += 1
     request = {"jsonrpc": "2.0", "id": sequence, "method": "tools/call", "params": {"name": name, "arguments": arguments}}
     p.stdin.write((json.dumps(request) + "\n").encode()); p.stdin.flush()
@@ -49,7 +55,12 @@ def rpc(name, **arguments):
     tool = result.get("result", {})
     if tool.get("isError") or "error" in result:
         raise RuntimeError(json.dumps(result))
-    return tool["structuredContent"]
+    structured = tool["structuredContent"]
+    returned_task_id = structured.get("task_id")
+    returned_token = structured.get("process_control_token")
+    if isinstance(returned_task_id, str) and isinstance(returned_token, str):
+        process_tokens[returned_task_id] = returned_token
+    return structured
 
 def observe(action, expected_error=False, **fields):
     payload = {"action": action, **fields}

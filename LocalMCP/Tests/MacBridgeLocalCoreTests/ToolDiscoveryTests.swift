@@ -13,11 +13,11 @@ final class ToolDiscoveryTests: XCTestCase {
         XCTAssertEqual(try rows().compactMap { $0["name"] as? String }, ToolDiscovery.starterNames)
         XCTAssertEqual(starter["returned_count"] as? Int, 13)
         XCTAssertEqual(starter["truncated"] as? Bool, true)
-        let result = try ToolDiscovery.catalog(["limit": 72]), index = try rows(["limit": 72])
-        XCTAssertEqual(result["catalog_count"] as? Int, 72)
-        XCTAssertEqual(result["canonical_count"] as? Int, 71)
-        XCTAssertEqual(result["returned_count"] as? Int, 71)
-        XCTAssertEqual(result["matched_count"] as? Int, 71)
+        let result = try ToolDiscovery.catalog(["limit": 76]), index = try rows(["limit": 76])
+        XCTAssertEqual(result["catalog_count"] as? Int, 76)
+        XCTAssertEqual(result["canonical_count"] as? Int, 75)
+        XCTAssertEqual(result["returned_count"] as? Int, 75)
+        XCTAssertEqual(result["matched_count"] as? Int, 75)
         XCTAssertEqual(result["truncated"] as? Bool, false)
         XCTAssertEqual(index.count, Set(index.compactMap { $0["canonical_name"] as? String }).count)
         XCTAssertFalse(index.contains { $0["name"] as? String == "workspace_list" })
@@ -149,7 +149,7 @@ final class ToolDiscoveryTests: XCTestCase {
 
     func testStarterDoesNotHideSpecialistToolsOrMisstateCatalogIdentity() throws {
         let all = LocalMCPServer.toolSpecs
-        XCTAssertEqual(all.count, 72)
+        XCTAssertEqual(all.count, 76)
         XCTAssertEqual(Set(ToolDiscovery.starterNames).count, 13)
         XCTAssertTrue(Set(ToolDiscovery.starterNames).isSubset(of: Set(all.compactMap { $0["name"] as? String })))
         let lookups: [JSONObject] = [[:], ["limit": 1], ["limit": 50], ["query": "git blame"], ["detail": "schemas"]]
@@ -157,7 +157,7 @@ final class ToolDiscoveryTests: XCTestCase {
             let result = try ToolDiscovery.catalog(arguments)
             XCTAssertEqual(result["catalog_sha256"] as? String, LocalHash.sha256(try LocalJSON.encode(all)))
             let categories = try XCTUnwrap(result["categories"] as? [JSONObject])
-            XCTAssertEqual(categories.compactMap { $0["count"] as? Int }.reduce(0, +), 71)
+            XCTAssertEqual(categories.compactMap { $0["count"] as? Int }.reduce(0, +), 75)
             XCTAssertEqual(result["matched_count"] as! Int > result["returned_count"] as! Int,
                            result["truncated"] as! Bool)
         }

@@ -25,12 +25,6 @@ enum ToolResultSummary {
             else if r["link_expired"] as? Bool == true { detail = "Transfer link expired; storage deletion is separate" }
             else { detail = "Media inspection returned; no new public link" }
             if let bytes = nonnegative(r["byte_count"]) { detail += "; \(bytes) bytes" }
-        } else if name == "computer_control", r["status"] as? String == "permission_required" {
-            detail = "Accessibility permission is missing; no app action performed"
-        } else if name == "computer_control" {
-            detail = r["action_performed"] as? Bool == true
-                ? "App accepted the requested action; verify the returned UI state"
-                : "App permission or UI snapshot returned; no mutation performed"
         } else if name == "desktop_open", r["request_accepted"] as? Bool == true {
             detail = "macOS accepted the desktop request; window visibility is not verified"
         } else if name == "bridge_capabilities", let count = nonnegative(r["catalog_count"]) {

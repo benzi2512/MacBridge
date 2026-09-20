@@ -71,9 +71,11 @@ final class UndoBudgetTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.workspace.appendingPathComponent("refused").path))
         XCTAssertEqual(service.retainedTransactionCount, 1)
         XCTAssertEqual(try Data(contentsOf: file), Data("external edit".utf8))
-        try Data("done".utf8).write(to: file) // synthetic external conflict resolution
-        _ = try service.restoreTransaction(id)
-        XCTAssertEqual(try Data(contentsOf: file), Data("1234".utf8))
+        try Data("done".utf8).write(to: file)
+        XCTAssertThrowsError(try service.restoreTransaction(id),
+                             "same bytes on a replacement inode are still an external revision")
+        XCTAssertEqual(service.retainedTransactionCount, 1)
+        XCTAssertEqual(try Data(contentsOf: file), Data("done".utf8))
     }
 
     func testZeroCountBudgetRefusesEveryMutationWithoutFilesystemEffects() throws {

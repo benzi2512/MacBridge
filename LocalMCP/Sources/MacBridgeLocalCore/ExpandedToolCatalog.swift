@@ -26,10 +26,16 @@ enum ExpandedToolCatalog {
             base.merging(more) { _, rhs in rhs }
         }
         let edit = object(["old_text": text(262144), "new_text": text(262144)], ["old_text", "new_text"])
-        let write = object(["path": path, "content": text(262144), "expected_sha256": text(64)], ["path", "content"])
+        let write = object(["path": path, "content": text(262144), "expected_sha256": text(64),
+                            "create_only": flag], ["path", "content"])
         let output = object(["task_id": task, "process_control_token": control,
                              "stdout_cursor": integer(0, Int.max),
                              "stderr_cursor": integer(0, Int.max)], ["task_id"])
+        let jsonPatch = object([
+            "op": choice(["add", "replace", "remove", "test"]),
+            "path": text(4096),
+            "value": [:],
+        ], ["op", "path"])
         let git: JSONObject = ["workspace_id": ws, "cwd": path,
                                "maximum_output_bytes": integer(1024, 262144)]
         return [
@@ -65,8 +71,18 @@ enum ExpandedToolCatalog {
                  extend(file, ["pattern": text(256), "recursive": flag, "maximum_entries": integer(1, 10000)]), ["workspace_id", "pattern"]),
             spec("file_apply_edits", "Apply 1-32 unique, non-overlapping literal replacements against one original UTF-8 file (up to 1 MiB). Requires the original SHA-256; all matches validate before one write and one undo transaction. Empty, ambiguous and overlapping matches are refused.",
                  extend(file, ["expected_sha256": text(64), "edits": array(edit, 32)]), ["workspace_id", "path", "expected_sha256", "edits"], write: true),
-            spec("file_write_many", "Write 1-16 explicit UTF-8 files with per-file expected hashes and undo receipts, at most 1 MiB total content. NOT an atomic batch: successful earlier writes remain if another item fails. Never blindly replay uncertain batches; inspect each receipt and restore selected transactions if needed.",
+            spec("file_write_many", "Write 1-16 explicit UTF-8 files under one mutation lock and one composite undo transaction, at most 1 MiB total content. This is a coordinated sequence, not a crash-atomic filesystem transaction: every destination is revalidated immediately before publication and a detected failure triggers verified content/POSIX-mode compensation. Inode identity, extended attributes, ACLs and other metadata are not preserved by compensation. Aliased destinations are refused. Existing files require expected_sha256; create_only refuses an existing target and returns its current revision.",
                  ["workspace_id": ws, "files": array(write, 16)], ["workspace_id", "files"], write: true),
+            spec("project_read_bundle", "Read bounded initial bodies for 1-16 explicit project files in one mutation-consistent snapshot, at most 256 KiB per file and 1 MiB total. Per-file eof plus top-level complete/truncated report whether every body is complete. Returns hashes, project-marker matches and one snapshot token; it never performs a recursive or inferred read.",
+                 ["workspace_id": ws, "paths": array(path, 16)], ["workspace_id", "paths"]),
+            spec("file_json_patch", "Apply 1-32 bounded JSON Pointer operations (add, replace, remove or test) to one JSON file. Requires the exact current SHA-256 and publishes one canonical JSON write with one undo transaction. Test failure or stale content performs no write.",
+                 ["workspace_id": ws, "path": path, "expected_sha256": text(64),
+                  "operations": array(jsonPatch, 32)],
+                 ["workspace_id", "path", "expected_sha256", "operations"], write: true),
+            spec("artifact_snapshot", "Create one immutable-by-convention, content-addressed copy of an explicit file. Requires its exact SHA-256; the destination filename must contain that full hash and must not already exist. Returns one normal undo transaction and never overwrites an artifact.",
+                 ["workspace_id": ws, "source_path": path, "destination_path": path,
+                  "expected_source_sha256": text(64)],
+                 ["workspace_id", "source_path", "destination_path", "expected_source_sha256"], write: true),
             spec("command_list", "List executable IDs actually supported and currently resolvable by this runtime without launching them. Use these IDs, not arbitrary absolute executable paths. No version probes or environment-variable values.", [:], []),
             spec("process_wait", "Optional wait up to 1000 ms for one existing job; no kill or output consumption. Not a required step before output. Observation timeout is not job failure. Its bounded wait is dispatched off the MCP request loop so other chats remain responsive; do other work between checks instead of frequent polling.",
                  ["task_id": task, "process_control_token": control,

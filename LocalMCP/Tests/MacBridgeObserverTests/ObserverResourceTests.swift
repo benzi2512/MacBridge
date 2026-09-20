@@ -68,4 +68,5 @@ final class ObserverResourceTests: XCTestCase {
         ObserverPollingCadence.delayNanoseconds(appActive: active, activeWork: work,
             lowPower: lowPower, consecutiveFailures: failures) / 1_000_000_000
     }
+
 }

@@ -284,6 +284,46 @@ final class FloatingDockingTests: XCTestCase {
     }
 
     @MainActor
+    func testPresentedNonactivatingPanelRetainsEveryDeclaredTargetAndRejectsTransparentCanvas() {
+        _ = NSApplication.shared
+        let panel = NSPanel(contentRect: NSRect(x: -10_000, y: -10_000, width: 220, height: 260),
+                            styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel.backgroundColor = .clear
+        panel.isOpaque = false
+        panel.hasShadow = false
+        panel.ignoresMouseEvents = false
+        panel.becomesKeyOnlyIfNeeded = true
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 260))
+        let host = FloatingFirstClickHostingView(rootView: EmptyView())
+        host.sizingOptions = []
+        host.frame = NSRect(x: 120, y: 20, width: 80, height: 220)
+        let declaredTargets = (0..<5).map { index in
+            NSRect(x: 24, y: CGFloat(index) * MBMetrics.edgeTargetSize,
+                   width: MBMetrics.edgeTargetSize, height: MBMetrics.edgeTargetSize)
+        }
+        host.acceptsInteractivePoint = { point in declaredTargets.contains { $0.contains(point) } }
+        container.addSubview(host)
+        panel.contentView = container
+        panel.orderFront(nil)
+        defer { panel.orderOut(nil); panel.close() }
+        container.layoutSubtreeIfNeeded()
+        host.layoutSubtreeIfNeeded()
+
+        XCTAssertTrue(panel.isVisible, "The acceptance fixture must be a presented AppKit panel")
+        XCTAssertFalse(panel.isKeyWindow, "The floating widget must not take application focus")
+        for target in declaredTargets {
+            let pointInHost = NSPoint(x: target.midX, y: target.midY)
+            let pointInContainer = host.convert(pointInHost, to: container)
+            XCTAssertNotNil(host.hitTest(pointInContainer),
+                            "Every complete 44-point rail target must stay inside the presented panel")
+        }
+        let transparentPointInHost = NSPoint(x: 4, y: 4)
+        let transparentPointInContainer = host.convert(transparentPointInHost, to: container)
+        XCTAssertNil(host.hitTest(transparentPointInContainer),
+                     "Transparent backing canvas must not consume a click intended for the app underneath")
+    }
+
+    @MainActor
     func testLogoHitTestingConvertsFromSuperviewCoordinatesExactlyOnce() {
         let container = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 300))
         let logo = FloatingLogoControl.LogoView(frame: NSRect(x: 120, y: 80, width: 44, height: 44))

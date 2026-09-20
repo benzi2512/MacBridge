@@ -276,7 +276,7 @@ final class ServerAndProcessTests: XCTestCase {
                 "params": [:] as JSONObject,
             ]))
         let result = try XCTUnwrap(listed["result"] as? JSONObject)
-        XCTAssertEqual((result["tools"] as? [JSONObject])?.count, 72)
+        XCTAssertEqual((result["tools"] as? [JSONObject])?.count, 76)
 
         let capabilities = try server.callTool(name: "bridge_capabilities", arguments: [:])
         XCTAssertEqual(capabilities["chatgpt_mode"] as? String, "CHATGPT_FULL")
@@ -396,7 +396,7 @@ final class ServerAndProcessTests: XCTestCase {
             ])
         )
         let listResult = try XCTUnwrap(listed["result"] as? JSONObject)
-        XCTAssertEqual((listResult["tools"] as? [JSONObject])?.count, 72)
+        XCTAssertEqual((listResult["tools"] as? [JSONObject])?.count, 76)
 
         let called = try XCTUnwrap(
             server.handle([
@@ -686,6 +686,135 @@ final class ServerAndProcessTests: XCTestCase {
         XCTAssertEqual(result["exit_code"] as? Int, 0, result["stderr"] as? String ?? "")
         Thread.sleep(forTimeInterval: 1.25)
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    func testCancelKillsDescendantThatCreatesANewSession() throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let processes = LocalProcessService(
+            workspaceService: try fixture.service(), selfExecutable: try testBinary()
+        )
+        let marker = fixture.workspace.appendingPathComponent("setsid-orphan-marker")
+        let ready = fixture.workspace.appendingPathComponent("setsid-orphan-ready")
+        let parent = """
+        import os,time
+        first=os.fork()
+        if first==0:
+            os.setsid()
+            second=os.fork()
+            if second>0: os._exit(0)
+            for fd in (0,1,2):
+                try: os.close(fd)
+                except OSError: pass
+            os.execv('/bin/sh', ['sh', '-c',
+                '/usr/bin/touch setsid-orphan-ready; /bin/sleep 1; /usr/bin/touch setsid-orphan-marker'])
+        time.sleep(10)
+        """
+        let started = try processes.startCommand(
+            workspaceID: fixture.workspaceID,
+            executableID: "python3",
+            arguments: ["-c", parent],
+            cwd: ".",
+            maximumOutputBytes: 4_096
+        )
+        let taskID = try XCTUnwrap(started["task_id"] as? String)
+        for _ in 0..<100 where !FileManager.default.fileExists(atPath: ready.path) {
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: ready.path))
+        let cancelled = try processes.cancelProcess(taskID: taskID)
+        XCTAssertEqual(cancelled["cancelled"] as? Bool, true)
+        XCTAssertEqual(cancelled["running"] as? Bool, false)
+        Thread.sleep(forTimeInterval: 1.15)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    func testDetachedPythonSubprocessCannotOutliveSuccessfulCommand() throws {
+        let fixture = try Fixture(); defer { fixture.remove() }
+        let processes = LocalProcessService(
+            workspaceService: try fixture.service(), selfExecutable: try testBinary()
+        )
+        let marker = fixture.workspace.appendingPathComponent("popen-detached-marker")
+        let script = """
+        import subprocess
+        subprocess.Popen(
+            ['/bin/sh', '-c', 'sleep 0.6; printf escaped > popen-detached-marker'],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True)
+        """
+        let result = try processes.runCommand(
+            workspaceID: fixture.workspaceID, executableID: "python3",
+            arguments: ["-c", script], cwd: ".", timeoutMilliseconds: 2_000,
+            maximumOutputBytes: 1_024
+        )
+        XCTAssertEqual(result["exit_code"] as? Int, 0, result["stderr"] as? String ?? "")
+        Thread.sleep(forTimeInterval: 0.9)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    func testCompletedSupervisorDoesNotReapConcurrentSiblingJob() throws {
+        let fixture = try Fixture(); defer { fixture.remove() }
+        let processes = LocalProcessService(
+            workspaceService: try fixture.service(), selfExecutable: try testBinary()
+        )
+        let sibling = try processes.startCommand(
+            workspaceID: fixture.workspaceID, executableID: "zsh",
+            arguments: ["-lc", "sleep 0.5; printf sibling-ok"], cwd: ".",
+            maximumOutputBytes: 1_024
+        )
+        let siblingID = try XCTUnwrap(sibling["task_id"] as? String)
+        let short = try processes.runCommand(
+            workspaceID: fixture.workspaceID, executableID: "true", arguments: [],
+            cwd: ".", timeoutMilliseconds: 2_000, maximumOutputBytes: 1_024
+        )
+        XCTAssertEqual(short["exit_code"] as? Int, 0)
+        var status = try processes.processStatus(taskID: siblingID)
+        for _ in 0..<200 where status["running"] as? Bool == true {
+            Thread.sleep(forTimeInterval: 0.01)
+            status = try processes.processStatus(taskID: siblingID)
+        }
+        XCTAssertEqual(status["exit_code"] as? Int, 0)
+        let output = try processes.processOutput(
+            taskID: siblingID, stdoutCursor: 0, stderrCursor: 0,
+            maximumBytesPerStream: 1_024
+        )
+        XCTAssertEqual(output["stdout"] as? String, "sibling-ok")
+    }
+
+    func testRunnerEntryPointRefusesDirectUnsandboxedInvocation() throws {
+        let sentinel = Process()
+        sentinel.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        sentinel.arguments = ["2"]
+        sentinel.standardOutput = FileHandle.nullDevice
+        sentinel.standardError = FileHandle.nullDevice
+        try sentinel.run()
+        defer {
+            if sentinel.isRunning { sentinel.terminate() }
+            sentinel.waitUntilExit()
+        }
+        let direct = Process()
+        direct.executableURL = try testBinary()
+        direct.arguments = ["--runner-child", String(getpid()), "/usr/bin/true"]
+        direct.standardOutput = FileHandle.nullDevice
+        direct.standardError = FileHandle.nullDevice
+        try direct.run()
+        direct.waitUntilExit()
+        XCTAssertEqual(direct.terminationStatus, 75)
+        XCTAssertTrue(sentinel.isRunning)
+    }
+
+    func testSupervisorPreservesChildSignalTerminationSemantics() throws {
+        let fixture = try Fixture(); defer { fixture.remove() }
+        let processes = LocalProcessService(
+            workspaceService: try fixture.service(), selfExecutable: try testBinary()
+        )
+        let result = try processes.runCommand(
+            workspaceID: fixture.workspaceID, executableID: "sh",
+            arguments: ["-c", "kill -TERM $$"], cwd: ".",
+            timeoutMilliseconds: 2_000, maximumOutputBytes: 1_024
+        )
+        XCTAssertEqual(result["exit_code"] as? Int, Int(SIGTERM))
+        XCTAssertEqual(result["termination_reason"] as? String, "uncaught_signal")
     }
 
     func testNaturalBackgroundExitCleansRuntimeWithoutPolling() throws {
@@ -1522,10 +1651,8 @@ final class ServerAndProcessTests: XCTestCase {
 
     private func testBinary() throws -> URL {
         let candidate = packageRoot().appendingPathComponent(".build/debug/macbridge-mcp")
-        guard FileManager.default.isExecutableFile(atPath: candidate.path) else {
-            throw XCTSkip("macbridge-mcp debug product is unavailable")
-        }
-        return candidate
+        return try XCTUnwrap(FileManager.default.isExecutableFile(atPath: candidate.path) ? candidate : nil,
+                             "macbridge-mcp debug product is required for process qualification")
     }
 
     private func packageRoot() -> URL {
