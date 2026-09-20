@@ -537,6 +537,7 @@ final class WorkspaceMutationBoundaryTests: XCTestCase {
         )
         var transactionID: String?
         var transactionToken: String?
+        var recoveryReceipt: JSONObject?
         XCTAssertThrowsError(try server.callTool(name: "path_move", arguments: [
             "workspace_id": fixture.workspaceID,
             "source_path": "move-source",
@@ -550,11 +551,35 @@ final class WorkspaceMutationBoundaryTests: XCTestCase {
             transactionToken = receipt?.transactionControlToken
             XCTAssertNotNil(transactionID)
             XCTAssertNotNil(transactionToken)
+            XCTAssertNotNil(UUID(uuidString: receipt?.transactionControlToken ?? ""))
             XCTAssertEqual(
                 (localErrorDetail(error)["recovery_transactions"] as? [JSONObject])?.count,
                 1
             )
+            recoveryReceipt = (localErrorDetail(error)["recovery_transactions"] as? [JSONObject])?.first
         }
+        let receipt = try XCTUnwrap(recoveryReceipt)
+        let instanceID = try XCTUnwrap(receipt["instance_id"] as? String)
+        XCTAssertNotNil(UUID(uuidString: instanceID))
+        let resolution = try XCTUnwrap(receipt["transaction_resolution"] as? JSONObject)
+        XCTAssertEqual(resolution["required_before_task_completion"] as? Bool, true)
+        let keep = try XCTUnwrap(resolution["keep_changes"] as? JSONObject)
+        XCTAssertEqual(keep["tool"] as? String, "transaction_accept")
+        let keepArguments = try XCTUnwrap(keep["arguments"] as? JSONObject)
+        XCTAssertEqual(keepArguments["instance_id"] as? String, instanceID)
+        XCTAssertEqual(
+            keepArguments["transaction_ids"] as? [String],
+            [try XCTUnwrap(transactionID)]
+        )
+        XCTAssertEqual(
+            keepArguments["transaction_control_tokens"] as? [String],
+            [try XCTUnwrap(transactionToken)]
+        )
+        let rollback = try XCTUnwrap(resolution["rollback"] as? JSONObject)
+        XCTAssertEqual(rollback["tool"] as? String, "transaction_restore")
+        let rollbackArguments = try XCTUnwrap(rollback["arguments"] as? JSONObject)
+        XCTAssertEqual(rollbackArguments["transaction_id"] as? String, transactionID)
+        XCTAssertEqual(rollbackArguments["transaction_control_token"] as? String, transactionToken)
         try FileManager.default.removeItem(at: source)
         _ = try server.callTool(name: "transaction_restore", arguments: [
             "transaction_id": try XCTUnwrap(transactionID),
@@ -591,6 +616,7 @@ final class WorkspaceMutationBoundaryTests: XCTestCase {
         )
         var transactionID: String?
         var transactionToken: String?
+        var recoveryReceipt: JSONObject?
         XCTAssertThrowsError(try server.callTool(name: "directory_create", arguments: [
             "workspace_id": fixture.workspaceID,
             "path": "created",
@@ -600,15 +626,22 @@ final class WorkspaceMutationBoundaryTests: XCTestCase {
             }
             transactionID = receipts.first?.transactionID
             transactionToken = receipts.first?.transactionControlToken
+            recoveryReceipt = (localErrorDetail(error)["recovery_transactions"] as? [JSONObject])?.first
         }
-        _ = try server.callTool(name: "transaction_restore", arguments: [
-            "transaction_id": try XCTUnwrap(transactionID),
-            "transaction_control_token": try XCTUnwrap(transactionToken),
-        ])
-        XCTAssertFalse(FileManager.default.fileExists(
+        let receipt = try XCTUnwrap(recoveryReceipt)
+        let resolution = try XCTUnwrap(receipt["transaction_resolution"] as? JSONObject)
+        let keep = try XCTUnwrap(resolution["keep_changes"] as? JSONObject)
+        let keepArguments = try XCTUnwrap(keep["arguments"] as? JSONObject)
+        _ = try server.callTool(name: try XCTUnwrap(keep["tool"] as? String), arguments: keepArguments)
+        XCTAssertTrue(FileManager.default.fileExists(
             atPath: fixture.workspace.appendingPathComponent("created").path
         ))
         XCTAssertEqual(service.retainedTransactionCount, 0)
+        XCTAssertThrowsError(try server.callTool(name: "transaction_restore", arguments: [
+            "transaction_id": try XCTUnwrap(transactionID),
+            "transaction_control_token": try XCTUnwrap(transactionToken),
+        ]))
+        try FileManager.default.removeItem(at: fixture.workspace.appendingPathComponent("created"))
     }
 
     func testCopyPreservesFileMetadataAndRestoresOrdinaryTrees() throws {

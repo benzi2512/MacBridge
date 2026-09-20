@@ -5,18 +5,44 @@ import Foundation
 public typealias JSONObject = [String: Any]
 
 public struct RecoveryTransactionReceipt: Sendable {
+    public let instanceID: String
     public let transactionID: String
     public let transactionControlToken: String
 
-    public init(transactionID: String, transactionControlToken: String) {
+    public init(
+        instanceID: String,
+        transactionID: String,
+        transactionControlToken: String
+    ) {
+        self.instanceID = instanceID
         self.transactionID = transactionID
         self.transactionControlToken = transactionControlToken
     }
 
     var jsonObject: JSONObject {
         [
+            "instance_id": instanceID,
             "transaction_id": transactionID,
             "transaction_control_token": transactionControlToken,
+            "transaction_resolution": [
+                "required_before_task_completion": true,
+                "instruction": "Verify the intended current state, then accept to keep it or restore to roll it back. Do not leave a completed scheduled or normal-Chat mutation retained.",
+                "keep_changes": [
+                    "tool": "transaction_accept",
+                    "arguments": [
+                        "instance_id": instanceID,
+                        "transaction_ids": [transactionID],
+                        "transaction_control_tokens": [transactionControlToken],
+                    ] as JSONObject,
+                ] as JSONObject,
+                "rollback": [
+                    "tool": "transaction_restore",
+                    "arguments": [
+                        "transaction_id": transactionID,
+                        "transaction_control_token": transactionControlToken,
+                    ] as JSONObject,
+                ] as JSONObject,
+            ] as JSONObject,
         ]
     }
 }

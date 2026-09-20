@@ -3,6 +3,37 @@ import XCTest
 @testable import MacBridgeLocalCore
 
 final class DesktopAccessDispatchTests: XCTestCase {
+    func testOnlyDefaultOwnerPolicyCanEnableFixedDesktopOpenOnBroadRoot() throws {
+        let ownerPolicy = URL(fileURLWithPath: "/Users/example/.config/macbridge/workspaces.json")
+        let desktopOnly = LocalWorkspaceConfigurationEntry(
+            id: UUID().uuidString, name: "Mac", path: "/",
+            allowBroadAccess: true, allowDesktopOpen: true
+        )
+        XCTAssertTrue(LocalWorkspaceRegistry.permitsFixedDesktopPolicyOverlap(
+            entry: desktopOnly, canonicalRoot: "/",
+            configurationURL: ownerPolicy,
+            expectedOwnerConfigurationURL: ownerPolicy
+        ))
+        XCTAssertFalse(LocalWorkspaceRegistry.permitsFixedDesktopPolicyOverlap(
+            entry: desktopOnly, canonicalRoot: "/",
+            configurationURL: URL(fileURLWithPath: "/tmp/workspaces.json"),
+            expectedOwnerConfigurationURL: ownerPolicy
+        ))
+        let withNetwork = LocalWorkspaceConfigurationEntry(
+            id: UUID().uuidString, name: "Mac", path: "/",
+            allowBroadAccess: true, allowDesktopOpen: true,
+            networkGrants: [.init(
+                id: UUID().uuidString, cwd: ".", ipv4: "203.0.113.10", port: 443,
+                expiresAt: Date().addingTimeInterval(60)
+            )]
+        )
+        XCTAssertFalse(LocalWorkspaceRegistry.permitsFixedDesktopPolicyOverlap(
+            entry: withNetwork, canonicalRoot: "/",
+            configurationURL: ownerPolicy,
+            expectedOwnerConfigurationURL: ownerPolicy
+        ))
+    }
+
     private func server(_ f: Fixture, enabled: Bool,
                         presented: @escaping DesktopOpen.Presenter) throws -> LocalMCPServer {
         let configuration = LocalWorkspaceConfiguration(workspaces: [.init(id: f.workspaceID, name: "Synthetic only",

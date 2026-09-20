@@ -494,6 +494,7 @@ public final class LocalMCPServer: @unchecked Sendable {
                     workspaceService.associateTransactions(newTransactions, workID: workID)
                     let receipts: [RecoveryTransactionReceipt] = newTransactions.map { id in
                         RecoveryTransactionReceipt(
+                            instanceID: instanceID,
                             transactionID: id,
                             transactionControlToken: registerCapability(
                                 for: id, kind: .transaction
@@ -525,12 +526,17 @@ public final class LocalMCPServer: @unchecked Sendable {
         "file_json_patch", "artifact_snapshot",
     ]
 
-    private func newControlToken() -> String {
-        UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+    private enum CapabilityKind { case process, transaction, work }
+
+    private func newControlToken(for kind: CapabilityKind) -> String {
+        // Transaction capabilities are echoed by the creating normal Chat to
+        // resolve one named undo. Keep full UUID entropy but avoid an opaque
+        // 64-hex string that host safety classifiers can mistake for a secret.
+        // Process/work control remains the stronger legacy bearer format.
+        if kind == .transaction { return UUID().uuidString.lowercased() }
+        return UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
             + UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
     }
-
-    private enum CapabilityKind { case process, transaction, work }
 
     private func registerCapability(for rawID: String, kind: CapabilityKind) -> String {
         let id = rawID.lowercased()
@@ -558,7 +564,7 @@ public final class LocalMCPServer: @unchecked Sendable {
         case .work: existing = workControlTokens[id]
         }
         if let existing { return existing }
-        let token = newControlToken()
+        let token = newControlToken(for: kind)
         switch kind {
         case .process: processControlTokens[id] = token
         case .transaction: transactionControlTokens[id] = token
@@ -736,9 +742,29 @@ public final class LocalMCPServer: @unchecked Sendable {
             if var child = value as? JSONObject {
                 for (key, nested) in child { child[key] = protect(nested) }
                 if let id = child["transaction_id"] as? String, UUID(uuidString: id) != nil {
-                    child["transaction_control_token"] = registerCapability(
+                    let token = registerCapability(
                         for: id, kind: .transaction
                     )
+                    child["transaction_control_token"] = token
+                    child["transaction_resolution"] = [
+                        "required_before_task_completion": true,
+                        "instruction": "Verify the intended current state, then accept to keep it or restore to roll it back. Do not leave a completed scheduled or normal-Chat mutation retained.",
+                        "keep_changes": [
+                            "tool": "transaction_accept",
+                            "arguments": [
+                                "instance_id": instanceID,
+                                "transaction_ids": [id],
+                                "transaction_control_tokens": [token],
+                            ] as JSONObject,
+                        ] as JSONObject,
+                        "rollback": [
+                            "tool": "transaction_restore",
+                            "arguments": [
+                                "transaction_id": id,
+                                "transaction_control_token": token,
+                            ] as JSONObject,
+                        ] as JSONObject,
+                    ] as JSONObject
                 }
                 return child
             }
@@ -1141,7 +1167,7 @@ public final class LocalMCPServer: @unchecked Sendable {
                     $0.allowsBroadAccess
                 },
                 "credential_paths_blocked": true,
-                "desktop_open": "owner_opt_in_per_workspace_fixed_finder_preview_textedit_safari_local_html",
+                "desktop_open": "owner_opt_in_per_workspace_fixed_finder_preview_textedit",
                 "desktop_open_enabled": workspaceService.registry.workspaces.contains { $0.allowsDesktopOpen },
                 "observer_output_pagination": true,
                 "catalog_count": Self.toolSpecs.count,
@@ -1966,7 +1992,7 @@ extension LocalMCPServer {
     static var catalogSHA256: String { builtInCatalog.digest }
 
     public static var discoveryGuide: String {
-        "Reviewing a tool is not permission to execute it; never replay commands from earlier tasks. Reuse already-loaded schemas; host discovers missing ones. tool_catalog: starters, query/category<=5, names return exact schemas, limit=current catalog count for full index; it cannot load host tools. developer_inspect is read-only; developer_task adds no authority. Operator loop: define acceptance, inspect, act, verify tests/diff/errors, repair from evidence, finish when accepted. Multi-step: developer_task returns its parent; otherwise begin work_task and carry its ID plus creator token. Keep returned process/transaction tokens in their chat; lists omit them. Never nest parents; labels grant no identity or permission. Resume waiting_user as active. Finish after jobs stop; silence is not completion. Long-work checkpoint: IDs/cursors, transactions, verified results and next step; revalidate after restart. Evidence includes actions, tests/diff/errors, log refs, truncation and unknowns. command_run has a timeout; command_start returns task_id. process_output returns status/cursors. Inspect every batch result. Reconcile uncertain writes before retry. Respect host approvals and Work-mode gates."
+        "Reviewing a tool is not permission to execute it; never replay commands from earlier tasks. Reuse already-loaded schemas; host finds missing ones. tool_catalog: starters; query/category<=5; names return exact schemas; limit=current catalog count for full index; cannot load host tools. developer_inspect is read-only; developer_task adds no authority. Operator loop: set acceptance, inspect, act, verify tests/diff/errors, repair, finish when accepted. Multi-step: developer_task returns parent; else begin work_task and carry ID/token. Keep process/transaction tokens in chat; lists omit them. Verify and resolve each transaction: accept to keep or restore to roll back. Never nest parents; labels grant no identity/permission. Resume waiting_user as active. Finish after jobs stop; silence is not completion. Long-work checkpoint: IDs/cursors, transactions, verified results, next step; revalidate after restart. Evidence: actions, tests/diff/errors, log refs, truncation and unknowns. command_run times out; command_start returns task_id; process_output returns status/cursors. Inspect every batch result. Reconcile uncertain writes before retry. Respect host approvals and Work-mode gates."
     }
 
     private static func makeToolSpecs() -> [JSONObject] {
@@ -2044,7 +2070,7 @@ extension LocalMCPServer {
                 required: ["action", "workspace_id", "request_id"], readOnly: false,
                 destructiveHint: true, idempotentHint: true, openWorldHint: true),
             spec("desktop_open", "Open in Finder or a fixed viewer",
-                "Pop up a local folder in Finder (action=folder), reveal a local item without executing it (reveal), open a supported document in fixed Preview/TextEdit, open a local .html file in fixed Safari when application=safari, or activate finder/preview/textedit/safari (application). Requires the owner's allow_desktop_open workspace setting. No URLs, custom handlers, arbitrary app paths or permission changes. request_accepted means macOS accepted it, not that the window was visually verified.",
+                "Pop up a local folder in Finder (action=folder), reveal a local item without executing it (reveal), open a supported document in fixed Preview/TextEdit, or activate finder/preview/textedit (application). Requires the owner's allow_desktop_open workspace setting. No browsers, URLs, custom handlers, arbitrary app paths or permission changes. request_accepted means macOS accepted it, not that the window was visually verified.",
                 properties: ["workspace_id": workspaceID, "path": path,
                     "action": ["type": "string", "enum": DesktopOpen.actions],
                     "application": ["type": "string", "enum": DesktopOpen.applications.keys.sorted()]],

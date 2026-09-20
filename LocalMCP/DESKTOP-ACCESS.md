@@ -33,17 +33,17 @@ or undo need to be preserved.
 | --- | --- |
 | `folder` | Existing directory inside the allowed workspace; show its contents in Finder. |
 | `reveal` | Existing regular file or directory; select the item in Finder without opening it. |
-| `file` | Supported non-executable, single-link regular document; fixed Preview/TextEdit, plus local `.html` in fixed Safari when explicitly selected. |
-| `application` | No path; `application` must be `finder`, `preview`, `textedit` or `safari`. |
+| `file` | Supported non-executable, single-link regular document; fixed Preview or TextEdit. Local `.html` is opened as text in TextEdit. |
+| `application` | No path; `application` must be `finder`, `preview` or `textedit`. |
 
 Relative and in-workspace absolute paths are accepted, including spaces and
 Unicode. No shell interpolation. URLs, NUL/control characters, `~`, traversal,
 symlinks and sensitive credential paths are refused. App/document bundles are
 reveal-only. Preview supports PNG/JPEG/HEIC/TIFF/GIF/WebP/PDF; TextEdit supports
 plain text and common source/config extensions listed in `DesktopOpen.swift`.
-Safari support is local-file presentation only. It does not add Chrome control,
-browser tabs, screenshots, cookies, a browser protocol, web navigation or URL opening.
-This does not certify arbitrary document content as safe to parse.
+No browser is launched, and the tool does not add browser tabs, screenshots,
+cookies, a browser protocol, web navigation or URL opening. This does not certify
+arbitrary document content as safe to parse.
 
 The receipt distinguishes `request_accepted: true` from
 `window_visibility_verified: false`. Do not tell the user a window is visible

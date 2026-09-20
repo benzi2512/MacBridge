@@ -132,7 +132,13 @@ public final class LocalWorkspaceRegistry: @unchecked Sendable {
             for entry in configuration.workspaces {
                 let root = try canonicalExistingPath(entry.path)
                 let prefix = root == "/" ? "/" : root + "/"
-                guard policyPath != root, !policyPath.hasPrefix(prefix) else {
+                let fixedDesktopBroadRoot = Self.permitsFixedDesktopPolicyOverlap(
+                    entry: entry,
+                    canonicalRoot: root,
+                    configurationURL: safeURL,
+                    expectedOwnerConfigurationURL: Self.defaultConfigurationURL
+                )
+                guard fixedDesktopBroadRoot || (policyPath != root && !policyPath.hasPrefix(prefix)) else {
                     throw LocalMCPError.invalidConfiguration(
                         "desktop/network grant policy must be outside every command-writable workspace"
                     )
@@ -140,6 +146,24 @@ public final class LocalWorkspaceRegistry: @unchecked Sendable {
             }
         }
         try self.init(configuration: configuration)
+    }
+
+    // The default owner policy is already denied by every MB file and command
+    // path. Permit only the fixed desktop-open opt-in on the explicit broad
+    // root; never extend this exception to network grants or custom policy
+    // locations that project tools could replace.
+    static func permitsFixedDesktopPolicyOverlap(
+        entry: LocalWorkspaceConfigurationEntry,
+        canonicalRoot: String,
+        configurationURL: URL,
+        expectedOwnerConfigurationURL: URL
+    ) -> Bool {
+        canonicalRoot == "/"
+            && entry.allowBroadAccess == true
+            && entry.allowDesktopOpen == true
+            && (entry.networkGrants ?? []).isEmpty
+            && configurationURL.standardizedFileURL.path
+                == expectedOwnerConfigurationURL.standardizedFileURL.path
     }
 
     /// Validates an explicit configuration without writing it or granting a

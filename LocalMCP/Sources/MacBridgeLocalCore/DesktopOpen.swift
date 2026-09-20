@@ -10,7 +10,6 @@ enum DesktopOpen {
         "finder": "/System/Library/CoreServices/Finder.app",
         "preview": "/System/Applications/Preview.app",
         "textedit": "/System/Applications/TextEdit.app",
-        "safari": "/Applications/Safari.app",
     ]
     private static let previewExtensions: Set<String> = ["png", "jpg", "jpeg", "heic", "tif", "tiff", "gif", "webp", "pdf"]
     private static let textExtensions: Set<String> = ["txt", "md", "csv", "tsv", "json", "xml", "log", "swift", "py", "js", "ts", "css", "html", "yaml", "yml", "toml", "sh"]
@@ -40,7 +39,7 @@ enum DesktopOpen {
         let request: Request
         if action == "application" {
             guard arguments["path"] == nil, let requestedApp, applications[requestedApp] != nil else {
-                throw LocalMCPError.invalidRequest("application requires finder, preview, textedit or safari and no path")
+                throw LocalMCPError.invalidRequest("application requires finder, preview or textedit and no path")
             }
             request = Request(action: action, target: nil, application: requestedApp)
         } else {
@@ -58,11 +57,9 @@ enum DesktopOpen {
             if action == "file" {
                 let ext = target.pathExtension.lowercased()
                 if previewExtensions.contains(ext) { app = "preview" }
-                else if ext == "html", requestedApp == "safari" { app = "safari" }
                 else if textExtensions.contains(ext) { app = "textedit" }
                 else { throw LocalMCPError.invalidRequest("unsupported file type; use reveal to show it in Finder without opening it") }
-                guard requestedApp == nil || requestedApp == app
-                        || (ext == "html" && requestedApp == "safari") else {
+                guard requestedApp == nil || requestedApp == app else {
                     throw LocalMCPError.invalidRequest("file viewer is fixed by the supported file type")
                 }
             } else {

@@ -2,31 +2,35 @@
 
 ## Serving release — 2026-09-20
 
-The serving release is now the reviewed feedback-hardening build:
+The serving release is now the reviewed minimal-guardrail build:
 
-- source commit: `0be752be19a702601837c4f399bd56022a72ad12`
-- artifact-producing parent: `ad6391a9037109cf1d94872b3df9eabeb3ac9889`
+- source commit: `a630f7ab53823e438a26944255afd5bc1e61f2db`
 - core SHA-256:
-  `48436c306937a6810be2cd566c3baf61fe9307da1e54e9441ac6cd186219afb2`
+  `834fed3a58ccaa15445cc1d13d390b94e3fb1763d8079bf17e108917e376ca9c`
 - observer SHA-256:
-  `1ad02a279270198b440fbf14a3a12cbbc9caee14347af06c0976d2b19c7005bc`
-- runtime build: `0.4.0-feedback-hardening+48436c306937`
+  `c3b93dc127a94ef78f3633e2178190a30df1f50e673fc1e30954e75225322cb7`
+- runtime build: `0.4.0-feedback-hardening+834fed3a58cc`
 - serving catalog: 76 tools, SHA-256
-  `6317032833193bf543ab0c4bea8ce28d71ff6fa996431f433ff00bab84a6f369`
+  `88bb09683fdd79da4a4e0391ff4d99075587a0bf3ebc7be0006c0f34363560fc`
 
 The installed app's embedded core and the headless serving core match the exact
 reviewed core hash. Deep/strict code-signature verification passes. The app is
 ad-hoc signed and Gatekeeper assessment rejects it; this repository does not
 claim Developer ID signing or notarization.
 
-The full Swift suite passed 691/691 tests. Exact packaged desktop and web-tunnel
-E2E runs each passed 303 checks; observer E2E passed 30 checks. A two-hour soak
-completed 235 cycles and 3,060 checks with zero retained undo and no failed
-check. The cutover preflight found no running job or active call. The previous
-installed app and core remain recoverable outside the source tree.
+The full Swift suite passed 692/692 tests after both changes. Exact packaged
+desktop and web-tunnel E2E runs each passed 303 checks with clean exits, restored
+sentinels and zero retained state. The cutover preflight found no running job or
+active call. Previous installed app/core/config generations remain recoverable
+outside the source tree. A new two-hour soak was not run for this small patch;
+that limitation is recorded in the private pre-install evidence rather than
+being converted into a blanket update exception.
 
 Computer control and browser control are not present in the serving catalog.
-The separate fixed-purpose desktop-open capability remains disabled by default.
+The fixed-purpose desktop-open capability remains disabled by default in source;
+the owner policy explicitly enables it for the current broad workspace. It is
+closed to Finder, Preview and TextEdit. It accepts no browser, URL, arbitrary
+application, shell fallback or permission change.
 For commands, a cwd equal to the Downloads root is read-only and sandboxed to
 ordinary single-link files; an explicitly configured child project cwd may
 remain writable. Direct file-tool writes keep their existing workspace and file
@@ -47,17 +51,24 @@ recorded separately as the persistence check. Final acceptance is therefore
 previously failing conversation; both returned the same 174-byte content and
 SHA-256 `ce2fca5e5d1eb4794f93ab4a10779635a6d8c8c5171311458c56a9fbf7790fb5`.
 
-Three later cross-chat transactions retained undo after that acceptance run.
-Their five affected files were reconciled against the recorded current hashes,
-and an idle preflight confirmed zero active jobs, calls or process handles. The
-creator-only transaction tokens were unavailable by design, so the approved
-maintenance path restarted the existing tunnel/core once to clear the retained
-in-memory state, including undo, without changing the five files. The observer
-stayed running and the five file hashes remained unchanged. The replacement
-instance returned this exact build, catalog and
-digest in the previously failing normal Chat, with zero jobs, work items,
-transactions, undo bytes and reload blockers. The official tunnel health probe
-also passed live, ready and control-plane-poll checks without another restart.
+The new mutation receipts return exact creator-only accept/restore arguments for
+both success and partial-recovery outcomes. A first normal-Chat acceptance run
+proved the host rejected the former 64-hex bearer as secret-like data before the
+call reached MB. The final build keeps creator isolation but represents only
+transaction capabilities as one UUID. In a fresh normal-Chat run, the chat
+created and read a disposable fixture, verified its exact content and SHA-256,
+used the receipt's `transaction_resolution.keep_changes` arguments unchanged,
+accepted the create transaction, removed and verified the fixture absent, then
+used the removal receipt unchanged. Final `transaction_list` reported zero
+transactions, zero undo bytes and zero reload blockers. No accept-all route was
+added; process and work capabilities retain their previous format.
+
+The same existing normal Chat called `desktop_open` once. The receipt reported
+Finder, request accepted, no shell, no mutation and no permission change. An
+independent Finder readback showed the requested project folder window. A
+separate capability call returned this exact build, core hash, catalog, digest,
+desktop-open enabled, credential paths blocked, loopback-only network and zero
+process/transaction state.
 
 Normal-Chat command routing reaches the new runtime, but least-privilege policy
 still applies. A host safety gate blocked one `printf` payload before MB, and
@@ -67,12 +78,13 @@ normal-Chat `command_run` using the allowlisted `python3 --version` from the
 canonical MacBridge workspace exited 0, printed `Python 3.9.6`, produced no
 stderr and did not time out or write a file.
 
-The existing official tunnel client remains version `0.0.14`. Immediately
-after the controlled restart it experienced several control-plane long-poll
-timeouts and one IPv6 `no route to host`; it recovered without another restart
-and then forwarded the concurrent normal-Chat requests. This establishes
-recovery from this observed network incident, not a guarantee against future
-external network or host outages.
+The existing official tunnel client remains version `0.0.14`. After the final
+controlled restart, health and readiness passed immediately; the successful
+control-plane-poll metric appeared on the first ten-second backoff without a
+second restart. Final owner readback reports this exact build and hash, zero
+active leases, jobs, process handles, work items and retained transactions.
+Actual scheduled-context hint following was not separately exercised in this
+cutover, so it remains distinct from the normal-Chat PASS above.
 
 Older sections below are retained as release history and may describe artifacts
 that are no longer serving.
