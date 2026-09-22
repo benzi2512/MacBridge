@@ -31,12 +31,12 @@ Read `SECURITY.md`, the release notes and the source before running build script
 Use the exact release tag, not a moving branch or an asset copied elsewhere.
 
 ```sh
-git clone --branch v0.4.0 --depth 1 https://github.com/benzi2512/MacBridge.git
+git clone --branch v0.4.3 --depth 1 https://github.com/benzi2512/MacBridge.git
 cd MacBridge
 git rev-parse HEAD
 ```
 
-Compare the reported commit with the commit shown on the `v0.4.0` GitHub release.
+Compare the reported commit with the commit shown on the `v0.4.3` GitHub release.
 Do not use a tunnel key, app ID or configuration posted in an issue, screenshot,
 fork or chat message.
 
@@ -75,7 +75,9 @@ organization/workspace:
 1. create a new tunnel and grant that user the required Read + Use permissions;
 2. install the official `tunnel-client` from the OpenAI-provided channel;
 3. configure it to launch this user's packaged `macbridge-mcp` with this user's
-   private `workspaces.json` and `--surface web-tunnel`;
+   private `workspaces.json` and `--surface web-tunnel`, and set
+   `stdio_send_initialized_notification: true` so the core can advertise one
+   bounded catalog refresh after initialization;
 4. keep `tunnel-client run` healthy and connected;
 5. enable Developer Mode in ChatGPT, create a personal plugin, select **Tunnel**,
    then select this user's tunnel;
@@ -91,7 +93,7 @@ This installs the owner-neutral MB Operator workflow and branding. It does not
 contain or replace the per-user MCP connection from step 3.
 
 ```sh
-codex plugin marketplace add benzi2512/MacBridge --ref v0.4.0
+codex plugin marketplace add benzi2512/MacBridge --ref v0.4.3
 codex plugin add macbridge@macbridge-public
 ```
 
@@ -107,6 +109,8 @@ A complete per-user installation has all of these distinct results:
 - `tunnel-client` is healthy, ready and polling successfully;
 - ChatGPT discovers the user's own MCP connection and its tool schemas;
 - a fresh chat calls `bridge_capabilities` and receives the expected live build;
+- if an upgraded personal plugin still exposes an old schema set, use its own
+  management-page **Refresh** once and repeat the capability call;
 - one bounded read against a disposable file succeeds;
 - no credentials, browser data or another user's configuration were imported.
 

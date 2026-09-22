@@ -1,6 +1,77 @@
 # Current state
 
-## Serving release — 2026-09-20
+## Serving release — 2026-09-21
+
+The serving release is MacBridge 0.4.3. Its source is the privacy-filtered
+public release source commit recorded below plus this documentation-only record.
+
+- runtime build: `0.4.3-read-preflight+54038f1efd7a`
+- source commit: `d1366a7139eb5085c581a7ae9e078cce29f12cb3`
+- core SHA-256:
+  `54038f1efd7a7a5748d0ceea6fa00e744697f7390a5fc8f3c4c22746afcc6199`
+- packaged observer SHA-256:
+  `207b2d18e987db7f8be88028afa1897ed5ab70e61e853e1f44d45b7626ecf40d`
+- catalog: 76 tools, SHA-256
+  `88bb09683fdd79da4a4e0391ff4d99075587a0bf3ebc7be0006c0f34363560fc`
+
+The installed headless core and app-embedded core match the exact reviewed
+core hash. The app reports version 0.4.3, build 7, and passes deep/strict
+code-signature verification. It remains ad-hoc signed: there is no Developer ID
+signature or notarization, so the project still does not claim a one-click
+consumer installer.
+
+The full Swift suite passed 700/700 tests. Exact 0.4.3 desktop-local and
+web-tunnel E2E gates each passed 303/303 checks with clean exits and unchanged
+sentinels. Packaging passed 19 cases plus three manifest self-checks, and the
+compact UI source policy passed 42/42 checks. The release candidate privacy scan
+found no user home path, personal email/handle, private-key marker or token-shaped
+value.
+
+This release fixes a stale host-catalog path: after a web-tunnel client sends
+`notifications/initialized`, the core emits one bounded
+`notifications/tools/list_changed` notification. The tunnel profiles enable the
+initialized notification, and the registered personal ChatGPT plugin was
+refreshed once from its own management page. A notification cannot force an old
+ChatGPT registration to change, so an existing installation may still require
+that one explicit plugin **Refresh** after upgrading.
+
+Eight existing normal Chat conversations that had previously reported disabled,
+502, timeout or stale-recipient failures were then exercised against the live
+runtime. All eight called the requested capability, workspace and bounded file
+operations successfully. Seven materialized the complete 76-schema catalog; the
+remaining audit chat materialized a smaller bounded subset but still called all
+five requested tools successfully. Every chat reported no `computer_control`,
+zero retained transactions/undo bytes, zero reload blockers, and zero active or
+retained process handles.
+
+`bridge_diagnostic` deliberately reports `DEGRADED` when the core cannot
+self-certify host binding or a file action. In the same normal-Chat acceptance
+turn, direct `bridge_capabilities`, `workspace_resolve`, `workspace_overview`,
+`file_stat` and `file_read` calls all passed. The diagnostic label is therefore
+kept as a conservative unknown, not rewritten into a false internal PASS.
+
+Developer gateway receipts now aggregate child failures and truncation instead
+of returning a successful parent while hiding a failed Git child. Work activity
+retains bounded structured failure reports and the observer shows child/report
+counts. Filesystem traversal errors distinguish a file that is not locally
+materialized from a preflight failure and report a protected, workspace-relative
+cause instead of a generic error or private absolute path.
+
+Computer control and browser control are absent from the source and serving
+catalog. The fixed-purpose `desktop_open` capability remains a separate bounded
+tool for Finder, Preview and TextEdit only; it cannot open a browser or URL and
+does not add Accessibility, Screen Recording or Input Monitoring authority.
+
+The exact serving runtime is installed and live. The public repository provides
+source plus a per-user ChatGPT installation guide. Each other user must still
+build the ad-hoc app locally and create their own Secure MCP Tunnel and personal
+ChatGPT connection; the repository contains no shared tunnel credential, app ID,
+workspace registry or maintainer runtime state.
+
+Older sections below are release history and may describe artifacts that are no
+longer serving.
+
+## Previous serving release — 2026-09-20
 
 The serving release is now the reviewed minimal-guardrail build:
 
@@ -85,9 +156,6 @@ second restart. Final owner readback reports this exact build and hash, zero
 active leases, jobs, process handles, work items and retained transactions.
 Actual scheduled-context hint following was not separately exercised in this
 cutover, so it remains distinct from the normal-Chat PASS above.
-
-Older sections below are retained as release history and may describe artifacts
-that are no longer serving.
 
 Updated 2026-09-08 after the approved blue-logo release cutover.
 
