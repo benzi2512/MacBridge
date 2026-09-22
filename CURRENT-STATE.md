@@ -5,12 +5,12 @@
 The serving release is MacBridge 0.4.3. Its source is the privacy-filtered
 public release source commit recorded below plus this documentation-only record.
 
-- runtime build: `0.4.3-read-preflight+54038f1efd7a`
-- source commit: `d1366a7139eb5085c581a7ae9e078cce29f12cb3`
+- runtime build: `0.4.3-read-preflight+0497140678f1`
+- source commit: `6e5b6fdd2dcb982e750a4f41a9bd6757774ea21d`
 - core SHA-256:
-  `54038f1efd7a7a5748d0ceea6fa00e744697f7390a5fc8f3c4c22746afcc6199`
+  `0497140678f19f721f0c9c94801ab414b282543cd7a6389f60d699b63c3d9ee8`
 - packaged observer SHA-256:
-  `207b2d18e987db7f8be88028afa1897ed5ab70e61e853e1f44d45b7626ecf40d`
+  `a2de06b770dc1c223c7475d55a00f18d01cb075be8829f6fd42d6159f0eb99ba`
 - catalog: 76 tools, SHA-256
   `88bb09683fdd79da4a4e0391ff4d99075587a0bf3ebc7be0006c0f34363560fc`
 
@@ -20,7 +20,7 @@ code-signature verification. It remains ad-hoc signed: there is no Developer ID
 signature or notarization, so the project still does not claim a one-click
 consumer installer.
 
-The full Swift suite passed 700/700 tests. Exact 0.4.3 desktop-local and
+The full Swift suite passed 701/701 tests. Exact 0.4.3 desktop-local and
 web-tunnel E2E gates each passed 303/303 checks with clean exits and unchanged
 sentinels. Packaging passed 19 cases plus three manifest self-checks, and the
 compact UI source policy passed 42/42 checks. The release candidate privacy scan
