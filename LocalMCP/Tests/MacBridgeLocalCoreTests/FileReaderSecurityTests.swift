@@ -59,6 +59,21 @@ final class FileReaderSecurityTests: XCTestCase {
         XCTAssertEqual(file["byte_count"] as? Int, 11)
     }
 
+    func testWorkspaceReadEntryPointCannotBypassSharedOpenPreflight() throws {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let sourceURL = packageRoot.appendingPathComponent(
+            "Sources/MacBridgeLocalCore/WorkspaceOperations.swift"
+        )
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+        let start = try XCTUnwrap(source.range(of: "    public func readFile("))
+        let tail = source[start.lowerBound...]
+        let end = try XCTUnwrap(tail.range(of: "    public func writeFile("))
+        let entryPoint = String(tail[..<end.lowerBound])
+        XCTAssertTrue(entryPoint.contains("LocalFileReader.openFile(url: resolved.url)"))
+        XCTAssertFalse(entryPoint.contains("Darwin.open("))
+    }
+
     func testFIFOLeafAncestorSymlinksAndHardlinksFailWithoutBlocking() throws {
         let fixture = try Fixture()
         defer { fixture.remove() }

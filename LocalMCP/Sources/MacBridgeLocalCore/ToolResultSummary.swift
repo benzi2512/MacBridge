@@ -160,7 +160,7 @@ enum ToolResultSummary {
             text += "; \(childErrors) failed child operations"
         }
         if let reports = nonnegative(r["failure_report_count"]), reports > 0 {
-            text += "; \(reports) automatic failure reports retained"
+            text += "; \(reports) automatic failure reports recorded"
         }
         if r["stale"] as? Bool == true { text += "; no recent update, not proof of completion" }
         return text

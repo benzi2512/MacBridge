@@ -232,7 +232,7 @@ final class ToolResultSummaryTests: XCTestCase {
             "phase": "failed", "call_count": 2, "error_count": 1,
             "failure_report_count": 1,
         ])
-        XCTAssertTrue(reports.contains("1 automatic failure reports retained"))
+        XCTAssertTrue(reports.contains("1 automatic failure reports recorded"))
     }
 
     func testCapabilityReceiptDoesNotClaimHostToolLoading() {

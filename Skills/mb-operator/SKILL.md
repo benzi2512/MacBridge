@@ -53,9 +53,10 @@ host-binding failure.
 ## Repair MacBridge itself
 
 Normal Chat may use the same bounded file, Git, command, process, and developer
-tools to diagnose and patch MacBridge source. Resolve the registered
-`MacBridge Unified Current` workspace first; do not assume an older workspace
-with a similar name is current. Preserve unrelated changes and inspect the diff.
+tools to diagnose and patch MacBridge source. Resolve the current source workspace
+from the live registry and repository identity. Prefer `MacBridge Unified Current`
+when that registered workspace exists, but do not require that owner-specific name
+on another installation. Preserve unrelated changes and inspect the diff.
 Run targeted tests, then the relevant full suite, and build a candidate from the
 pinned source revision.
 
