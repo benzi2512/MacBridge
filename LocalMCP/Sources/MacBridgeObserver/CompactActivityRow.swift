@@ -73,7 +73,7 @@ struct CompactRowContent {
         icon = work.executing ? "play.circle" : work.active ? "clock" : "checkmark.circle"
         active = work.executing; failed = work.state == "failed"
         help = [work.title, work.status, "Chat label: " + (work.chatLabel ?? "Not supplied"),
-                work.workspaceName, "\(work.callCount) calls · \(work.errorCount) errors",
+                work.workspaceName, "\(work.callCount) calls · \(work.errorCount) errors · \(work.failureReportCount) reports",
                 work.updated.map { "Updated: " + $0.formatted() } ?? "", work.explanation].joined(separator: "\n")
     }
 }

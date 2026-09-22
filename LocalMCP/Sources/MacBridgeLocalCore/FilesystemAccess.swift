@@ -3,6 +3,17 @@ import Foundation
 // Shared by direct file operations and the command sandbox. Broad access is
 // access as the current user, not permission to read credentials or bypass TCC.
 enum LocalFilesystemAccess {
+    private struct TraversalFailure {
+        let stage: String
+        let relativePath: String
+        let domain: String
+        let code: Int
+
+        var error: LocalMCPError {
+            .filesystemPreflight(stage: stage, relativePath: relativePath,
+                                 osDomain: domain, osCode: code)
+        }
+    }
     private static let policyLocale = Locale(identifier: "en_US_POSIX")
     static let maximumReadOnlyRootPathBytes = 128 * 1_024
 
@@ -55,6 +66,25 @@ enum LocalFilesystemAccess {
         return blockedFragments.contains { normalized.contains("/" + $0 + "/") }
     }
 
+    static func sanitizedTraversalPath(_ url: URL, rootPath: String) -> String {
+        let path = url.standardizedFileURL.path
+        let raw: String
+        if path == rootPath { raw = "." }
+        else if rootPath == "/", path.hasPrefix("/") { raw = String(path.dropFirst()) }
+        else if path.hasPrefix(rootPath + "/") { raw = String(path.dropFirst(rootPath.count + 1)) }
+        else { raw = "[outside-root]" }
+        if raw != ".", isSensitive(raw) { return "[protected]" }
+        let clean = raw.unicodeScalars.filter { $0.value >= 0x20 && $0.value != 0x7f }
+        return String(String.UnicodeScalarView(clean)).prefix(512).description
+    }
+
+    private static func traversalFailure(stage: String, url: URL, rootPath: String,
+                                         error: NSError) -> TraversalFailure {
+        TraversalFailure(stage: stage,
+            relativePath: sanitizedTraversalPath(url, rootPath: rootPath),
+            domain: String(error.domain.prefix(128)), code: error.code)
+    }
+
     // Seatbelt regexes are case-sensitive. Expand ASCII letters so the policy
     // also matches alternate casing on case-insensitive macOS volumes.
     static func sandboxDenyRules() -> String {
@@ -96,18 +126,21 @@ enum LocalFilesystemAccess {
         guard !rootPath.contains("\n"), !rootPath.contains("\0") else {
             throw LocalMCPError.invalidPath("sandbox path")
         }
-        var traversalFailed = false
+        var traversalFailure: TraversalFailure?
         guard let enumerator = FileManager.default.enumerator(
             at: canonicalRoot,
             includingPropertiesForKeys: nil,
             options: [.skipsSubdirectoryDescendants],
-            errorHandler: { _, error in
+            errorHandler: { url, error in
                 let value = error as NSError
                 if (value.domain == NSCocoaErrorDomain && value.code == NSFileReadNoSuchFileError)
                     || (value.domain == NSPOSIXErrorDomain && value.code == Int(ENOENT)) {
                     return true
                 }
-                traversalFailed = true
+                traversalFailure = Self.traversalFailure(
+                    stage: "read_only_root_enumeration", url: url,
+                    rootPath: rootPath, error: value
+                )
                 return false
             }
         ) else {
@@ -136,17 +169,17 @@ enum LocalFilesystemAccess {
             var status = stat()
             guard lstat(url.path, &status) == 0 else {
                 if errno == ENOENT { continue }
-                traversalFailed = true
+                let value = NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+                traversalFailure = Self.traversalFailure(
+                    stage: "read_only_root_lstat", url: url,
+                    rootPath: rootPath, error: value
+                )
                 break
             }
             guard status.st_mode & S_IFMT == S_IFREG, status.st_nlink == 1 else { continue }
             readable.insert(url.path)
         }
-        guard !traversalFailed else {
-            throw LocalMCPError.operationFailed(
-                "read-only root inspection encountered an inaccessible entry"
-            )
-        }
+        if let traversalFailure { throw traversalFailure.error }
         func quote(_ value: String) -> String {
             "\"" + value.replacingOccurrences(of: "\\", with: "\\\\")
                 .replacingOccurrences(of: "\"", with: "\\\"") + "\""
@@ -166,18 +199,21 @@ enum LocalFilesystemAccess {
     /// under an unblocked spelling. Newly created data is command-owned.
     static func sandboxExistingSensitiveRules(root: URL) throws -> String {
         let rootPath = root.path
-        var traversalFailed = false
+        var traversalFailure: TraversalFailure?
         guard let enumerator = FileManager.default.enumerator(
             at: root,
             includingPropertiesForKeys: [.isSymbolicLinkKey],
             options: [],
-            errorHandler: { _, error in
+            errorHandler: { url, error in
                 let value = error as NSError
                 if (value.domain == NSCocoaErrorDomain && value.code == NSFileReadNoSuchFileError)
                     || (value.domain == NSPOSIXErrorDomain && value.code == Int(ENOENT)) {
                     return true
                 }
-                traversalFailed = true
+                traversalFailure = Self.traversalFailure(
+                    stage: "protected_path_enumeration", url: url,
+                    rootPath: rootPath, error: value
+                )
                 return false
             }
         ) else { throw LocalMCPError.operationFailed("workspace could not be inspected for protected paths") }
@@ -204,11 +240,7 @@ enum LocalFilesystemAccess {
                 parent.deleteLastPathComponent()
             }
         }
-        guard !traversalFailed else {
-            throw LocalMCPError.operationFailed(
-                "workspace protected-path inspection encountered an inaccessible entry"
-            )
-        }
+        if let traversalFailure { throw traversalFailure.error }
         func quote(_ value: String) -> String {
             "\"" + value.replacingOccurrences(of: "\\", with: "\\\\")
                 .replacingOccurrences(of: "\"", with: "\\\"") + "\""

@@ -35,31 +35,36 @@ enum DeveloperTask {
             let maximumCommits = try a.optionalInt(
                 "maximum_commits", default: 12, range: 1...50
             )
-            return [
-                "developer_action": action,
-                "inspection": try ExpandedToolOperations.execute(
+            let children: [(String, JSONObject)] = [
+                ("inspection", try ExpandedToolOperations.execute(
                     "workspace_inspect", ["workspace_id": id, "path": cwd],
                     workspace: w, processes: p
-                ),
-                "git_status": try ExpandedToolOperations.execute(
+                )),
+                ("git_status", try ExpandedToolOperations.execute(
                     "git_status", ["workspace_id": id, "cwd": cwd,
                                    "maximum_output_bytes": 65_536],
                     workspace: w, processes: p
-                ),
-                "git_branches": try ExpandedToolOperations.execute(
+                )),
+                ("git_branches", try ExpandedToolOperations.execute(
                     "git_branches", ["workspace_id": id, "cwd": cwd,
                                      "maximum_output_bytes": 32_768],
                     workspace: w, processes: p
-                ),
-                "git_log": try ExpandedToolOperations.execute(
+                )),
+                ("git_log", try ExpandedToolOperations.execute(
                     "git_log", ["workspace_id": id, "cwd": cwd,
                                 "maximum_commits": maximumCommits,
                                 "maximum_output_bytes": 65_536],
                     workspace: w, processes: p
-                ),
+                )),
+            ]
+            return aggregate(
+                action: action, children: children,
+                base: [
+                "developer_action": action,
                 "next_actions": ["execute_task", "run_tests", "review_diff"],
                 "authority_changed": false,
-            ]
+                ]
+            )
         case "review_diff":
             let id = try a.requiredString("workspace_id", maximumBytes: 36)
             let cwd = try a.optionalString("cwd", maximumBytes: 4096) ?? "."
@@ -71,18 +76,23 @@ enum DeveloperTask {
             if let path = try a.optionalString("path", maximumBytes: 4096) {
                 diff["path"] = path
             }
-            return [
-                "developer_action": action,
-                "git_status": try ExpandedToolOperations.execute(
+            let children: [(String, JSONObject)] = [
+                ("git_status", try ExpandedToolOperations.execute(
                     "git_status", ["workspace_id": id, "cwd": cwd,
                                    "maximum_output_bytes": 65_536],
                     workspace: w, processes: p
-                ),
-                "git_diff": try ExpandedToolOperations.execute(
+                )),
+                ("git_diff", try ExpandedToolOperations.execute(
                     "git_diff", diff, workspace: w, processes: p
-                ),
-                "authority_changed": false,
+                )),
             ]
+            return aggregate(
+                action: action, children: children,
+                base: [
+                "developer_action": action,
+                "authority_changed": false,
+                ]
+            )
         case "execute_task", "run_tests":
             guard let workID else {
                 throw LocalMCPError.operationFailed("developer parent was not created")
@@ -148,6 +158,57 @@ enum DeveloperTask {
         default:
             preconditionFailure("validated action")
         }
+    }
+
+    /// Promote bounded child receipts into one truthful parent status without
+    /// copying command output into the summary. A successful gateway call can
+    /// still be partial when one or more inspected child operations failed.
+    private static func aggregate(
+        action: String,
+        children: [(String, JSONObject)],
+        base: JSONObject
+    ) -> JSONObject {
+        var result = base
+        var childResults: [JSONObject] = []
+        var errorCount = 0
+        var partialCount = 0
+        for (step, child) in children {
+            result[step] = child
+            let failed = (child["exit_code"] as? Int).map { $0 != 0 } == true
+                || child["timed_out"] as? Bool == true
+                || child["cancelled"] as? Bool == true
+                || child["isError"] as? Bool == true
+                || child["error"] != nil
+                || child["status"] as? String == "error"
+            let truncated = child["complete"] as? Bool == false
+                || child["partial"] as? Bool == true
+                || child["truncated"] as? Bool == true
+                || child["stdout_truncated"] as? Bool == true
+                || child["stderr_truncated"] as? Bool == true
+            if failed { errorCount += 1 }
+            if truncated { partialCount += 1 }
+            var receipt: JSONObject = [
+                "step": step,
+                "status": failed ? "failed" : (truncated ? "partial" : "completed"),
+            ]
+            for key in ["exit_code", "timed_out", "cancelled", "complete",
+                        "stdout_truncated", "stderr_truncated"] where child[key] != nil {
+                receipt[key] = child[key]
+            }
+            childResults.append(receipt)
+        }
+        let partial = errorCount > 0 || partialCount > 0
+        result["child_count"] = children.count
+        result["child_error_count"] = errorCount
+        result["child_partial_count"] = partialCount
+        result["child_results"] = childResults
+        result["error_count"] = errorCount
+        result["complete"] = !partial
+        result["partial"] = partial
+        result["overall_status"] = errorCount == children.count && !children.isEmpty
+            ? "failed" : (partial ? "partial" : "completed")
+        result["developer_action"] = action
+        return result
     }
 
     private static func command(

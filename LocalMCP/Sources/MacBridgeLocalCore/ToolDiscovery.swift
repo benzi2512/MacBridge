@@ -6,7 +6,7 @@ enum ToolDiscovery {
     static let aliases = ["workspace_list": "workspace_overview"]
     // A short entry point, not a second callable surface. Explicit searches and
     // names still cover the full catalog; no operation or permission is hidden.
-    static let starterNames = ["developer_inspect", "developer_task", "workspace_overview", "directory_list", "file_read_many",
+    static let starterNames = ["bridge_capabilities", "developer_inspect", "developer_task", "workspace_overview", "file_read_many",
         "file_read", "file_search", "file_patch", "file_write", "command_start",
         "process_output", "process_cancel", "transaction_restore"]
 

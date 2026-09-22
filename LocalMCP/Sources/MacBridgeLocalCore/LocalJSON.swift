@@ -61,6 +61,9 @@ public enum LocalMCPError: Error, CustomStringConvertible {
     case limitExceeded(String)
     case unsupportedCommand
     case processNotFound
+    case fileNotMaterialized(size: Int64, allocatedBlocks: Int64, flags: UInt32)
+    case filesystemPreflight(stage: String, relativePath: String, osDomain: String,
+                             osCode: Int)
     case compensated(String)
     case partial(String)
     case recoveryRequired(String, recoveryTransactions: [RecoveryTransactionReceipt])
@@ -81,6 +84,10 @@ public enum LocalMCPError: Error, CustomStringConvertible {
         case .limitExceeded(let value): "Limit exceeded: \(value)"
         case .unsupportedCommand: "Command is not in the local executable allowlist."
         case .processNotFound: "Unknown process task."
+        case .fileNotMaterialized:
+            "File content is not materialized locally; no content read was attempted."
+        case .filesystemPreflight(let stage, let path, let domain, let code):
+            "Filesystem preflight failed at \(stage) for \(path) (\(domain) \(code)); no process was launched."
         case .compensated(let value): "Operation was compensated after starting: \(value)"
         case .partial(let value): "Operation completed only in part: \(value)"
         case .recoveryRequired(let value, _): value
@@ -110,6 +117,8 @@ public enum LocalMCPError: Error, CustomStringConvertible {
         case .limitExceeded: code = "LIMIT_EXCEEDED"; retrySafe = false; action = "reduce_scope_or_release_retained_state"; outcome = "not_started"
         case .unsupportedCommand: code = "COMMAND_NOT_ALLOWED"; retrySafe = false; action = "call_command_list"; outcome = "not_started"
         case .processNotFound: code = "PROCESS_NOT_FOUND"; retrySafe = false; action = "call_process_list"; outcome = "not_started"
+        case .fileNotMaterialized: code = "FILE_NOT_MATERIALIZED"; retrySafe = false; action = "materialize_file_locally_then_retry"; outcome = "not_started_no_content_read"
+        case .filesystemPreflight: code = "FILESYSTEM_PREFLIGHT_FAILED"; retrySafe = false; action = "inspect_reported_entry_or_choose_narrower_cwd"; outcome = "not_started_no_process_launched"
         case .compensated: code = "OPERATION_COMPENSATED"; retrySafe = false; action = "inspect_content_and_metadata_before_retry"; outcome = "compensated_content_and_mode_metadata_identity_may_differ"
         case .partial, .recoveryRequired: code = "OPERATION_PARTIAL"; retrySafe = false; action = "inspect_then_use_recovery_transaction"; outcome = "partially_completed_remaining_undo_retained"
         case .operationFailed: code = "OPERATION_FAILED"; retrySafe = false; action = "inspect_before_retry"; outcome = "unknown"
@@ -133,6 +142,20 @@ public enum LocalMCPError: Error, CustomStringConvertible {
         }
         if case .recoveryRequired(_, let transactions) = self {
             value["recovery_transactions"] = transactions.map(\.jsonObject)
+        }
+        if case .fileNotMaterialized(let size, let blocks, let flags) = self {
+            value["stage"] = "read_preflight"
+            value["logical_size_bytes"] = size
+            value["allocated_blocks"] = blocks
+            value["file_flags_hex"] = String(format: "0x%08x", flags)
+            value["content_read_attempted"] = false
+        }
+        if case .filesystemPreflight(let stage, let path, let domain, let code) = self {
+            value["stage"] = stage
+            value["relative_path"] = path
+            value["os_error_domain"] = domain
+            value["os_error_code"] = code
+            value["process_launched"] = false
         }
         return value
     }
@@ -283,8 +306,51 @@ public enum LocalHash {
 // Mutable workspace data must never be memory-mapped or opened as a blocking
 // special file. Both hashing and undo preimages use the same descriptor checks.
 enum LocalFileReader {
+    static func isDataless(_ status: stat) -> Bool {
+        status.st_flags & UInt32(SF_DATALESS) != 0
+    }
+
+    static func requireMaterialized(_ status: stat) throws {
+        guard !isDataless(status) else {
+            throw LocalMCPError.fileNotMaterialized(
+                size: Int64(status.st_size), allocatedBlocks: Int64(status.st_blocks),
+                flags: status.st_flags
+            )
+        }
+    }
+
     static func read(url: URL, maximumBytes: Int) throws -> Data {
         try withFile(url: url) { try read(descriptor: $0, maximumBytes: maximumBytes) }
+    }
+
+    /// Opens a regular-file candidate without hydrating a cloud placeholder.
+    /// The caller owns the returned descriptor and must close it.
+    static func openFile(url: URL) throws -> Int32 {
+        let descriptor = Darwin.open(url.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW_ANY | O_NONBLOCK)
+        guard descriptor >= 0 else {
+            let openError = errno
+            // macOS reports EDEADLK for a known dataless placeholder opened
+            // nonblocking. Inspect metadata only for that exact failure; other
+            // failures retain O_NOFOLLOW_ANY's symlink/ancestor boundary.
+            if openError == EDEADLK {
+                var expected = stat()
+                if lstat(url.path, &expected) == 0 { try requireMaterialized(expected) }
+            }
+            throw LocalMCPError.operationFailed(String(cString: strerror(openError)))
+        }
+        var status = stat()
+        guard fstat(descriptor, &status) == 0 else {
+            let statusError = errno
+            Darwin.close(descriptor)
+            throw LocalMCPError.operationFailed(String(cString: strerror(statusError)))
+        }
+        do {
+            try requireMaterialized(status)
+        } catch {
+            Darwin.close(descriptor)
+            throw error
+        }
+        return descriptor
     }
 
     // Caller retains ownership of the descriptor; pread leaves its offset intact.
@@ -297,10 +363,7 @@ enum LocalFileReader {
     }
 
     static func withFile<T>(url: URL, body: (Int32) throws -> T) throws -> T {
-        let descriptor = Darwin.open(url.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW_ANY | O_NONBLOCK)
-        guard descriptor >= 0 else {
-            throw LocalMCPError.operationFailed(String(cString: strerror(errno)))
-        }
+        let descriptor = try openFile(url: url)
         defer { Darwin.close(descriptor) }
         let result = try body(descriptor)
         var current = stat()
@@ -318,6 +381,7 @@ enum LocalFileReader {
         guard fstat(descriptor, &before) == 0,
               before.st_mode & S_IFMT == S_IFREG, before.st_nlink == 1,
               before.st_size >= 0 else { throw LocalMCPError.wrongFileType }
+        try requireMaterialized(before)
         guard maximumBytes >= 0, before.st_size <= maximumBytes else {
             throw LocalMCPError.limitExceeded("file read")
         }

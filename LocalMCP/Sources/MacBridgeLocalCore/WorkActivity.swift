@@ -33,8 +33,11 @@ final class WorkActivity: @unchecked Sendable {
         var updated: Int64
         var calls = 0
         var errors = 0
+        var childErrors = 0
         var activeCalls = 0
         var jobs: [String] = []
+        var failureReports: [JSONObject] = []
+        var failureReportCount = 0
         // Deduplicate observed exits only while their job mapping is retained.
         // The cumulative error count survives eviction; this set stays bounded.
         var failedJobs: Set<String> = []
@@ -309,8 +312,16 @@ final class WorkActivity: @unchecked Sendable {
             // Failed calls/partial calls are separate from child exit outcomes.
             // A successful read of an old failed job is not another failed call.
             let batchFailed = batch.contains { $0["status"] as? String == "error" }
-            if failed || batchFailed || (result["error_count"] as? Int ?? 0) > 0 {
+            let recordedFailure = failed || batchFailed || (result["error_count"] as? Int ?? 0) > 0
+            if recordedFailure {
                 items[i].errors += 1
+                appendFailureReport(
+                    index: i, tool: name, result: result,
+                    status: failed ? "failed" : "partial", now: now
+                )
+            }
+            if let count = result["child_error_count"] as? Int, count > 0 {
+                items[i].childErrors += count
             }
             if !name.hasPrefix("process_"), let job = result["task_id"] as? String {
                 linkJobLocked(job.lowercased(), workID: id, index: i)
@@ -335,7 +346,13 @@ final class WorkActivity: @unchecked Sendable {
         if let i = try? index(owner) {
             let firstFailure = !running && (result["exit_code"] as? Int ?? 0) != 0
                 && items[i].failedJobs.insert(job).inserted
-            if firstFailure { items[i].errors += 1 }
+            if firstFailure {
+                items[i].errors += 1
+                appendFailureReport(
+                    index: i, tool: "child_process", result: result,
+                    status: "failed", now: now
+                )
+            }
             if changed || firstFailure { items[i].updated = now }
         }
     }
@@ -392,13 +409,59 @@ final class WorkActivity: @unchecked Sendable {
 
     private func snapshots(now: Int64) -> [JSONObject] { items.map { snapshot($0, now: now) } }
 
+    private func appendFailureReport(
+        index: Int, tool: String, result: JSONObject, status: String, now: Int64
+    ) {
+        var report: JSONObject = [
+            "schema_version": 1,
+            "status": status,
+            "step": String(tool.prefix(128)),
+            "recorded_ms": now,
+            "retention": "owner_memory_bounded",
+            "durable_after_restart": false,
+        ]
+        for key in ["error_count", "child_error_count", "child_partial_count",
+                    "overall_status", "exit_code", "timed_out", "cancelled",
+                    "mutation_performed", "complete", "partial"] where result[key] != nil {
+            report[key] = result[key]
+        }
+        if let detail = result["error_detail"] as? JSONObject {
+            let allowed = [
+                "code", "layer", "retry_safe", "recommended_action",
+                "operation_outcome", "stage", "relative_path", "os_error_domain",
+                "os_error_code", "logical_size_bytes", "allocated_blocks",
+                "file_flags_hex", "content_read_attempted", "process_launched",
+            ]
+            var safe: JSONObject = [:]
+            for key in allowed where detail[key] != nil { safe[key] = detail[key] }
+            if !safe.isEmpty { report["error_detail"] = safe }
+        }
+        if let children = result["child_results"] as? [JSONObject] {
+            report["child_results"] = children.prefix(16).map { child -> JSONObject in
+                var safe: JSONObject = [:]
+                for key in ["step", "status", "exit_code", "timed_out", "cancelled",
+                            "complete", "stdout_truncated", "stderr_truncated"]
+                    where child[key] != nil { safe[key] = child[key] }
+                return safe
+            }
+        }
+        items[index].failureReportCount += 1
+        items[index].failureReports.append(report)
+        if items[index].failureReports.count > 8 {
+            items[index].failureReports.removeFirst(items[index].failureReports.count - 8)
+        }
+    }
+
     private func snapshot(_ item: Item, now: Int64) -> JSONObject {
         let executing = item.activeCalls > 0 || item.jobs.contains(where: { runningJobs.contains($0) })
         let phase = item.state == "active" ? (executing ? "executing" : "waiting_next_step") : item.state
         var result: JSONObject = [
             "work_id": item.id, "title": item.title, "state": item.state, "phase": phase,
             "started_ms": item.started, "updated_ms": item.updated, "call_count": item.calls,
-            "error_count": item.errors, "active_call_count": item.activeCalls, "job_ids": item.jobs,
+            "error_count": item.errors, "child_error_count": item.childErrors,
+            "failure_report_count": item.failureReportCount,
+            "failure_reports": item.failureReports,
+            "active_call_count": item.activeCalls, "job_ids": item.jobs,
             "stale": item.state == "active" && !executing && now - item.updated >= Self.staleMilliseconds,
             "chat_label_authenticated": false,
         ]

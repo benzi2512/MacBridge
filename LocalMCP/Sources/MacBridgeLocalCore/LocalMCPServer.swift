@@ -51,7 +51,7 @@ public enum MacBridgeConnectorSurface: String, Sendable {
 }
 
 public final class LocalMCPServer: @unchecked Sendable {
-    public static let version = "0.4.0-feedback-hardening"
+    public static let version = "0.4.3-read-preflight"
     public static let maximumFrameBytes = 24 * 1_024 * 1_024
     public static let supportedProtocolVersions = [
         "2026-07-28", "2025-11-25", "2025-06-18",
@@ -72,6 +72,7 @@ public final class LocalMCPServer: @unchecked Sendable {
     private let startedUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
     private var initializeResponded = false
     private var initialized = false
+    private var catalogRefreshNotificationSent = false
     private var negotiatedProtocol = "2025-06-18"
 
     /// Changes whenever either the serving process or typed catalog changes.
@@ -887,7 +888,8 @@ public final class LocalMCPServer: @unchecked Sendable {
 
     // Small outcome metadata only, never per-item file content or batch payloads.
     private static let observedOutcomeKeys = [
-        "complete", "partial", "error_count", "skipped_count", "success_count", "read_count",
+        "complete", "partial", "error_count", "child_error_count", "child_partial_count",
+        "overall_status", "skipped_count", "success_count", "read_count",
         "edits_applied", "replacements",
     ]
 
@@ -961,7 +963,8 @@ public final class LocalMCPServer: @unchecked Sendable {
                 error: failed ? "Tool reported an unsuccessful or uncertain outcome; inspect receipt" : nil) }
             return result
         } catch {
-            workActivity.finishCall(workID, name: name, result: [:], failed: true)
+            let failure = structuredError(error)
+            workActivity.finishCall(workID, name: name, result: failure, failed: true)
             if observationEnabled { finishObservation(eventID, result: [:], error: safeMessage(error)) }
             throw error
         }
@@ -1520,6 +1523,19 @@ public final class LocalMCPServer: @unchecked Sendable {
                 let message = try LocalJSON.decodeObject(data)
                 if try dispatchLongTool(message, data: data, output: output, responses: responses) { return }
                 if let response = handle(message) { try write(response, to: output) }
+                if message["method"] as? String == "notifications/initialized",
+                   connectorSurface == .webTunnel, !catalogRefreshNotificationSent {
+                    // A new tunnel process may serve a newer typed catalog while
+                    // the remote host still holds recipients from the previous
+                    // instance. Advertise one bounded refresh after negotiation;
+                    // tools/list remains the sole source of schemas.
+                    catalogRefreshNotificationSent = true
+                    try write([
+                        "jsonrpc": "2.0",
+                        "method": "notifications/tools/list_changed",
+                        "params": [:] as JSONObject,
+                    ], to: output)
+                }
             } catch {
                 try write(
                     rpcError(id: NSNull(), code: -32_700, message: safeMessage(error)),
@@ -1801,13 +1817,15 @@ public final class LocalMCPServer: @unchecked Sendable {
                         // begun. Authorization can fail before that boundary and
                         // must still close the admitted activity exactly once.
                         if !handedToObservation {
-                            workActivity.finishCall(admittedWorkID, name: name, result: [:], failed: true)
+                            workActivity.finishCall(admittedWorkID, name: name,
+                                result: structuredError(error), failed: true)
                         }
                         payload = toolResult(structuredError(error), message: safeMessage(error), isError: true)
                     }
                     response = rpcSuccess(id: responseID, result: payload)
                 } catch {
-                    workActivity.finishCall(admittedWorkID, name: name, result: [:], failed: true)
+                    workActivity.finishCall(admittedWorkID, name: name,
+                        result: structuredError(error), failed: true)
                     let message = safeMessage(error)
                     response = rpcSuccess(id: responseID, result: toolResult(
                         structuredError(error), message: message, isError: true
@@ -1992,7 +2010,7 @@ extension LocalMCPServer {
     static var catalogSHA256: String { builtInCatalog.digest }
 
     public static var discoveryGuide: String {
-        "Reviewing a tool is not permission to execute it; never replay commands from earlier tasks. Reuse already-loaded schemas; host finds missing ones. tool_catalog: starters; query/category<=5; names return exact schemas; limit=current catalog count for full index; cannot load host tools. developer_inspect is read-only; developer_task adds no authority. Operator loop: set acceptance, inspect, act, verify tests/diff/errors, repair, finish when accepted. Multi-step: developer_task returns parent; else begin work_task and carry ID/token. Keep process/transaction tokens in chat; lists omit them. Verify and resolve each transaction: accept to keep or restore to roll back. Never nest parents; labels grant no identity/permission. Resume waiting_user as active. Finish after jobs stop; silence is not completion. Long-work checkpoint: IDs/cursors, transactions, verified results, next step; revalidate after restart. Evidence: actions, tests/diff/errors, log refs, truncation and unknowns. command_run times out; command_start returns task_id; process_output returns status/cursors. Inspect every batch result. Reconcile uncertain writes before retry. Respect host approvals and Work-mode gates."
+        "Reviewing a tool is not permission to execute it; never replay commands from earlier tasks. Before MB work call bridge_capabilities; record build_id, catalog_sha256 and binding_epoch. Use current schemas, never an older chat. Reuse already-loaded schemas. If a schema is missing or binding changes, allow one targeted host rebind and read-only probe. Latest means the installed owner-pinned build; never download mutable latest. tool_catalog: query/category<=5; names return exact schemas; limit=current catalog count for full index; cannot load host tools. For MB self-repair resolve the current unified workspace, inspect Git/diff, patch and test; never reload, restart or replace runtime while jobs or transactions are unknown. Operator loop: set acceptance, inspect, act, verify tests/diff/errors, repair, finish when accepted. Never nest parents; carry one ID/token; resolve every transaction. Long-work checkpoint: IDs/cursors, transactions, verified results, next step; revalidate after restart. Evidence: actions, tests/diff/errors, truncation and unknowns. Inspect every batch result; reconcile uncertain writes. Respect host approvals and Work-mode gates."
     }
 
     private static func makeToolSpecs() -> [JSONObject] {

@@ -32,7 +32,7 @@ const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
     assert.deepEqual(discovered.capabilities.tools,{listChanged:true});
     child.stdin.write(JSON.stringify({jsonrpc:'2.0',method:'notifications/initialized'})+'\n');
     const listed=await request('resources/list');assert.equal(listed.resources.length,3);
-    assert(!notifications.includes('notifications/tools/list_changed'),'stable catalog emitted an unsolicited refresh');
+    assert.equal(notifications.filter(name=>name==='notifications/tools/list_changed').length,1,'web tunnel did not request exactly one host catalog refresh');
     const expected=new Map([
       ['ui://macbridge/activity-chatgpt-v3.html','text/html+skybridge'],
       ['ui://macbridge/activity-chatgpt-v2.html','text/html+skybridge'],

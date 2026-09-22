@@ -4,6 +4,26 @@ import XCTest
 @testable import MacBridgeLocalCore
 
 final class FileReaderSecurityTests: XCTestCase {
+    func testDatalessDirectReadHasStableNonHydratingErrorMetadata() throws {
+        var metadata = stat()
+        metadata.st_size = 8_191
+        metadata.st_blocks = 0
+        metadata.st_flags = UInt32(SF_DATALESS)
+        XCTAssertTrue(LocalFileReader.isDataless(metadata))
+        var detail: JSONObject = [:]
+        XCTAssertThrowsError(try LocalFileReader.requireMaterialized(metadata)) {
+            detail = localErrorDetail($0)
+        }
+        XCTAssertEqual(detail["code"] as? String, "FILE_NOT_MATERIALIZED")
+        XCTAssertEqual(detail["stage"] as? String, "read_preflight")
+        XCTAssertEqual(detail["logical_size_bytes"] as? Int64, 8_191)
+        XCTAssertEqual(detail["allocated_blocks"] as? Int64, 0)
+        XCTAssertEqual(detail["content_read_attempted"] as? Bool, false)
+        XCTAssertEqual(detail["retry_safe"] as? Bool, false)
+        XCTAssertEqual(detail["recommended_action"] as? String,
+                       "materialize_file_locally_then_retry")
+    }
+
     func testBoundedReaderPreservesBytesHashAndDescriptorOffset() throws {
         let fixture = try Fixture()
         defer { fixture.remove() }
@@ -22,6 +42,21 @@ final class FileReaderSecurityTests: XCTestCase {
         XCTAssertEqual(try LocalFileReader.read(descriptor: fd, maximumBytes: bytes.count), bytes)
         XCTAssertEqual(lseek(fd, 0, SEEK_CUR), 7)
         XCTAssertEqual(try LocalHash.sha256(descriptor: fd), LocalHash.sha256(bytes))
+    }
+
+    func testWorkspaceReadUsesSharedNonHydratingOpenPath() throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let url = fixture.workspace.appendingPathComponent("entry-point.txt")
+        try Data("entry point".utf8).write(to: url)
+        let service = try fixture.service()
+        let result = try service.readFile(
+            workspaceID: fixture.workspaceID, path: "entry-point.txt",
+            encoding: "utf8", maximumBytes: 64
+        )
+        let file = try XCTUnwrap(result["file"] as? JSONObject)
+        XCTAssertEqual(file["content"] as? String, "entry point")
+        XCTAssertEqual(file["byte_count"] as? Int, 11)
     }
 
     func testFIFOLeafAncestorSymlinksAndHardlinksFailWithoutBlocking() throws {

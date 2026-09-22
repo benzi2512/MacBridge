@@ -11,6 +11,7 @@ final class ToolDiscoveryTests: XCTestCase {
         let starter = try ToolDiscovery.catalog([:])
         XCTAssertEqual(starter["selection"] as? String, "starter")
         XCTAssertEqual(try rows().compactMap { $0["name"] as? String }, ToolDiscovery.starterNames)
+        XCTAssertEqual(try rows().first?["name"] as? String, "bridge_capabilities")
         XCTAssertEqual(starter["returned_count"] as? Int, 13)
         XCTAssertEqual(starter["truncated"] as? Bool, true)
         let result = try ToolDiscovery.catalog(["limit": 76]), index = try rows(["limit": 76])

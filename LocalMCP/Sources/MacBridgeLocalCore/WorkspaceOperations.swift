@@ -893,13 +893,7 @@ public final class LocalWorkspaceService: @unchecked Sendable {
         guard !isSensitive(resolved.relativePath) else {
             throw LocalMCPError.sensitivePathBlocked
         }
-        let descriptor = Darwin.open(
-            resolved.url.path,
-            O_RDONLY | O_CLOEXEC | O_NOFOLLOW_ANY | O_NONBLOCK
-        )
-        guard descriptor >= 0 else {
-            throw LocalMCPError.operationFailed(String(cString: strerror(errno)))
-        }
+        let descriptor = try LocalFileReader.openFile(url: resolved.url)
         defer { Darwin.close(descriptor) }
         var status = stat()
         guard fstat(descriptor, &status) == 0,

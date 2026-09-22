@@ -105,6 +105,50 @@ final class WorkActivityTests: XCTestCase {
         XCTAssertEqual(store.list(jobs: nil)[0]["error_count"] as? Int, 3)
     }
 
+    func testNestedChildFailuresCountOneFailedCallAndExactChildren() throws {
+        let store = WorkActivity(), id = try begin(store)
+        _ = try store.beginCall(name: "developer_inspect", arguments: ["work_id": id])
+        store.finishCall(id, name: "developer_inspect", result: [
+            "error_count": 3, "child_error_count": 3, "partial": true,
+        ], failed: false)
+        let parent = store.list(jobs: nil)[0]
+        XCTAssertEqual(parent["error_count"] as? Int, 1)
+        XCTAssertEqual(parent["child_error_count"] as? Int, 3)
+        XCTAssertEqual(parent["failure_report_count"] as? Int, 1)
+        let report = try XCTUnwrap((parent["failure_reports"] as? [JSONObject])?.first)
+        XCTAssertEqual(report["status"] as? String, "partial")
+        XCTAssertEqual(report["step"] as? String, "developer_inspect")
+        XCTAssertEqual(report["child_error_count"] as? Int, 3)
+        XCTAssertEqual(report["retention"] as? String, "owner_memory_bounded")
+        XCTAssertEqual(report["durable_after_restart"] as? Bool, false)
+        XCTAssertEqual(parent["call_count"] as? Int, 1)
+    }
+
+    func testAutomaticFailureReportKeepsStructuredCauseWithoutTokens() throws {
+        let store = WorkActivity(), id = try begin(store)
+        _ = try store.beginCall(name: "file_read", arguments: ["work_id": id])
+        store.finishCall(id, name: "file_read", result: [
+            "error": "must not be copied",
+            "transaction_control_token": "must-not-be-retained",
+            "error_detail": [
+                "code": "FILE_NOT_MATERIALIZED", "layer": "core",
+                "retry_safe": false, "recommended_action": "materialize_file_locally_then_retry",
+                "operation_outcome": "not_started_no_content_read",
+                "stage": "read_preflight", "logical_size_bytes": 8191,
+                "allocated_blocks": 0, "file_flags_hex": "0x40000060",
+                "content_read_attempted": false,
+            ] as JSONObject,
+        ], failed: true)
+        let parent = store.list(jobs: nil)[0]
+        let report = try XCTUnwrap((parent["failure_reports"] as? [JSONObject])?.first)
+        let detail = try XCTUnwrap(report["error_detail"] as? JSONObject)
+        XCTAssertEqual(detail["code"] as? String, "FILE_NOT_MATERIALIZED")
+        XCTAssertEqual(detail["logical_size_bytes"] as? Int, 8191)
+        XCTAssertNil(report["error"])
+        XCTAssertNil(report["transaction_control_token"])
+        XCTAssertFalse(String(describing: report).contains("must-not-be-retained"))
+    }
+
     func testListAndObserverOnlyFailureIsCountedOnceBeforeStatusRead() throws {
         for firstObservation in ["observer", "process_list", "work_task"] {
             let store = WorkActivity(), id = try begin(store), job = UUID().uuidString.lowercased()
@@ -536,6 +580,7 @@ final class WorkActivityTests: XCTestCase {
             XCTAssertEqual(status["status_only"] as? Bool, true)
             let snapshot = try server.observerRequest(["action": "snapshot"])
             XCTAssertEqual((snapshot["work_items"] as? [JSONObject])?.first?["error_count"] as? Int, 1)
+            XCTAssertEqual((snapshot["work_items"] as? [JSONObject])?.first?["failure_report_count"] as? Int, 1)
         }
         let finished = try server.callTool(name: "work_task", arguments: ["action": "finish", "work_id": id, "status": "failed"])
         XCTAssertEqual(finished["error_count"] as? Int, 1)
@@ -545,6 +590,7 @@ final class WorkActivityTests: XCTestCase {
         let snapshot = try server.observerRequest(["action": "snapshot"])
         let retained = try XCTUnwrap((snapshot["work_items"] as? [JSONObject])?.first)
         XCTAssertEqual(retained["error_count"] as? Int, 2)
+        XCTAssertEqual(retained["failure_report_count"] as? Int, 2)
         XCTAssertEqual(retained["state"] as? String, "failed")
         XCTAssertEqual((try server.callTool(name: "process_list", arguments: [:])["processes"] as? [JSONObject])?.count, 0)
     }

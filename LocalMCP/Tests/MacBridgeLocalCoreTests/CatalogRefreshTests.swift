@@ -3,7 +3,7 @@ import XCTest
 @testable import MacBridgeLocalCore
 
 final class CatalogRefreshTests: XCTestCase {
-    func testFreshWebTunnelSessionKeepsCatalogStableAfterInitialized() throws {
+    func testFreshWebTunnelSessionRequestsOneCatalogRefreshAfterInitialized() throws {
         let fixture = try Fixture()
         defer { fixture.remove() }
         let server = try LocalMCPServer(
@@ -24,10 +24,12 @@ final class CatalogRefreshTests: XCTestCase {
             ["jsonrpc": "2.0", "method": "notifications/initialized"],
         ])
 
-        XCTAssertEqual(frames.count, 1)
+        XCTAssertEqual(frames.count, 2)
         let initialized = try XCTUnwrap(frames.first?["result"] as? JSONObject)
         let capabilities = try XCTUnwrap(initialized["capabilities"] as? JSONObject)
         XCTAssertEqual((capabilities["tools"] as? JSONObject)?["listChanged"] as? Bool, true)
+        XCTAssertEqual(frames[1]["method"] as? String, "notifications/tools/list_changed")
+        XCTAssertNil(frames[1]["id"])
     }
 
     func testResumedWebTunnelSessionReturnsOnlyOperationalToolResult() throws {

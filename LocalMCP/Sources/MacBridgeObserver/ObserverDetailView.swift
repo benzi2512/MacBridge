@@ -34,7 +34,7 @@ struct ObserverDetailView: View {
                 detailField("Workspace", work.workspaceName)
                 detailField("Chat label", work.chatLabel ?? "Not supplied")
                 Text("Caller-supplied label · not a verified chat identity.").font(.caption2).foregroundStyle(.secondary)
-                detailField("Recorded activity", "\(work.callCount) calls · \(work.errorCount) errors · \(work.visibleChildren.count) recent steps shown")
+                detailField("Recorded activity", "\(work.callCount) calls · \(work.errorCount) errors · \(work.childErrorCount) failed child operations · \(work.failureReportCount) automatic reports (\(work.retainedFailureReportCount) retained) · \(work.visibleChildren.count) recent steps shown")
                 if let updated = work.updated {
                     HStack { Text("Last update"); Text(updated, style: .date); Text(updated, style: .time) }
                         .font(.caption).foregroundStyle(.secondary)

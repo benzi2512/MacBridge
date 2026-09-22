@@ -147,7 +147,13 @@ class MCPClient:
         request_id = self.next_id
         self.next_id += 1
         self.send({'jsonrpc': '2.0', 'id': request_id, 'method': method, 'params': params})
-        response = self.receive()
+        while True:
+            response = self.receive()
+            if response.get('id') is None and isinstance(response.get('method'), str):
+                # Server notifications are independent of request responses.
+                # A real MCP client routes them to its notification handler.
+                continue
+            break
         if response.get('id') != request_id:
             raise GateFailure(f'MCP response id mismatch for {method}')
         if 'error' in response:

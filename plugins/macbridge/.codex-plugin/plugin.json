@@ -1,6 +1,6 @@
 {
   "name": "macbridge",
-  "version": "0.4.0",
+  "version": "0.4.3",
   "description": "Evidence-backed workflows for a MacBridge connection owned by the installer.",
   "author": {
     "name": "MacBridge Maintainers",

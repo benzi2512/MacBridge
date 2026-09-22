@@ -39,7 +39,7 @@ enum SearchReadIssue: Error {
 
 enum SearchFileReader {
     static func isDataless(_ status: stat) -> Bool {
-        status.st_flags & UInt32(SF_DATALESS) != 0
+        LocalFileReader.isDataless(status)
     }
 
     // Never mmap search input, hydrate a known dataless placeholder, follow a

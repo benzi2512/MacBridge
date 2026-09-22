@@ -75,6 +75,20 @@ final class ToolResultSummaryTests: XCTestCase {
         }
     }
 
+    func testDeveloperInspectionSurfacesAggregatedChildFailures() {
+        let text = ToolResultSummary.text(name: "developer_inspect", result: [
+            "child_error_count": 3, "error_count": 3, "partial": true,
+            "inspection": ["scanned_returned_entries": 2],
+            "git_status": ["exit_code": 128],
+            "git_branches": ["exit_code": 128],
+            "git_log": ["exit_code": 128],
+        ])
+        XCTAssertTrue(text.contains("3 child operations failed"), text)
+        XCTAssertTrue(text.contains("Git status exit 128"), text)
+        XCTAssertTrue(text.contains("partial result"), text)
+        XCTAssertFalse(text.contains("PASS"), text)
+    }
+
     func testOnlyUUIDJobIDsAreRepeated() {
         let id = "11111111-2222-4333-8444-555555555555"
         XCTAssertTrue(ToolResultSummary.text(name: "process_output", result: ["task_id": id]).contains(id))
@@ -214,6 +228,11 @@ final class ToolResultSummaryTests: XCTestCase {
             XCTAssertTrue(inspect.contains(fragment), inspect)
         }
         XCTAssertFalse(inspect.contains("private filename"))
+        let reports = ToolResultSummary.text(name: "work_task", result: [
+            "phase": "failed", "call_count": 2, "error_count": 1,
+            "failure_report_count": 1,
+        ])
+        XCTAssertTrue(reports.contains("1 automatic failure reports retained"))
     }
 
     func testCapabilityReceiptDoesNotClaimHostToolLoading() {

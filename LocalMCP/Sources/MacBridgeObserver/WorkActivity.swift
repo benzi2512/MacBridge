@@ -18,9 +18,14 @@ struct WorkActivity: Identifiable {
     var active: Bool { state != "completed" && state != "failed" }
     var stale: Bool { snapshotStale || raw["stale"] as? Bool == true }
     var executing: Bool { connected && !stale && active && phase == "executing" }
-    var issue: Bool { !connected || stale || state == "unknown" || state == "failed" || errorCount > 0 }
+    var issue: Bool { !connected || stale || state == "unknown" || state == "failed" || errorCount > 0 || childErrorCount > 0 || failureReportCount > 0 }
     var callCount: Int { max(0, raw["call_count"] as? Int ?? 0) }
     var errorCount: Int { max(0, raw["error_count"] as? Int ?? 0) }
+    var childErrorCount: Int { max(0, raw["child_error_count"] as? Int ?? 0) }
+    var failureReportCount: Int { max(0, raw["failure_report_count"] as? Int ?? 0) }
+    var retainedFailureReportCount: Int {
+        max(0, (raw["failure_reports"] as? [[String: Any]])?.count ?? 0)
+    }
     var updatedMilliseconds: Double { (raw["updated_ms"] as? NSNumber)?.doubleValue ?? 0 }
     var updated: Date? { updatedMilliseconds > 0 && updatedMilliseconds.isFinite ? Date(timeIntervalSince1970: updatedMilliseconds / 1000) : nil }
     var phaseLabel: String {
@@ -44,6 +49,9 @@ struct WorkActivity: Identifiable {
             return active
                 ? "This task has not been marked complete. Its current progress cannot be confirmed from this snapshot."
                 : "The last snapshot records the caller's finished task status. This is not a current connection or independent verification that the goal passed."
+        }
+        if failureReportCount > 0 {
+            return "MacBridge recorded \(failureReportCount) automatic failure report\(failureReportCount == 1 ? "" : "s") for this task and retains the latest \(retainedFailureReportCount) in bounded owner memory. Technical metadata shows structured causes and next actions without control tokens or command output."
         }
         if phase == "waiting_next_step" { return "The last MB call has returned. The task stays active until its caller marks it complete; no process is implied by this waiting state." }
         if phase == "waiting_user" { return "The caller marked this task as waiting for your input. It remains in Active." }

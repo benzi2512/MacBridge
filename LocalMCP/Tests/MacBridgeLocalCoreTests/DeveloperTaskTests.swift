@@ -77,6 +77,15 @@ final class DeveloperTaskTests: XCTestCase {
         XCTAssertEqual(inspected["developer_action"] as? String, "inspect_repo")
         XCTAssertEqual(inspected["authority_changed"] as? Bool, false)
         XCTAssertNotNil(inspected["inspection"] as? JSONObject)
+        XCTAssertEqual(inspected["child_count"] as? Int, 4)
+        XCTAssertEqual(inspected["child_error_count"] as? Int, 3)
+        XCTAssertEqual(inspected["error_count"] as? Int, 3)
+        XCTAssertEqual(inspected["complete"] as? Bool, false)
+        XCTAssertEqual(inspected["partial"] as? Bool, true)
+        XCTAssertEqual(inspected["overall_status"] as? String, "partial")
+        let children = try XCTUnwrap(inspected["child_results"] as? [JSONObject])
+        XCTAssertEqual(children.filter { $0["status"] as? String == "failed" }.count, 3)
+        XCTAssertFalse(children.contains { $0["stdout"] != nil || $0["stderr"] != nil })
         XCTAssertThrowsError(
             try server.callTool(
                 name: "developer_inspect",
@@ -92,6 +101,19 @@ final class DeveloperTaskTests: XCTestCase {
                 arguments: ["action": "inspect_repo", "workspace_id": fixture.workspaceID]
             )
         )
+    }
+
+    func testReviewDiffAggregatesNonRepositoryChildFailures() throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let inspected = try server(fixture).callTool(
+            name: "developer_inspect",
+            arguments: ["action": "review_diff", "workspace_id": fixture.workspaceID]
+        )
+        XCTAssertEqual(inspected["child_count"] as? Int, 2)
+        XCTAssertEqual(inspected["child_error_count"] as? Int, 2)
+        XCTAssertEqual(inspected["overall_status"] as? String, "failed")
+        XCTAssertEqual(inspected["complete"] as? Bool, false)
     }
 
     func testRejectedLaunchClosesItsNewParentAsFailed() throws {

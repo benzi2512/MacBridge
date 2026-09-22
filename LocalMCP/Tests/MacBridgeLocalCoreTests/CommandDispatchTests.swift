@@ -672,28 +672,33 @@ private final class CommandDispatchConnection {
     }
 
     func receive(id: Any? = nil) throws -> JSONObject {
-        while received.firstIndex(of: 10) == nil {
-            var descriptor = pollfd(fd: output.fileHandleForReading.fileDescriptor,
-                                    events: Int16(POLLIN), revents: 0)
-            guard poll(&descriptor, 1, 2_000) > 0 else {
-                throw LocalMCPError.operationFailed("stdio response blocked while command awaited completion")
+        while true {
+            while received.firstIndex(of: 10) == nil {
+                var descriptor = pollfd(fd: output.fileHandleForReading.fileDescriptor,
+                                        events: Int16(POLLIN), revents: 0)
+                guard poll(&descriptor, 1, 2_000) > 0 else {
+                    throw LocalMCPError.operationFailed("stdio response blocked while command awaited completion")
+                }
+                var buffer = [UInt8](repeating: 0, count: 8192)
+                let count = Darwin.read(descriptor.fd, &buffer, buffer.count)
+                guard count > 0 else { throw LocalMCPError.operationFailed("response stream ended") }
+                received.append(contentsOf: buffer.prefix(count))
             }
-            var buffer = [UInt8](repeating: 0, count: 8192)
-            let count = Darwin.read(descriptor.fd, &buffer, buffer.count)
-            guard count > 0 else { throw LocalMCPError.operationFailed("response stream ended") }
-            received.append(contentsOf: buffer.prefix(count))
+            let newline = received.firstIndex(of: 10)!
+            let frame = Data(received.prefix(upTo: newline))
+            received.removeSubrange(...newline)
+            let response = try LocalJSON.decodeObject(frame)
+            // JSON-RPC notifications are not request responses. Real clients
+            // route them separately; this helper must do the same.
+            if response["id"] == nil, response["method"] != nil { continue }
+            if let id = id as? Int {
+                let actualID = response["id"]
+                XCTAssertEqual(actualID as? Int, id,
+                               "received response id \(String(describing: actualID))")
+            }
+            if let id = id as? String { XCTAssertEqual(response["id"] as? String, id) }
+            return response
         }
-        let newline = received.firstIndex(of: 10)!
-        let frame = Data(received.prefix(upTo: newline))
-        received.removeSubrange(...newline)
-        let response = try LocalJSON.decodeObject(frame)
-        if let id = id as? Int {
-            let actualID = response["id"]
-            XCTAssertEqual(actualID as? Int, id,
-                           "received response id \(String(describing: actualID))")
-        }
-        if let id = id as? String { XCTAssertEqual(response["id"] as? String, id) }
-        return response
     }
 
     func endInput() throws {

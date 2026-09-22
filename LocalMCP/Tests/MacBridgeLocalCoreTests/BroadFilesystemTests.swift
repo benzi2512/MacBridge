@@ -5,6 +5,31 @@ import XCTest
 @testable import MacBridgeLocalCore
 
 final class BroadFilesystemTests: XCTestCase {
+    func testPreflightFailureReportsFilteredEntryCauseAndNoLaunch() {
+        let root = "/Users/example/Downloads"
+        XCTAssertEqual(LocalFilesystemAccess.sanitizedTraversalPath(
+            URL(fileURLWithPath: root + "/ordinary.txt"), rootPath: root
+        ), "ordinary.txt")
+        XCTAssertEqual(LocalFilesystemAccess.sanitizedTraversalPath(
+            URL(fileURLWithPath: root + "/.ssh/id_ed25519"), rootPath: root
+        ), "[protected]")
+        XCTAssertEqual(LocalFilesystemAccess.sanitizedTraversalPath(
+            URL(fileURLWithPath: "/private/outside"), rootPath: root
+        ), "[outside-root]")
+        XCTAssertEqual(LocalFilesystemAccess.sanitizedTraversalPath(
+            URL(fileURLWithPath: "/Users/example/Desktop/report.txt"), rootPath: "/"
+        ), "Users/example/Desktop/report.txt")
+        let detail = localErrorDetail(LocalMCPError.filesystemPreflight(
+            stage: "protected_path_enumeration", relativePath: "ordinary.txt",
+            osDomain: NSPOSIXErrorDomain, osCode: Int(EACCES)
+        ))
+        XCTAssertEqual(detail["code"] as? String, "FILESYSTEM_PREFLIGHT_FAILED")
+        XCTAssertEqual(detail["relative_path"] as? String, "ordinary.txt")
+        XCTAssertEqual(detail["os_error_domain"] as? String, NSPOSIXErrorDomain)
+        XCTAssertEqual(detail["os_error_code"] as? Int, Int(EACCES))
+        XCTAssertEqual(detail["process_launched"] as? Bool, false)
+    }
+
     func testRootRequiresExplicitOptInAndAdvertisesAbsolutePaths() throws {
         let fixture = try Fixture()
         defer { fixture.remove() }

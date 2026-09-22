@@ -80,6 +80,11 @@ else
 fi
 /bin/cp "$core" "$destination/Contents/MacOS/macbridge-mcp"
 [ "$core_hash" = "$(/usr/bin/shasum -a 256 "$destination/Contents/MacOS/macbridge-mcp" | /usr/bin/awk '{print $1}')" ] || fail "Candidate core changed during copy"
+# Finder/file-provider folders can add cosmetic resource metadata to a newly
+# created bundle. Remove only the two attributes rejected by codesign; retain
+# provenance, quarantine and every other security-relevant attribute.
+/usr/bin/xattr -dr com.apple.FinderInfo "$destination" 2>/dev/null || true
+/usr/bin/xattr -dr com.apple.ResourceFork "$destination" 2>/dev/null || true
 /usr/bin/codesign --force --sign - "$destination"
 /usr/bin/codesign --verify --deep --strict "$destination"
 [ "$core_hash" = "$(/usr/bin/shasum -a 256 "$destination/Contents/MacOS/macbridge-mcp" | /usr/bin/awk '{print $1}')" ] || fail "Packaging changed the candidate core"

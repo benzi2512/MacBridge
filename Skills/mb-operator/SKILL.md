@@ -1,6 +1,6 @@
 ---
 name: mb-operator
-description: "Run a MacBridge request as a complete, evidence-backed workflow. Use when ChatGPT or Codex should inspect, change, test, review, resume, or hand off work through MacBridge without adding another model or agent framework."
+description: "Run an evidence-backed MacBridge workflow, including binding the current runtime and diagnosing or repairing MacBridge itself. Use when ChatGPT or Codex should inspect, change, test, review, resume, or hand off work through MacBridge."
 ---
 
 # MB Operator
@@ -8,6 +8,23 @@ description: "Run a MacBridge request as a complete, evidence-backed workflow. U
 Use the current ChatGPT or Codex model as the reasoning layer. Treat MacBridge as
 the deterministic executor, state holder, and evidence source; this skill adds no
 authority and does not bypass host, macOS, or workspace gates.
+
+## Bind the active runtime first
+
+Before any MacBridge operation, call `bridge_capabilities` and record its
+`build_id`, `catalog_sha256`, and `binding_epoch`. Treat those values as the
+current source of truth. Never reuse parameters copied from an older chat,
+checkpoint, document, or cached tool schema.
+
+If a required tool is missing, or the binding epoch changes, perform at most one
+targeted host rediscovery/rebind and then one read-only probe. If the direct
+recipient is still unavailable, report `HOST_BINDING_MISSING` or
+`HOST_RECIPIENT_STALE` and stop that MB path. Do not restart MacBridge to hide a
+host-binding failure.
+
+“Latest” means the installed, owner-pinned active build reported by
+`bridge_capabilities`. Never download, build, install, or switch to a mutable
+`latest` release merely because a chat is starting.
 
 ## Run the workflow
 
@@ -32,6 +49,20 @@ authority and does not bypass host, macOS, or workspace gates.
    Reconcile uncertain writes before any retry; never replay a mutation blindly.
 8. Finish `work_task` only after its jobs stop and the acceptance checks pass or
    the result is explicitly marked failed with the remaining blocker.
+
+## Repair MacBridge itself
+
+Normal Chat may use the same bounded file, Git, command, process, and developer
+tools to diagnose and patch MacBridge source. Resolve the registered
+`MacBridge Unified Current` workspace first; do not assume an older workspace
+with a similar name is current. Preserve unrelated changes and inspect the diff.
+Run targeted tests, then the relevant full suite, and build a candidate from the
+pinned source revision.
+
+Source repair is not cutover authorization. Do not replace the running binary,
+reload workspaces, or restart the core/tunnel while any job, retained transaction,
+or ownership is unknown. Verify the exact artifact hash and rollback path before
+cutover. A local test PASS is not a normal-Chat acceptance PASS.
 
 ## Pause and report
 

@@ -156,12 +156,21 @@ enum ToolResultSummary {
         if let calls = nonnegative(r["call_count"]), let errors = nonnegative(r["error_count"]) {
             text += "; \(calls) calls; \(errors) recorded errors"
         }
+        if let childErrors = nonnegative(r["child_error_count"]), childErrors > 0 {
+            text += "; \(childErrors) failed child operations"
+        }
+        if let reports = nonnegative(r["failure_report_count"]), reports > 0 {
+            text += "; \(reports) automatic failure reports retained"
+        }
         if r["stale"] as? Bool == true { text += "; no recent update, not proof of completion" }
         return text
     }
 
     private static func inspectionSummary(_ r: JSONObject) -> String {
         var parts: [String] = []
+        if let errors = nonnegative(r["child_error_count"]), errors > 0 {
+            parts.append("\(errors) child operations failed")
+        }
         if let inspection = r["inspection"] as? JSONObject,
            let count = nonnegative(inspection["scanned_returned_entries"]) {
             parts.append("inspected \(count) directory entries")

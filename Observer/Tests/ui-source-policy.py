@@ -31,7 +31,7 @@ with (ROOT / "Observer" / "Info.plist").open("rb") as handle:
 check("agent-app-no-dock", info.get("LSUIElement") is True)
 check("app-name", info.get("CFBundleDisplayName") == "MacBridge")
 check("macos-13-minimum", info.get("LSMinimumSystemVersion") == "13.0")
-check("runtime-aligned-version", info.get("CFBundleShortVersionString") == "0.4.0")
+check("runtime-aligned-version", info.get("CFBundleShortVersionString") == "0.4.3")
 check("canonical-png", (ROOT / "Assets" / "Brand" / "macbridge-icon.png").is_file())
 check("canonical-icns", (ROOT / "Assets" / "Brand" / "MacBridge.icns").is_file())
 

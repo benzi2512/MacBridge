@@ -36,6 +36,25 @@ final class WorkActivityTests: XCTestCase {
         }
     }
 
+    func testAutomaticFailureReportsAppearAsTaskIssuesWithoutExposingPayloads() throws {
+        var reported = work()
+        reported["error_count"] = 1
+        reported["child_error_count"] = 3
+        reported["failure_report_count"] = 1
+        reported["failure_reports"] = [[
+            "schema_version": 1, "status": "partial", "step": "developer_inspect",
+            "error_detail": ["code": "OPERATION_PARTIAL"],
+        ]]
+        let parent = try XCTUnwrap(feed(works: [reported]).groups.first)
+        XCTAssertTrue(parent.issue)
+        XCTAssertEqual(parent.childErrorCount, 3)
+        XCTAssertEqual(parent.failureReportCount, 1)
+        XCTAssertEqual(parent.retainedFailureReportCount, 1)
+        XCTAssertTrue(parent.explanation.contains("recorded 1 automatic failure report"))
+        XCTAssertTrue(parent.explanation.contains("retains the latest 1"))
+        XCTAssertFalse(parent.explanation.contains("payload"))
+    }
+
     func testMultipleParentsGroupOnlyExplicitIDsAndDoNotDuplicateJobsOrReceipts() throws {
         var start = call("start"); start["tool"] = "command_start"
         start["result"] = ["task_id": "job1", "running": true]
