@@ -15,8 +15,9 @@ Installing one does not silently complete the other two.
 ## Supported distribution boundary
 
 - macOS 13 or newer on Apple silicon is the currently tested target.
-- The app is built from source and ad-hoc signed. It is not Developer-ID signed or
-  notarized, so this project does not advertise a one-click consumer DMG.
+- The v0.4.3 release includes an exact arm64 ZIP and the source needed to rebuild
+  it. The app is ad-hoc signed, not Developer-ID signed or notarized, so this
+  project does not advertise a one-click consumer DMG.
 - The Secure MCP Tunnel is private, account/workspace scoped transport. Every user
   creates and authorizes their own tunnel and personal ChatGPT connection.
 - A public, universally installable ChatGPT plugin would require a stable public
@@ -24,6 +25,13 @@ Installing one does not silently complete the other two.
   listener and this source release does not claim that distribution mode.
 - Developer Mode and plugin availability can depend on the user's ChatGPT plan
   and workspace policy.
+
+## Codex-assisted setup
+
+For the shortest owner-neutral route, send Codex the repository URL and ask it
+to follow [CODEX-SETUP.md](CODEX-SETUP.md). That workflow pins the exact release
+asset and hashes, verifies before installing, and separates local installation
+from the user's account-bound tunnel/ChatGPT authorization.
 
 ## 1. Review and obtain one exact source release
 
@@ -93,7 +101,8 @@ This installs the owner-neutral MB Operator workflow and branding. It does not
 contain or replace the per-user MCP connection from step 3.
 
 ```sh
-codex plugin marketplace add benzi2512/MacBridge --ref v0.4.3
+codex plugin marketplace add benzi2512/MacBridge \
+  --ref 660497f3cf9acd118fc2a6ab9a48767c2e7bb94a
 codex plugin add macbridge@macbridge-public
 ```
 

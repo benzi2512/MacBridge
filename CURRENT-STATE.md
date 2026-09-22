@@ -20,6 +20,13 @@ code-signature verification. It remains ad-hoc signed: there is no Developer ID
 signature or notarization, so the project still does not claim a one-click
 consumer installer.
 
+The public `v0.4.3` release also carries the exact Apple-silicon archive
+`MacBridge-0.4.3-build7-macos-arm64-ad-hoc.zip`, SHA-256
+`059e51314a1d200c134acddb15553ba4496c4a0a5ebdfe1a1754b9c21b3a2b16`.
+The owner-neutral Codex bootstrap verifies that archive, the embedded core and
+observer before a fresh install; it does not overwrite an existing install or
+copy another user's tunnel credentials and workspace registry.
+
 The full Swift suite passed 701/701 tests. Exact 0.4.3 desktop-local and
 web-tunnel E2E gates each passed 303/303 checks with clean exits and unchanged
 sentinels. Packaging passed 19 cases plus three manifest self-checks, and the
@@ -63,10 +70,11 @@ tool for Finder, Preview and TextEdit only; it cannot open a browser or URL and
 does not add Accessibility, Screen Recording or Input Monitoring authority.
 
 The exact serving runtime is installed and live. The public repository provides
-source plus a per-user ChatGPT installation guide. Each other user must still
-build the ad-hoc app locally and create their own Secure MCP Tunnel and personal
-ChatGPT connection; the repository contains no shared tunnel credential, app ID,
-workspace registry or maintainer runtime state.
+source, the pinned release archive, an offline verification/install script and a
+per-user Codex/ChatGPT setup guide. Each other user must still create and
+authorize their own Secure MCP Tunnel and personal ChatGPT connection; the
+repository contains no shared tunnel credential, app ID, workspace registry or
+maintainer runtime state.
 
 Older sections below are release history and may describe artifacts that are no
 longer serving.

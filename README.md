@@ -12,8 +12,17 @@ The current public source release is **0.4.3**. The installed app and public
 source can be compared against the exact hashes in [Current state](CURRENT-STATE.md).
 For a separate user's Mac and ChatGPT account, use the owner-neutral
 [installation guide](INSTALL-FOR-CHATGPT.md). The GitHub marketplace installs the
-MB Operator workflow; each user must still build/install the local app and create
+MB Operator workflow; each user must still install the local app and create
 their own Secure MCP Tunnel and personal ChatGPT connection.
+
+## Set up from Codex
+
+Send Codex this repository URL and ask it to follow
+[CODEX-SETUP.md](CODEX-SETUP.md). Codex can audit and install the pinned desktop
+app/core, guide the per-user tunnel setup, install the workflow plugin and run
+acceptance checks. Account-bound tunnel credentials, ChatGPT Developer Mode and
+plugin confirmation still belong to the installing user and are never copied
+from the repository owner.
 
 ## Source layout
 
