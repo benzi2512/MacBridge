@@ -132,16 +132,14 @@ private struct FileRevisionStamp: Equatable {
         Int64(modifiedSeconds) * 1_000 + Int64(modifiedNanoseconds / 1_000_000)
     }
 
-    /// Content finalization tolerates a ctime-only metadata notification from
-    /// Finder/file providers, but remains bound to the same ordinary file,
-    /// ownership, mode, flags, inode, bytes and mtime.
+    /// Content finalization releases rollback only; it does not write the file.
+    /// Finder and file providers may replace or retimestamp an unchanged file
+    /// after publication, so inode and timestamps are not stable evidence here.
+    /// Keep the security-relevant metadata and exact bytes bound instead.
     func matchesFinalizedWrite(_ other: FileRevisionStamp) -> Bool {
-        device == other.device && inode == other.inode && mode == other.mode
-            && links == other.links && owner == other.owner && group == other.group
-            && flags == other.flags && size == other.size
-            && modifiedSeconds == other.modifiedSeconds
-            && modifiedNanoseconds == other.modifiedNanoseconds
-            && sha256 == other.sha256
+        device == other.device && mode == other.mode && links == other.links
+            && owner == other.owner && group == other.group && flags == other.flags
+            && size == other.size && sha256 == other.sha256
     }
 }
 

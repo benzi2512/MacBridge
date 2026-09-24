@@ -74,7 +74,7 @@ final class TransactionLifecycleTests: XCTestCase {
         }
         let createdURL = f.workspace.appendingPathComponent("created.txt")
         try FileManager.default.removeItem(at: createdURL)
-        try Data("created".utf8).write(to: createdURL)
+        try Data("externally changed".utf8).write(to: createdURL)
         XCTAssertThrowsError(try service.finalizeFileTransaction(
             transactionID: createdID, workspaceID: f.workspaceID,
             path: "created.txt", expectedPreSHA256: "absent",
@@ -151,6 +151,52 @@ final class TransactionLifecycleTests: XCTestCase {
         ))
         XCTAssertEqual(service.retainedTransactionCount, 1)
         _ = try service.acceptTransactions([modeID])
+    }
+
+    func testFinalizeFileToleratesSameBytesReplacementButRejectsChangedBytes() throws {
+        let f = try Fixture(); defer { f.remove() }
+        let service = try f.service()
+        let written = try service.writeFile(
+            workspaceID: f.workspaceID, path: "replaced.txt", content: "stable",
+            encoding: "utf8", expectedSHA256: nil
+        )
+        let target = f.workspace.appendingPathComponent("replaced.txt")
+        var before = stat()
+        XCTAssertEqual(lstat(target.path, &before), 0)
+
+        let replacement = f.workspace.appendingPathComponent("replacement.tmp")
+        try Data("stable".utf8).write(to: replacement)
+        XCTAssertEqual(chmod(replacement.path, before.st_mode & 0o7777), 0)
+        XCTAssertEqual(rename(replacement.path, target.path), 0)
+        var after = stat()
+        XCTAssertEqual(lstat(target.path, &after), 0)
+        XCTAssertNotEqual(before.st_ino, after.st_ino)
+
+        let finalized = try service.finalizeFileTransaction(
+            transactionID: try XCTUnwrap(written["transaction_id"] as? String),
+            workspaceID: f.workspaceID, path: "replaced.txt",
+            expectedPreSHA256: "absent",
+            expectedPostSHA256: try XCTUnwrap(written["sha256"] as? String)
+        )
+        XCTAssertEqual(finalized["finalized_count"] as? Int, 1)
+
+        let changed = try service.writeFile(
+            workspaceID: f.workspaceID, path: "changed.txt", content: "stable",
+            encoding: "utf8", expectedSHA256: nil
+        )
+        try Data("changed".utf8).write(
+            to: f.workspace.appendingPathComponent("changed.txt"), options: .atomic
+        )
+        XCTAssertThrowsError(try service.finalizeFileTransaction(
+            transactionID: try XCTUnwrap(changed["transaction_id"] as? String),
+            workspaceID: f.workspaceID, path: "changed.txt",
+            expectedPreSHA256: "absent",
+            expectedPostSHA256: try XCTUnwrap(changed["sha256"] as? String)
+        ))
+        XCTAssertEqual(service.retainedTransactionCount, 1)
+        _ = try service.acceptTransactions([
+            try XCTUnwrap(changed["transaction_id"] as? String),
+        ])
     }
 
     func testWholeBatchPreflightPreservesAllUndoOnAnyInvalidID() throws {
