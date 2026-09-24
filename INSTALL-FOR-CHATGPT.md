@@ -102,7 +102,7 @@ contain or replace the per-user MCP connection from step 3.
 
 ```sh
 codex plugin marketplace add benzi2512/MacBridge \
-  --ref 660497f3cf9acd118fc2a6ab9a48767c2e7bb94a
+  --ref dba87815858f2105d699b9f65d319b1b6d0264b4
 codex plugin add macbridge@macbridge-public
 ```
 

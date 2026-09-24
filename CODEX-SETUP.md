@@ -25,11 +25,13 @@ This bootstrap installs the tested v0.4.4 Apple-silicon release:
 - GitHub release: `v0.4.4`
 - asset: `MacBridge-0.4.4-build8-macos-arm64-ad-hoc.zip`
 - asset SHA-256:
-  `3e74c337d79451ea5807a300aaee8267232102bba2e9e17c06a5d69c5424e060`
+  `9eb3deeaa6527758ae93502b2bcee4448343b1122deb527b44b3f3132d3cf81a`
 - embedded core SHA-256:
-  `38e4aeaad2608066ab712dd3dacbf20c71da79f8565667ea6048547e933dd13a`
+  `7b910e301d6b36af4175e7703e63122c97cdf84c150f3471f853915c80696a68`
 - embedded observer SHA-256:
-  `d8bdb6d44d22c437aa430d0d10dc841b80448fcc655f681fced7c5e6bc151986`
+  `bc5d1e335e4ea1aee7d8e85b43f643848428e4de0b9f8c7f7bbbaf4d77c33312`
+- reviewed implementation commit:
+  `dba87815858f2105d699b9f65d319b1b6d0264b4`
 - app version/build: `0.4.4 (8)`
 - target: macOS 13 or newer on Apple silicon (`arm64`)
 
@@ -120,7 +122,7 @@ In the user's ChatGPT account:
 
    ```sh
    codex plugin marketplace add benzi2512/MacBridge \
-     --ref 660497f3cf9acd118fc2a6ab9a48767c2e7bb94a
+     --ref dba87815858f2105d699b9f65d319b1b6d0264b4
    codex plugin add macbridge@macbridge-public
    ```
 

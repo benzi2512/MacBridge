@@ -1,5 +1,60 @@
 # Current state
 
+## Serving release — 2026-09-24
+
+The serving release is MacBridge 0.4.4, build 8. The installed app and
+headless core match the reviewed release artifact, and the outbound tunnel and
+native Observer are running the new binaries.
+
+- runtime build: `0.4.4-scheduled-finalize+7b910e301d6b`
+- reviewed implementation commit:
+  `dba87815858f2105d699b9f65d319b1b6d0264b4`
+- core SHA-256:
+  `7b910e301d6b36af4175e7703e63122c97cdf84c150f3471f853915c80696a68`
+- packaged observer SHA-256:
+  `bc5d1e335e4ea1aee7d8e85b43f643848428e4de0b9f8c7f7bbbaf4d77c33312`
+- release archive: `MacBridge-0.4.4-build8-macos-arm64-ad-hoc.zip`
+- archive SHA-256:
+  `9eb3deeaa6527758ae93502b2bcee4448343b1122deb527b44b3f3132d3cf81a`
+- catalog: 77 tools, SHA-256
+  `fbbc61e1d4d9ef34404fb29e23129924b424b858965b759ad34b673b2c55e640`
+
+The release adds `transaction_finalize_file`, a narrow recovery route for one
+verified regular-file write when a later scheduled/normal Chat turn no longer
+has the creator-only transaction token. It requires the live instance ID and
+exact workspace, path, preimage and postimage evidence; it neither writes the
+file nor resolves another transaction. It rejects changed bytes, mode changes,
+batch writes, moves, removals and mismatched evidence. Finder/file-provider
+inode and timestamp churn, plus macOS's name-derived hidden flag for dotfiles,
+are no longer mistaken for content drift.
+
+The full Swift suite passed 707/707 tests. Exact packaged desktop-local and
+web-tunnel E2E each passed 306/306 checks with clean exits and unchanged
+sentinels. Packaging passed 19 cases plus three manifest self-checks, compact UI
+source policy passed 42 checks, and activity presentation passed 136 checks.
+The offline release installer verified the pinned archive, embedded binaries,
+arm64 metadata and deep/strict signature.
+
+Normal Chat acceptance used the installed runtime and a disposable dotfile.
+The chat observed zero baseline transactions and zero active/retained processes,
+wrote and read back the exact expected bytes, called
+`transaction_finalize_file` exactly once, retained the same content hash,
+released 19 bytes of in-memory rollback and returned to zero transactions and
+zero reload blockers. The registered personal ChatGPT plugin required one
+explicit **Refresh tools** after the 77th schema was added; the direct recipient
+then materialized normally.
+
+The Cacilia SEO scheduled task now carries the same-turn transaction resolution
+protocol and is active again. That prompt update changes only local persistence
+handling and does not broaden its live SEO or Shopify authority. The next real
+scheduled run remains the business-level acceptance surface; this release does
+not claim an SEO or storefront change merely from the infrastructure test.
+
+The public archive remains ad-hoc signed, not Developer-ID signed or notarized.
+Each user must create their own tunnel/plugin registration and refresh tools
+after a schema-changing upgrade. No shared credential, workspace registry,
+personal path or maintainer account configuration belongs in the release.
+
 ## Serving release — 2026-09-21
 
 The serving release is MacBridge 0.4.3. Its source is the privacy-filtered

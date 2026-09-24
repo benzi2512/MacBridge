@@ -37,9 +37,9 @@ case "$macos_major" in
 esac
 [ "$macos_major" -ge 13 ] || fail "this release requires macOS 13 or newer"
 
-expected_archive=3e74c337d79451ea5807a300aaee8267232102bba2e9e17c06a5d69c5424e060
-expected_core=38e4aeaad2608066ab712dd3dacbf20c71da79f8565667ea6048547e933dd13a
-expected_observer=d8bdb6d44d22c437aa430d0d10dc841b80448fcc655f681fced7c5e6bc151986
+expected_archive=9eb3deeaa6527758ae93502b2bcee4448343b1122deb527b44b3f3132d3cf81a
+expected_core=7b910e301d6b36af4175e7703e63122c97cdf84c150f3471f853915c80696a68
+expected_observer=bc5d1e335e4ea1aee7d8e85b43f643848428e4de0b9f8c7f7bbbaf4d77c33312
 
 actual_archive=$(/usr/bin/shasum -a 256 "$archive" | /usr/bin/awk '{print $1}')
 [ "$actual_archive" = "$expected_archive" ] || fail "archive SHA-256 does not match the pinned v0.4.4 asset"
