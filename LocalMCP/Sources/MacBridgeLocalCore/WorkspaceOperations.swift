@@ -135,11 +135,13 @@ private struct FileRevisionStamp: Equatable {
     /// Content finalization releases rollback only; it does not write the file.
     /// Finder and file providers may replace or retimestamp an unchanged file
     /// after publication, so inode and timestamps are not stable evidence here.
-    /// Keep the security-relevant metadata and exact bytes bound instead.
+    /// Keep the stable security-relevant metadata and exact bytes bound instead.
+    /// macOS may derive UF_HIDDEN from a dotfile name after publication, so
+    /// st_flags is not stable enough to gate rollback release either.
     func matchesFinalizedWrite(_ other: FileRevisionStamp) -> Bool {
         device == other.device && mode == other.mode && links == other.links
-            && owner == other.owner && group == other.group && flags == other.flags
-            && size == other.size && sha256 == other.sha256
+            && owner == other.owner && group == other.group && size == other.size
+            && sha256 == other.sha256
     }
 }
 

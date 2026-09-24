@@ -199,6 +199,23 @@ final class TransactionLifecycleTests: XCTestCase {
         ])
     }
 
+    func testFinalizeFileToleratesNameDerivedHiddenFlagOnDotfile() throws {
+        let f = try Fixture(); defer { f.remove() }
+        let service = try f.service()
+        let hidden = try service.writeFile(
+            workspaceID: f.workspaceID, path: ".receipt.json", content: "stable",
+            encoding: "utf8", expectedSHA256: nil
+        )
+        let finalized = try service.finalizeFileTransaction(
+            transactionID: try XCTUnwrap(hidden["transaction_id"] as? String),
+            workspaceID: f.workspaceID, path: ".receipt.json",
+            expectedPreSHA256: "absent",
+            expectedPostSHA256: try XCTUnwrap(hidden["sha256"] as? String)
+        )
+        XCTAssertEqual(finalized["finalized_count"] as? Int, 1)
+        XCTAssertEqual(service.retainedTransactionCount, 0)
+    }
+
     func testWholeBatchPreflightPreservesAllUndoOnAnyInvalidID() throws {
         let f = try Fixture(); defer { f.remove() }
         let service = try f.service()
