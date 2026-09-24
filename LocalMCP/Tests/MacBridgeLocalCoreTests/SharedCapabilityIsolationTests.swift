@@ -135,6 +135,50 @@ final class SharedCapabilityIsolationTests: XCTestCase {
         XCTAssertEqual(afterAccept["retained_transaction_count"] as? Int, 0)
     }
 
+    func testVerifiedFileFinalizationRecoversWithoutCreatorCapability() throws {
+        let fixture = try Fixture(); defer { fixture.remove() }
+        let server = try server(fixture)
+        let created = try server.callTool(name: "file_write", arguments: [
+            "workspace_id": fixture.workspaceID,
+            "path": "scheduled-receipt.json",
+            "content": "{\"result\":\"persisted\"}",
+        ])
+        let transactionID = try XCTUnwrap(created["transaction_id"] as? String)
+        let creatorToken = try XCTUnwrap(created["transaction_control_token"] as? String)
+        let sha256 = try XCTUnwrap(created["sha256"] as? String)
+        let instanceID = try XCTUnwrap(
+            server.callTool(name: "transaction_list", arguments: [:])["instance_id"] as? String
+        )
+        let finalized = try server.callTool(name: "transaction_finalize_file", arguments: [
+            "instance_id": instanceID,
+            "transaction_id": transactionID,
+            "workspace_id": fixture.workspaceID,
+            "path": "scheduled-receipt.json",
+            "expected_pre_sha256": "absent",
+            "expected_post_sha256": sha256,
+        ])
+        XCTAssertEqual(finalized["finalized_count"] as? Int, 1)
+        XCTAssertEqual(finalized["filesystem_mutation_performed"] as? Bool, false)
+        XCTAssertEqual(finalized["current_file_state_validated"] as? Bool, true)
+        XCTAssertEqual(
+            try String(
+                contentsOf: fixture.workspace.appendingPathComponent("scheduled-receipt.json"),
+                encoding: .utf8
+            ),
+            "{\"result\":\"persisted\"}"
+        )
+        XCTAssertThrowsError(try server.callTool(name: "transaction_restore", arguments: [
+            "transaction_id": transactionID,
+            "transaction_control_token": creatorToken,
+        ]))
+        XCTAssertEqual(
+            try server.callTool(name: "transaction_list", arguments: [:])[
+                "retained_transaction_count"
+            ] as? Int,
+            0
+        )
+    }
+
     func testWorkGroupingRequiresItsCreatorCapabilityWithoutLeakingIt() throws {
         let fixture = try Fixture(); defer { fixture.remove() }
         let server = try server(fixture)

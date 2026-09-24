@@ -43,6 +43,7 @@ struct ActivityPresentation {
             "transaction_restore": ("Restoring a file change", "Restored a file change", "arrow.uturn.backward"),
             "transaction_list": ("Listing undo records", "Listed undo records", "list.bullet"),
             "transaction_accept": ("Releasing selected undo", "Released selected undo", "checkmark.circle"),
+            "transaction_finalize_file": ("Finalizing verified file", "Finalized verified file", "checkmark.seal"),
             "tool_catalog": ("Finding tools", "Found tool information", "square.grid.2x2"),
             "workspace_inspect": ("Inspecting a workspace", "Inspected a workspace", "folder"),
             "file_read_lines": ("Reading file lines", "Read file lines", "doc.text"),

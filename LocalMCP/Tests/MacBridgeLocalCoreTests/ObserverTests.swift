@@ -16,7 +16,7 @@ final class ObserverTests: XCTestCase {
         let f = try Fixture(); defer { f.remove() }
         let owner = try server(f, enabled: false)
         XCTAssertThrowsError(try owner.observerRequest(["action": "snapshot"]))
-        XCTAssertEqual(try owner.callTool(name: "bridge_capabilities", arguments: [:])["catalog_count"] as? Int, 76)
+        XCTAssertEqual(try owner.callTool(name: "bridge_capabilities", arguments: [:])["catalog_count"] as? Int, 77)
     }
 
     func testHistoryIsBoundedAndDoesNotStoreRequestContent() throws {
@@ -149,7 +149,7 @@ final class ObserverTests: XCTestCase {
                                                payload: LocalJSON.encode(["action": "snapshot"] as JSONObject))
         let wrapper = try LocalJSON.decodeObject(bytes)
         XCTAssertEqual(wrapper["ok"] as? Bool, true)
-        XCTAssertEqual((wrapper["result"] as? JSONObject)?["catalog_count"] as? Int, 76)
+        XCTAssertEqual((wrapper["result"] as? JSONObject)?["catalog_count"] as? Int, 77)
         XCTAssertThrowsError(try LocalObserverEndpoint(directory: directory, server: owner))
         XCTAssertNoThrow(try ObserverSocket.request(directory: directory,
                                                     payload: LocalJSON.encode(["action": "snapshot"] as JSONObject)))

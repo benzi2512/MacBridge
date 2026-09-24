@@ -39,7 +39,7 @@ const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
       ['ui://macbridge/activity-v1.html','text/html;profile=mcp-app']
     ]);
     assert.deepEqual(new Set(listed.resources.map(r=>r.uri)),new Set(expected.keys()));
-    const tools=await request('tools/list');assert.equal(tools.tools.length,76);
+    const tools=await request('tools/list');assert.equal(tools.tools.length,77);
     assert(tools.tools.some(t=>t.name==='work_task'));
     const render=tools.tools.find(t=>t.name==='bridge_activity_view');
     assert.equal(render._meta.ui.resourceUri,'ui://macbridge/activity-chatgpt-v3.html');
@@ -58,7 +58,7 @@ const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
       if(firstHTML!==undefined)assert.equal(content.text,firstHTML);else firstHTML=content.text;
     }
     const view=await tool('bridge_activity_view'),owner=view.instance_id;
-    assert.equal(view.catalog_count,76);assert.equal(view.snapshot_stale,false);
+    assert.equal(view.catalog_count,77);assert.equal(view.snapshot_stale,false);
     assert.deepEqual(view.ui_resource_delivery,{read_count:3,last_outcome:'response_prepared'});
     const start=await tool('command_start',{workspace_id:workspaceID,executable:'sh',arguments:['-c',"printf 'step-1\\n'; sleep 0.4; printf 'step-2\\n'; sleep 0.4; printf 'done\\n'"],maximum_output_bytes:8192});
     taskID=start.task_id;processControl=start.process_control_token;let sawRunning=false,sawDone=false,sawPartial=false;
@@ -73,7 +73,7 @@ const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
     assert(sawRunning && sawPartial && sawDone,'running -> partial log -> completed');
     const drain=await tool('process_output',{task_id:taskID,process_control_token:processControl});assert.equal(drain.session_retained,false);taskID=null;
     assert.equal((await tool('process_list')).processes.length,0);
-    console.log('PASS: discovery/initialize agreement, all template MIME/URI contracts over real stdio, identical HTML, 76 tools, background progress, partial/final log, preserved handle and final drain. Host rendering not tested.');
+    console.log('PASS: discovery/initialize agreement, all template MIME/URI contracts over real stdio, identical HTML, 77 tools, background progress, partial/final log, preserved handle and final drain. Host rendering not tested.');
   }finally{
     if(taskID && !exited)await tool('process_cancel',{task_id:taskID,process_control_token:processControl}).catch(()=>{});
     child.stdin.end();

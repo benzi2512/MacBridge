@@ -1,5 +1,5 @@
 #!/bin/sh
-# Verify and optionally install the exact MacBridge v0.4.3 release app.
+# Verify and optionally install the exact MacBridge v0.4.4 release app.
 # This script performs no network access, privilege escalation, persistence,
 # tunnel configuration, Gatekeeper change or credential access.
 set -eu
@@ -10,7 +10,7 @@ fail() {
 }
 
 usage() {
-  echo "usage: $0 /absolute/path/MacBridge-0.4.3-build7-macos-arm64-ad-hoc.zip [--install]" >&2
+  echo "usage: $0 /absolute/path/MacBridge-0.4.4-build8-macos-arm64-ad-hoc.zip [--install]" >&2
   exit 64
 }
 
@@ -37,12 +37,12 @@ case "$macos_major" in
 esac
 [ "$macos_major" -ge 13 ] || fail "this release requires macOS 13 or newer"
 
-expected_archive=059e51314a1d200c134acddb15553ba4496c4a0a5ebdfe1a1754b9c21b3a2b16
-expected_core=0497140678f19f721f0c9c94801ab414b282543cd7a6389f60d699b63c3d9ee8
-expected_observer=a2de06b770dc1c223c7475d55a00f18d01cb075be8829f6fd42d6159f0eb99ba
+expected_archive=3e74c337d79451ea5807a300aaee8267232102bba2e9e17c06a5d69c5424e060
+expected_core=38e4aeaad2608066ab712dd3dacbf20c71da79f8565667ea6048547e933dd13a
+expected_observer=d8bdb6d44d22c437aa430d0d10dc841b80448fcc655f681fced7c5e6bc151986
 
 actual_archive=$(/usr/bin/shasum -a 256 "$archive" | /usr/bin/awk '{print $1}')
-[ "$actual_archive" = "$expected_archive" ] || fail "archive SHA-256 does not match the pinned v0.4.3 asset"
+[ "$actual_archive" = "$expected_archive" ] || fail "archive SHA-256 does not match the pinned v0.4.4 asset"
 /usr/bin/zipinfo -1 "$archive" | /usr/bin/awk '
   /^\// || /^[A-Za-z]:/ || /(^|\/)\.\.(\/|$)/ || /\\/ { unsafe = 1 }
   END { exit unsafe ? 1 : 0 }
@@ -106,7 +106,7 @@ actual_observer=$(/usr/bin/shasum -a 256 "$observer" | /usr/bin/awk '{print $1}'
 
 version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")
 build=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist")
-[ "$version" = "0.4.3" ] && [ "$build" = "7" ] || fail "unexpected app version/build"
+[ "$version" = "0.4.4" ] && [ "$build" = "8" ] || fail "unexpected app version/build"
 /usr/bin/file "$core" | /usr/bin/grep -q 'Mach-O 64-bit executable arm64' || fail "core is not an arm64 Mach-O executable"
 /usr/bin/file "$observer" | /usr/bin/grep -q 'Mach-O 64-bit executable arm64' || fail "observer is not an arm64 Mach-O executable"
 /usr/bin/codesign --verify --deep --strict "$app" || fail "deep/strict code-signature verification failed"

@@ -43,6 +43,7 @@ enum ActivityPresentationTests {
         check("Unknown tool preserved", event("future_tool").title == "future_tool returned")
         check("Unknown state not past tense", event("file_write", "unknown").subtitle.hasPrefix("Unknown"))
         check("Undo accept not file mutation", event("transaction_accept").title == "Released selected undo")
+        check("Verified file finalize", event("transaction_finalize_file").title == "Finalized verified file")
         let waiting = ActivityPresentation.summary(history: [], jobs: [], connected: true, stale: false)
         check("Empty waiting", waiting == "Waiting for MacBridge activity")
         check("Offline summary", ActivityPresentation.summary(history: [], jobs: [["running": true]], connected: false, stale: false).contains("unavailable"))

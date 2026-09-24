@@ -15,9 +15,9 @@ final class ExpandedToolsTests: XCTestCase {
         let f = try Fixture(); defer { f.remove() }
         let s = try server(f), specs = LocalMCPServer.toolSpecs
         let names = specs.compactMap { $0["name"] as? String }
-        XCTAssertEqual(names.count, 76); XCTAssertEqual(Set(names).count, 76)
+        XCTAssertEqual(names.count, 77); XCTAssertEqual(Set(names).count, 77)
         let compact = try s.callTool(name: "tool_catalog", arguments: [:])
-        XCTAssertEqual(compact["returned_count"] as? Int, 13)
+        XCTAssertEqual(compact["returned_count"] as? Int, 14)
         XCTAssertEqual(compact["truncated"] as? Bool, true)
         XCTAssertEqual(compact["detail"] as? String, "index")
         let catalog = try s.callTool(name: "tool_catalog", arguments: ["detail": "schemas"])
@@ -26,7 +26,7 @@ final class ExpandedToolsTests: XCTestCase {
         XCTAssertEqual(capabilities["tool_names"] as? [String], names)
         XCTAssertEqual(capabilities["catalog_sha256"] as? String, catalog["catalog_sha256"] as? String)
         XCTAssertFalse(LocalMCPServer.discoveryGuide.contains(names.joined(separator: ", ")))
-        XCTAssertTrue(LocalMCPServer.discoveryGuide.contains("already-loaded"))
+        XCTAssertTrue(LocalMCPServer.discoveryGuide.contains("Reuse loaded schemas"))
         XCTAssertEqual(try LocalJSON.encode(s.callTool(name: "workspace_list", arguments: [:])),
                        try LocalJSON.encode(s.callTool(name: "workspace_overview", arguments: [:])))
         let subset = try s.callTool(name: "tool_catalog", arguments: ["names": ["command_start", "command_run"]])

@@ -8,7 +8,7 @@ enum ToolDiscovery {
     // names still cover the full catalog; no operation or permission is hidden.
     static let starterNames = ["bridge_capabilities", "developer_inspect", "developer_task", "workspace_overview", "file_read_many",
         "file_read", "file_search", "file_patch", "file_write", "command_start",
-        "process_output", "process_cancel", "transaction_restore"]
+        "process_output", "process_cancel", "transaction_restore", "transaction_finalize_file"]
 
     private static let searchTools: Set<String> = ["file_search", "file_search_many", "directory_find"]
     private static let editTools: Set<String> = ["file_write", "file_write_many", "file_patch",
@@ -51,6 +51,7 @@ enum ToolDiscovery {
         "transaction_restore": "restore undo rollback khoi phuc hoan tac",
         "transaction_list": "list undo receipts giao dich dang giu",
         "transaction_accept": "keep changes release undo giu thay doi bo undo",
+        "transaction_finalize_file": "finalize verified file write scheduled receipt state keep release rollback",
         "command_list": "available executable commands lenh ho tro",
         "command_run": "short synchronous command lenh ngan dong bo",
         "command_start": "build test chay nen background long job",
@@ -181,7 +182,7 @@ enum ToolDiscovery {
             let description = spec["description"] as! String
             return ["name": name, "canonical_name": aliases[name] ?? name,
                     "deprecated": aliases[name] != nil, "category": Self.category(for: name),
-                    "description": String(description.prefix(180)), "description_truncated": description.count > 180,
+                    "description": String(description.prefix(115)), "description_truncated": description.count > 115,
                     "required": schema["required"] ?? [],
                     "parameters": (schema["properties"] as? JSONObject ?? [:]).keys.sorted(),
                     "annotations": spec["annotations"] ?? [:]]

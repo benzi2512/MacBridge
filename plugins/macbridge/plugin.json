@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "macbridge",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "description": "Evidence-backed workflows for a MacBridge connection owned by the installer.",
   "author": {
     "name": "MacBridge Maintainers",

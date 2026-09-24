@@ -60,9 +60,9 @@ const probes = [
     assert.equal(init.protocolVersion, '2025-06-18');
     session.notify('notifications/initialized');
     const catalog = (await rpc('tools/list')).tools;
-    assert.equal(catalog.length, 76);
+    assert.equal(catalog.length, 77);
     const names = catalog.map(t => t.name), brevo = names.filter(n => n.startsWith('brevo_'));
-    assert.equal(new Set(names).size, 76); assert.equal(brevo.length, 12);
+    assert.equal(new Set(names).size, 77); assert.equal(brevo.length, 12);
     for (const name of brevo) {
       const spec = catalog.find(t => t.name === name);
       assert.equal(spec.inputSchema.additionalProperties, false);
@@ -85,7 +85,7 @@ const probes = [
     assert.equal(rejected.isError, true);
     assert(JSON.stringify(rejected).includes('confirm_write'));
     const identity = await tool('bridge_capabilities');
-    assert.equal(identity.catalog_count, 76);
+    assert.equal(identity.catalog_count, 77);
     assert.equal(identity.network_default, 'loopback_only');
     assert.equal(identity.mcp_executable_sha256, expectedHash);
     assert.equal(identity.desktop_open_enabled, false);
@@ -115,7 +115,7 @@ const probes = [
   // Do not publish a PASS before clean child shutdown and fixture cleanup.
   assert(report);
   fs.writeFileSync(output, JSON.stringify(report, null, 2), {mode: 0o600, flag: 'wx'});
-  console.log(JSON.stringify({status: 'PASS', binary_sha256: expectedHash, catalog_count: 76,
+  console.log(JSON.stringify({status: 'PASS', binary_sha256: expectedHash, catalog_count: 77,
     catalog_sha256: report.identity.catalog_sha256, build_id: report.identity.build_id,
     dry_run_probes: probes.length, rpc_calls: session.sequence, output}));
 })().catch(error => { console.error(JSON.stringify({status: 'FAIL', code: error.code || error.name,

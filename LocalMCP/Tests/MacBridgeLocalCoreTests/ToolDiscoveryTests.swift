@@ -12,13 +12,13 @@ final class ToolDiscoveryTests: XCTestCase {
         XCTAssertEqual(starter["selection"] as? String, "starter")
         XCTAssertEqual(try rows().compactMap { $0["name"] as? String }, ToolDiscovery.starterNames)
         XCTAssertEqual(try rows().first?["name"] as? String, "bridge_capabilities")
-        XCTAssertEqual(starter["returned_count"] as? Int, 13)
+        XCTAssertEqual(starter["returned_count"] as? Int, 14)
         XCTAssertEqual(starter["truncated"] as? Bool, true)
-        let result = try ToolDiscovery.catalog(["limit": 76]), index = try rows(["limit": 76])
-        XCTAssertEqual(result["catalog_count"] as? Int, 76)
-        XCTAssertEqual(result["canonical_count"] as? Int, 75)
-        XCTAssertEqual(result["returned_count"] as? Int, 75)
-        XCTAssertEqual(result["matched_count"] as? Int, 75)
+        let result = try ToolDiscovery.catalog(["limit": 77]), index = try rows(["limit": 77])
+        XCTAssertEqual(result["catalog_count"] as? Int, 77)
+        XCTAssertEqual(result["canonical_count"] as? Int, 76)
+        XCTAssertEqual(result["returned_count"] as? Int, 76)
+        XCTAssertEqual(result["matched_count"] as? Int, 76)
         XCTAssertEqual(result["truncated"] as? Bool, false)
         XCTAssertEqual(index.count, Set(index.compactMap { $0["canonical_name"] as? String }).count)
         XCTAssertFalse(index.contains { $0["name"] as? String == "workspace_list" })
@@ -150,15 +150,15 @@ final class ToolDiscoveryTests: XCTestCase {
 
     func testStarterDoesNotHideSpecialistToolsOrMisstateCatalogIdentity() throws {
         let all = LocalMCPServer.toolSpecs
-        XCTAssertEqual(all.count, 76)
-        XCTAssertEqual(Set(ToolDiscovery.starterNames).count, 13)
+        XCTAssertEqual(all.count, 77)
+        XCTAssertEqual(Set(ToolDiscovery.starterNames).count, 14)
         XCTAssertTrue(Set(ToolDiscovery.starterNames).isSubset(of: Set(all.compactMap { $0["name"] as? String })))
         let lookups: [JSONObject] = [[:], ["limit": 1], ["limit": 50], ["query": "git blame"], ["detail": "schemas"]]
         for arguments in lookups {
             let result = try ToolDiscovery.catalog(arguments)
             XCTAssertEqual(result["catalog_sha256"] as? String, LocalHash.sha256(try LocalJSON.encode(all)))
             let categories = try XCTUnwrap(result["categories"] as? [JSONObject])
-            XCTAssertEqual(categories.compactMap { $0["count"] as? Int }.reduce(0, +), 75)
+            XCTAssertEqual(categories.compactMap { $0["count"] as? Int }.reduce(0, +), 76)
             XCTAssertEqual(result["matched_count"] as! Int > result["returned_count"] as! Int,
                            result["truncated"] as! Bool)
         }

@@ -8,7 +8,7 @@ dashboard. It does not run an AI model.
 Local MCP clients use stdio. Ordinary Chat requires a supported connector and
 transport; the core alone cannot guarantee that a host permits every tool.
 
-The current public source release is **0.4.3**. The installed app and public
+The current public source release is **0.4.4**. The installed app and public
 source can be compared against the exact hashes in [Current state](CURRENT-STATE.md).
 For a separate user's Mac and ChatGPT account, use the owner-neutral
 [installation guide](INSTALL-FOR-CHATGPT.md). The GitHub marketplace installs the

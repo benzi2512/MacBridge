@@ -100,6 +100,11 @@ private struct PreparedAtomicFileWrite {
 private struct FileRevisionStamp: Equatable {
     let device: dev_t
     let inode: ino_t
+    let mode: mode_t
+    let links: nlink_t
+    let owner: uid_t
+    let group: gid_t
+    let flags: UInt32
     let size: off_t
     let modifiedSeconds: Int
     let modifiedNanoseconds: Int
@@ -110,6 +115,11 @@ private struct FileRevisionStamp: Equatable {
     init(_ status: stat, sha256: String) {
         device = status.st_dev
         inode = status.st_ino
+        mode = status.st_mode
+        links = status.st_nlink
+        owner = status.st_uid
+        group = status.st_gid
+        flags = status.st_flags
         size = status.st_size
         modifiedSeconds = status.st_mtimespec.tv_sec
         modifiedNanoseconds = status.st_mtimespec.tv_nsec
@@ -120,6 +130,18 @@ private struct FileRevisionStamp: Equatable {
 
     var modifiedMilliseconds: Int64 {
         Int64(modifiedSeconds) * 1_000 + Int64(modifiedNanoseconds / 1_000_000)
+    }
+
+    /// Content finalization tolerates a ctime-only metadata notification from
+    /// Finder/file providers, but remains bound to the same ordinary file,
+    /// ownership, mode, flags, inode, bytes and mtime.
+    func matchesFinalizedWrite(_ other: FileRevisionStamp) -> Bool {
+        device == other.device && inode == other.inode && mode == other.mode
+            && links == other.links && owner == other.owner && group == other.group
+            && flags == other.flags && size == other.size
+            && modifiedSeconds == other.modifiedSeconds
+            && modifiedNanoseconds == other.modifiedNanoseconds
+            && sha256 == other.sha256
     }
 }
 
@@ -537,6 +559,81 @@ public final class LocalWorkspaceService: @unchecked Sendable {
             "execution_backend": "owner_transaction_registry",
             "current_file_state_validated": false,
             "meaning": "Selected undo released; current files untouched. This does not prove task success or free disk recovery.",
+        ]
+    }
+
+    /// Finalize one single-file write transaction after revalidating its exact
+    /// workspace path, preimage, postimage and full post-write revision. This
+    /// recovery route exists for a later owner turn when the creator capability
+    /// is no longer available. It cannot finalize batches, moves or removals.
+    public func finalizeFileTransaction(
+        transactionID rawID: String,
+        workspaceID: String,
+        path: String,
+        expectedPreSHA256: String,
+        expectedPostSHA256: String
+    ) throws -> JSONObject {
+        guard let transactionID = UUID(uuidString: rawID)?.uuidString.lowercased(),
+              expectedPreSHA256 == "absent" || LocalHash.isSHA256(expectedPreSHA256),
+              LocalHash.isSHA256(expectedPostSHA256) else {
+            throw LocalMCPError.invalidRequest("file-finalization evidence is malformed")
+        }
+        let expectedPreimage = expectedPreSHA256.lowercased()
+        let expectedSHA256 = expectedPostSHA256.lowercased()
+        transactionLock.lock()
+        defer { transactionLock.unlock() }
+        guard let stored = transactions[transactionID] else {
+            throw LocalMCPError.conflict(
+                "transaction is unknown or no longer retained; no undo released"
+            )
+        }
+        guard case .restoreFile(
+            let retainedWorkspaceID, let retainedPath, let previousData, _, let postStamp
+        ) = stored.action else {
+            throw LocalMCPError.conflict(
+                "only one single-file write transaction can use evidence finalization"
+            )
+        }
+        guard retainedWorkspaceID.lowercased() == workspaceID.lowercased(),
+              (previousData.map(LocalHash.sha256) ?? "absent") == expectedPreimage,
+              postStamp.sha256 == expectedSHA256 else {
+            throw LocalMCPError.conflict(
+                "file-finalization evidence does not match the retained transaction"
+            )
+        }
+        let resolved = try resolveExisting(workspaceID: workspaceID, path: path)
+        guard resolved.relativePath == retainedPath else {
+            throw LocalMCPError.conflict(
+                "file-finalization path does not match the retained transaction"
+            )
+        }
+        let parent = try WorkspaceDirectory(resolved.url.deletingLastPathComponent())
+        let current = try fileRevision(parent: parent, name: resolved.url.lastPathComponent)
+        guard current.stamp.matchesFinalizedWrite(postStamp) else {
+            throw LocalMCPError.casConflict(
+                expectedSHA256: expectedSHA256,
+                currentSHA256: current.stamp.sha256,
+                modifiedMilliseconds: current.stamp.modifiedMilliseconds
+            )
+        }
+        var receipt = transactionMetadata(id: transactionID, stored: stored)
+        receipt["automatic_restore_available"] = false
+        transactions.removeValue(forKey: transactionID)
+        retainedUndoFileBytes -= stored.retainedFileBytes
+        return [
+            "operation": "transaction_finalize_file",
+            "finalized": receipt,
+            "finalized_count": 1,
+            "released_undo_file_bytes": stored.retainedFileBytes,
+            "retained_transaction_count": transactions.count,
+            "retained_undo_file_bytes": retainedUndoFileBytes,
+            "backend_called": true,
+            "undo_released": true,
+            "filesystem_mutation_performed": false,
+            "current_file_state_validated": true,
+            "verification_scope": "one unchanged single-file write",
+            "execution_backend": "owner_transaction_registry",
+            "meaning": "Verified file write kept; its in-memory automatic rollback was released. Other transactions were untouched.",
         ]
     }
 

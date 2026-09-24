@@ -33,7 +33,7 @@ function observe(request){return new Promise((resolve,reject)=>{
 });}
 let a,b,aControl,bControl,taskID,processControl,tx,txControl;
 (async()=>{try{
-  const catalog=await rpc('tools/list');assert.equal(catalog.tools.length,76);
+  const catalog=await rpc('tools/list');assert.equal(catalog.tools.length,77);
   for(const name of ['file_patch','command_start','command_run','file_search'])assert(catalog.tools.find(t=>t.name===name).inputSchema.properties.work_id);
   const owner=(await tool('bridge_capabilities')).instance_id;
   const startedA=await tool('work_task',{action:'begin',title:'Fix addition and run tests',chat_label:'Chat A (fixture)',workspace_id:workspaceID});

@@ -396,7 +396,7 @@ final class WorkActivityTests: XCTestCase {
 
     func testCatalogHasExplicitBoundedGroupingWithoutChangingReadOnlyFlags() throws {
         let specs = LocalMCPServer.toolSpecs
-        XCTAssertEqual(specs.count, 76)
+        XCTAssertEqual(specs.count, 77)
         for spec in specs {
             let name = try XCTUnwrap(spec["name"] as? String)
             let schema = try XCTUnwrap(spec["inputSchema"] as? JSONObject)

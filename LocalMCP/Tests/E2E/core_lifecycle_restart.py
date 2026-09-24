@@ -80,7 +80,7 @@ def main():
                     assert init["protocolVersion"] == "2025-06-18"
                     catalog = rpc(child, 2, "tools/list", {})["tools"]
                     names = {tool["name"] for tool in catalog}
-                    assert len(catalog) == 76 and {"brevo_read", "brevo_campaign",
+                    assert len(catalog) == 77 and {"brevo_read", "brevo_campaign",
                         "brevo_contacts", "brevo_lists", "brevo_events", "brevo_webhooks"} <= names
                     current_hash = hashlib.sha256(json.dumps(catalog, sort_keys=True,
                                                             separators=(",", ":")).encode()).hexdigest()

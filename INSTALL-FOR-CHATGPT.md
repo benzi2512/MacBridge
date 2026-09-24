@@ -15,7 +15,7 @@ Installing one does not silently complete the other two.
 ## Supported distribution boundary
 
 - macOS 13 or newer on Apple silicon is the currently tested target.
-- The v0.4.3 release includes an exact arm64 ZIP and the source needed to rebuild
+- The v0.4.4 release includes an exact arm64 ZIP and the source needed to rebuild
   it. The app is ad-hoc signed, not Developer-ID signed or notarized, so this
   project does not advertise a one-click consumer DMG.
 - The Secure MCP Tunnel is private, account/workspace scoped transport. Every user
@@ -39,12 +39,12 @@ Read `SECURITY.md`, the release notes and the source before running build script
 Use the exact release tag, not a moving branch or an asset copied elsewhere.
 
 ```sh
-git clone --branch v0.4.3 --depth 1 https://github.com/benzi2512/MacBridge.git
+git clone --branch v0.4.4 --depth 1 https://github.com/benzi2512/MacBridge.git
 cd MacBridge
 git rev-parse HEAD
 ```
 
-Compare the reported commit with the commit shown on the `v0.4.3` GitHub release.
+Compare the reported commit with the commit shown on the `v0.4.4` GitHub release.
 Do not use a tunnel key, app ID or configuration posted in an issue, screenshot,
 fork or chat message.
 

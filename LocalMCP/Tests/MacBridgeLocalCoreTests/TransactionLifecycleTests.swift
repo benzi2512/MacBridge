@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import XCTest
 
@@ -24,6 +25,132 @@ final class TransactionLifecycleTests: XCTestCase {
         let next = try write(service, f, "new", "kept")
         _ = try service.acceptTransactions([next])
         XCTAssertEqual(service.retainedTransactionCount, 0)
+    }
+
+    func testFinalizeFileRequiresExactUnchangedPostState() throws {
+        let f = try Fixture(); defer { f.remove() }
+        let service = try f.service()
+        let created = try service.writeFile(
+            workspaceID: f.workspaceID, path: "receipt.json",
+            content: "{\"status\":\"persisted\"}", encoding: "utf8",
+            expectedSHA256: nil
+        )
+        let id = try XCTUnwrap(created["transaction_id"] as? String)
+        let sha256 = try XCTUnwrap(created["sha256"] as? String)
+        let finalized = try service.finalizeFileTransaction(
+            transactionID: id, workspaceID: f.workspaceID,
+            path: "receipt.json", expectedPreSHA256: "absent",
+            expectedPostSHA256: sha256
+        )
+        XCTAssertEqual(finalized["operation"] as? String, "transaction_finalize_file")
+        XCTAssertEqual(finalized["filesystem_mutation_performed"] as? Bool, false)
+        XCTAssertEqual(finalized["current_file_state_validated"] as? Bool, true)
+        XCTAssertEqual(finalized["retained_transaction_count"] as? Int, 0)
+        XCTAssertEqual(
+            try String(contentsOf: f.workspace.appendingPathComponent("receipt.json"), encoding: .utf8),
+            "{\"status\":\"persisted\"}"
+        )
+        XCTAssertThrowsError(try service.restoreTransaction(id))
+    }
+
+    func testFinalizeFileRefusesWrongEvidenceAndChangedFilesButAcceptsExactEdit() throws {
+        let f = try Fixture(); defer { f.remove() }
+        let service = try f.service()
+        let created = try service.writeFile(
+            workspaceID: f.workspaceID, path: "created.txt", content: "created",
+            encoding: "utf8", expectedSHA256: nil
+        )
+        let createdID = try XCTUnwrap(created["transaction_id"] as? String)
+        let createdSHA = try XCTUnwrap(created["sha256"] as? String)
+        for (path, sha) in [
+            ("other.txt", createdSHA),
+            ("created.txt", String(repeating: "0", count: 64)),
+        ] {
+            XCTAssertThrowsError(try service.finalizeFileTransaction(
+                transactionID: createdID, workspaceID: f.workspaceID,
+                path: path, expectedPreSHA256: "absent", expectedPostSHA256: sha
+            ))
+            XCTAssertEqual(service.retainedTransactionCount, 1)
+        }
+        let createdURL = f.workspace.appendingPathComponent("created.txt")
+        try FileManager.default.removeItem(at: createdURL)
+        try Data("created".utf8).write(to: createdURL)
+        XCTAssertThrowsError(try service.finalizeFileTransaction(
+            transactionID: createdID, workspaceID: f.workspaceID,
+            path: "created.txt", expectedPreSHA256: "absent",
+            expectedPostSHA256: createdSHA
+        ))
+        XCTAssertEqual(service.retainedTransactionCount, 1)
+        _ = try service.acceptTransactions([createdID])
+
+        let existing = f.workspace.appendingPathComponent("existing.txt")
+        try Data("before".utf8).write(to: existing)
+        let edited = try service.writeFile(
+            workspaceID: f.workspaceID, path: "existing.txt", content: "after",
+            encoding: "utf8", expectedSHA256: LocalHash.sha256(Data("before".utf8))
+        )
+        let editedID = try XCTUnwrap(edited["transaction_id"] as? String)
+        XCTAssertThrowsError(try service.finalizeFileTransaction(
+            transactionID: editedID, workspaceID: f.workspaceID,
+            path: "existing.txt", expectedPreSHA256: String(repeating: "0", count: 64),
+            expectedPostSHA256: try XCTUnwrap(edited["sha256"] as? String)
+        ))
+        XCTAssertEqual(service.retainedTransactionCount, 1)
+        let finalizedEdit = try service.finalizeFileTransaction(
+            transactionID: editedID, workspaceID: f.workspaceID,
+            path: "existing.txt",
+            expectedPreSHA256: LocalHash.sha256(Data("before".utf8)),
+            expectedPostSHA256: try XCTUnwrap(edited["sha256"] as? String)
+        )
+        XCTAssertEqual(finalizedEdit["finalized_count"] as? Int, 1)
+        XCTAssertEqual(service.retainedTransactionCount, 0)
+    }
+
+    func testFinalizeFileToleratesCtimeOnlyMetadataButRejectsModeChange() throws {
+        let f = try Fixture(); defer { f.remove() }
+        let service = try f.service()
+        let metadata = try service.writeFile(
+            workspaceID: f.workspaceID, path: "metadata.txt", content: "stable",
+            encoding: "utf8", expectedSHA256: nil
+        )
+        let metadataPath = f.workspace.appendingPathComponent("metadata.txt").path
+        var before = stat()
+        XCTAssertEqual(lstat(metadataPath, &before), 0)
+        usleep(10_000)
+        XCTAssertEqual(chmod(metadataPath, before.st_mode & 0o7777), 0)
+        var after = stat()
+        XCTAssertEqual(lstat(metadataPath, &after), 0)
+        XCTAssertTrue(
+            before.st_ctimespec.tv_sec != after.st_ctimespec.tv_sec
+                || before.st_ctimespec.tv_nsec != after.st_ctimespec.tv_nsec
+        )
+        let finalized = try service.finalizeFileTransaction(
+            transactionID: try XCTUnwrap(metadata["transaction_id"] as? String),
+            workspaceID: f.workspaceID, path: "metadata.txt",
+            expectedPreSHA256: "absent",
+            expectedPostSHA256: try XCTUnwrap(metadata["sha256"] as? String)
+        )
+        XCTAssertEqual(finalized["finalized_count"] as? Int, 1)
+
+        let mode = try service.writeFile(
+            workspaceID: f.workspaceID, path: "mode.txt", content: "stable",
+            encoding: "utf8", expectedSHA256: nil
+        )
+        let modePath = f.workspace.appendingPathComponent("mode.txt").path
+        let attributes = try FileManager.default.attributesOfItem(atPath: modePath)
+        let currentMode = try XCTUnwrap(attributes[.posixPermissions] as? NSNumber).intValue
+        let changedMode = currentMode == 0o600 ? 0o640 : 0o600
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: changedMode)], ofItemAtPath: modePath
+        )
+        let modeID = try XCTUnwrap(mode["transaction_id"] as? String)
+        XCTAssertThrowsError(try service.finalizeFileTransaction(
+            transactionID: modeID, workspaceID: f.workspaceID, path: "mode.txt",
+            expectedPreSHA256: "absent",
+            expectedPostSHA256: try XCTUnwrap(mode["sha256"] as? String)
+        ))
+        XCTAssertEqual(service.retainedTransactionCount, 1)
+        _ = try service.acceptTransactions([modeID])
     }
 
     func testWholeBatchPreflightPreservesAllUndoOnAnyInvalidID() throws {
@@ -157,6 +284,13 @@ final class TransactionLifecycleTests: XCTestCase {
         XCTAssertEqual(annotations["idempotentHint"] as? Bool, false)
         let list = try XCTUnwrap(LocalMCPServer.toolSpecs.first { $0["name"] as? String == "transaction_list" })
         XCTAssertEqual((list["annotations"] as? JSONObject)?["readOnlyHint"] as? Bool, true)
+        let finalize = try XCTUnwrap(LocalMCPServer.toolSpecs.first {
+            $0["name"] as? String == "transaction_finalize_file"
+        })
+        let finalizeAnnotations = try XCTUnwrap(finalize["annotations"] as? JSONObject)
+        XCTAssertEqual(finalizeAnnotations["readOnlyHint"] as? Bool, false)
+        XCTAssertEqual(finalizeAnnotations["destructiveHint"] as? Bool, true)
+        XCTAssertEqual(finalizeAnnotations["idempotentHint"] as? Bool, false)
     }
 
     private func limited(_ fixture: Fixture) throws -> LocalWorkspaceService {

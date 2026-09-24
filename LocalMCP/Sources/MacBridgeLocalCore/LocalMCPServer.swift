@@ -51,7 +51,7 @@ public enum MacBridgeConnectorSurface: String, Sendable {
 }
 
 public final class LocalMCPServer: @unchecked Sendable {
-    public static let version = "0.4.3-read-preflight"
+    public static let version = "0.4.4-scheduled-finalize"
     public static let maximumFrameBytes = 24 * 1_024 * 1_024
     public static let supportedProtocolVersions = [
         "2026-07-28", "2025-11-25", "2025-06-18",
@@ -480,6 +480,9 @@ public final class LocalMCPServer: @unchecked Sendable {
                 removeCapability(for: id, kind: .work)
             }
             if name == "transaction_restore", let id = effectiveArguments["transaction_id"] as? String {
+                removeCapability(for: id, kind: .transaction)
+            } else if name == "transaction_finalize_file",
+                      let id = effectiveArguments["transaction_id"] as? String {
                 removeCapability(for: id, kind: .transaction)
             } else if name == "transaction_accept",
                       let ids = effectiveArguments["transaction_ids"] as? [String] {
@@ -1210,6 +1213,8 @@ public final class LocalMCPServer: @unchecked Sendable {
                 "workspace_reload_preserves_pending_undo": "refuse_until_restored_or_explicitly_accepted",
                 "transaction_list_available": true,
                 "transaction_accept_available": true,
+                "transaction_finalize_file_available": true,
+                "transaction_finalize_file_scope": "one unchanged regular-file write with exact owner path preimage postimage and revision evidence",
                 "transaction_accept_purges_disk_recovery": false,
                 "maximum_retained_undo_transactions": LocalWorkspaceService.maximumRetainedTransactions,
                 "maximum_retained_undo_file_bytes": LocalWorkspaceService.maximumRetainedUndoFileBytes,
@@ -1439,6 +1444,27 @@ public final class LocalMCPServer: @unchecked Sendable {
             }
             var result = try workspaceService.acceptTransactions(
                 arguments.requiredStringArray("transaction_ids", maximumItems: 128, maximumItemBytes: 36)
+            )
+            result["instance_id"] = instanceID
+            return result
+        case "transaction_finalize_file":
+            try arguments.requireOnlyKeys([
+                "instance_id", "transaction_id", "workspace_id", "path",
+                "expected_pre_sha256", "expected_post_sha256",
+            ])
+            guard try arguments.requiredString("instance_id", maximumBytes: 36) == instanceID else {
+                throw LocalMCPError.conflict("owner changed; no undo released")
+            }
+            var result = try workspaceService.finalizeFileTransaction(
+                transactionID: arguments.requiredString("transaction_id", maximumBytes: 36),
+                workspaceID: arguments.requiredString("workspace_id", maximumBytes: 36),
+                path: arguments.requiredString("path", maximumBytes: 4_096),
+                expectedPreSHA256: arguments.requiredString(
+                    "expected_pre_sha256", maximumBytes: 64
+                ),
+                expectedPostSHA256: arguments.requiredString(
+                    "expected_post_sha256", maximumBytes: 64
+                )
             )
             result["instance_id"] = instanceID
             return result
@@ -2010,7 +2036,7 @@ extension LocalMCPServer {
     static var catalogSHA256: String { builtInCatalog.digest }
 
     public static var discoveryGuide: String {
-        "Reviewing a tool is not permission to execute it; never replay commands from earlier tasks. Before MB work call bridge_capabilities; record build_id, catalog_sha256 and binding_epoch. Use current schemas, never an older chat. Reuse already-loaded schemas. If a schema is missing or binding changes, allow one targeted host rebind and read-only probe. Latest means the installed owner-pinned build; never download mutable latest. tool_catalog: query/category<=5; names return exact schemas; limit=current catalog count for full index; cannot load host tools. For MB self-repair resolve the current unified workspace, inspect Git/diff, patch and test; never reload, restart or replace runtime while jobs or transactions are unknown. Operator loop: set acceptance, inspect, act, verify tests/diff/errors, repair, finish when accepted. Never nest parents; carry one ID/token; resolve every transaction. Long-work checkpoint: IDs/cursors, transactions, verified results, next step; revalidate after restart. Evidence: actions, tests/diff/errors, truncation and unknowns. Inspect every batch result; reconcile uncertain writes. Respect host approvals and Work-mode gates."
+        "Reviewing a tool is not permission to execute it; never replay commands from earlier tasks. Before MB work call bridge_capabilities; record build_id, catalog_sha256 and binding_epoch. Use current schemas, never an older chat. Reuse loaded schemas; after a missing schema/binding change allow one targeted rebind and read-only probe. Latest means the installed owner-pinned build; never download mutable latest. tool_catalog names return exact schemas; limit=current catalog count; cannot load host tools. For MB self-repair resolve the current unified workspace, inspect Git/diff, patch and test; never reload, restart or replace runtime while jobs or transactions are unknown. Operator loop: set acceptance, inspect, act, verify tests/diff/errors, repair, finish when accepted. Never nest parents; carry one ID/token; resolve every transaction. If its creator token is lost, transaction_finalize_file requires exact list evidence. Long-work checkpoint: IDs/cursors, transactions, verified results, next step; revalidate after restart. Evidence: actions, tests/diff/errors, truncation and unknowns. Inspect every batch result; reconcile uncertain writes. Respect host approvals and Work-mode gates."
     }
 
     private static func makeToolSpecs() -> [JSONObject] {
@@ -2219,6 +2245,24 @@ extension LocalMCPServer {
                                                  "maxItems": 128,
                                                  "items": controlToken]],
                 required: ["instance_id", "transaction_ids"], readOnly: false, destructiveHint: true),
+            spec(
+                "transaction_finalize_file", "Finalize one verified file write",
+                "Keep exactly one unchanged regular-file write and release only that transaction's in-memory automatic rollback. This owner-recovery path requires the live instance_id plus exact transaction ID, workspace, path, preimage and postimage SHA-256 evidence from transaction_list; use preimage 'absent' only for a newly created file. The retained full post-write revision is revalidated before release. It cannot finalize a batch, move, copy, directory create or removal; it does not change file bytes, touch other transactions, delete disk recovery, accept all undo or prove the wider task succeeded.",
+                properties: [
+                    "instance_id": stringSchema(maximumLength: 36),
+                    "transaction_id": stringSchema(maximumLength: 36),
+                    "workspace_id": workspaceID,
+                    "path": path,
+                    "expected_pre_sha256": [
+                        "type": "string", "minLength": 6, "maxLength": 64,
+                        "description": "Exact pre_sha256 from transaction_list: lowercase SHA-256 or absent for a create-only file.",
+                    ],
+                    "expected_post_sha256": sha,
+                ],
+                required: [
+                    "instance_id", "transaction_id", "workspace_id", "path",
+                    "expected_pre_sha256", "expected_post_sha256",
+                ], readOnly: false, destructiveHint: true, idempotentHint: false),
             spec(
                 "command_run", "Run command",
                 "Run one short supported executable or headless shell command and return its final output with loopback-only networking and a hard timeout. Its wait does not block other MCP requests. Up to eight command_run responses may be pending across chats; use command_start for builds, tests or further concurrent jobs.",

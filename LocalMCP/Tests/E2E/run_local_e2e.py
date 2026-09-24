@@ -19,7 +19,7 @@ import time
 import uuid
 PROTOCOL_VERSION = '2025-06-18'
 EXPECTED_TOOLS = {'bridge_capabilities', 'workspace_overview', 'workspace_list', 'workspace_reload', 'directory_list', 'file_stat', 'file_stat_many', 'file_read', 'file_read_many', 'file_search', 'file_write', 'file_patch', 'file_append', 'directory_create', 'path_copy', 'path_move', 'path_remove', 'transaction_restore', 'command_run', 'command_start', 'process_status', 'process_output', 'process_list', 'process_input', 'process_cancel'}
-EXPECTED_TOOLS.update({'transaction_list', 'transaction_accept'})
+EXPECTED_TOOLS.update({'transaction_list', 'transaction_accept', 'transaction_finalize_file'})
 EXPECTED_TOOLS.update({'bridge_activity_view', 'bridge_activity'})
 EXPECTED_TOOLS.update({'work_task', 'developer_inspect', 'developer_task'})
 EXPECTED_TOOLS.update({'tool_catalog', 'workspace_inspect', 'file_read_lines', 'file_tail',
@@ -239,6 +239,11 @@ class MCPClient:
                 transaction = receipt.get('transaction_id')
                 if transaction in self.pending_transactions:
                     self.pending_transactions.remove(transaction)
+        if not is_error and name == 'transaction_finalize_file':
+            receipt = structured.get('finalized', {})
+            transaction = receipt.get('transaction_id') if isinstance(receipt, dict) else None
+            if transaction in self.pending_transactions:
+                self.pending_transactions.remove(transaction)
         if not is_error and isinstance(structured.get('transaction_id'), str):
             transaction = structured['transaction_id']
             if name == 'transaction_restore':
@@ -501,7 +506,7 @@ def run_gate(args: argparse.Namespace, evidence: Evidence, root: Path) -> dict[s
             compact_catalog = client.tool('tool_catalog')
             evidence.check(compact_catalog.get('detail') == 'index'
                            and compact_catalog.get('canonical_count') == len(EXPECTED_TOOLS) - 1
-                           and compact_catalog.get('returned_count') == 13
+                           and compact_catalog.get('returned_count') == 14
                            and compact_catalog.get('truncated') is True
                            and compact_catalog.get('selection') == 'starter'
                            and not any(row['name'] == 'workspace_list' or 'inputSchema' in row for row in compact_catalog['tools']),
@@ -513,7 +518,7 @@ def run_gate(args: argparse.Namespace, evidence: Evidence, root: Path) -> dict[s
             evidence.check(full_index.get('returned_count') == len(EXPECTED_TOOLS) - 1 and full_index.get('truncated') is False
                            and {row['name'] for row in full_index['tools']} == EXPECTED_TOOLS - {'workspace_list'},
                            'full index still reaches every canonical tool')
-            evidence.check('already-loaded' in initialized.get('instructions', '')
+            evidence.check('Reuse loaded schemas' in initialized.get('instructions', '')
                            and 'Available tools (' not in initialized.get('instructions', ''),
                            'initialize gives direct-use discovery guidance without repeated catalog')
             discovery = client.tool('tool_catalog', {'query': 'đọc nhiều file', 'limit': 3})
@@ -693,6 +698,51 @@ def run_gate(args: argparse.Namespace, evidence: Evidence, root: Path) -> dict[s
             client.tool('transaction_restore', {'transaction_id': a}, expect_error=True)
             client.tool('transaction_restore', {'transaction_id': b})
             evidence.check(not (workspace / 'accept-other.txt').exists(), 'unselected undo remains usable')
+            finalized_edit_path = workspace / 'finalize-edit.json'
+            finalized_edit_path.write_text('{"revision":1}\n', encoding='utf-8')
+            preimage = sha256_bytes(b'{"revision":1}\n')
+            finalized_edit = tool_write(
+                client, workspace_id, 'finalize-edit.json', '{"revision":2}\n', preimage
+            )
+            finalized_edit_id = str(finalized_edit['transaction_id'])
+            client.tool('transaction_finalize_file', {
+                'instance_id': owner, 'transaction_id': finalized_edit_id,
+                'workspace_id': workspace_id, 'path': 'finalize-edit.json',
+                'expected_pre_sha256': '0' * 64,
+                'expected_post_sha256': str(finalized_edit['sha256']),
+            }, expect_error=True)
+            evidence.check(
+                client.tool('transaction_list').get('retained_transaction_count') == 1,
+                'wrong finalization evidence releases nothing'
+            )
+            finalized = client.tool('transaction_finalize_file', {
+                'instance_id': owner, 'transaction_id': finalized_edit_id,
+                'workspace_id': workspace_id, 'path': 'finalize-edit.json',
+                'expected_pre_sha256': preimage,
+                'expected_post_sha256': str(finalized_edit['sha256']),
+            })
+            evidence.check(
+                finalized.get('current_file_state_validated') is True
+                and finalized.get('filesystem_mutation_performed') is False
+                and finalized_edit_path.read_text(encoding='utf-8') == '{"revision":2}\n',
+                'exact single-file edit finalizes without changing bytes'
+            )
+            finalized_create = tool_write(
+                client, workspace_id, 'finalize-create.json', '{"persisted":true}\n'
+            )
+            finalized_create_result = client.tool('transaction_finalize_file', {
+                'instance_id': owner,
+                'transaction_id': str(finalized_create['transaction_id']),
+                'workspace_id': workspace_id,
+                'path': 'finalize-create.json',
+                'expected_pre_sha256': 'absent',
+                'expected_post_sha256': str(finalized_create['sha256']),
+            })
+            evidence.check(
+                finalized_create_result.get('finalized_count') == 1
+                and (workspace / 'finalize-create.json').read_text(encoding='utf-8') == '{"persisted":true}\n',
+                'exact create-only receipt finalizes without creator capability'
+            )
             removed_file = workspace / 'accept-removal.txt'
             removed_file.write_bytes(b'manual-recovery-fixture\n')
             removed = client.tool('path_remove', {'workspace_id': workspace_id, 'path': 'accept-removal.txt'})

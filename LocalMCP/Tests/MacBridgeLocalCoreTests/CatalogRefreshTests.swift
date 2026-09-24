@@ -71,7 +71,7 @@ final class CatalogRefreshTests: XCTestCase {
         XCTAssertEqual(frames.count, 1)
         XCTAssertEqual(frames[0]["id"] as? Int, 9)
         let result = try XCTUnwrap(frames[0]["result"] as? JSONObject)
-        XCTAssertEqual((result["tools"] as? [JSONObject])?.count, 76)
+        XCTAssertEqual((result["tools"] as? [JSONObject])?.count, 77)
     }
 
     func testDesktopLocalDoesNotAdvertiseListChanged() throws {

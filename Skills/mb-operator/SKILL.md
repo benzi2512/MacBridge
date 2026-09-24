@@ -50,6 +50,23 @@ host-binding failure.
 8. Finish `work_task` only after its jobs stop and the acceptance checks pass or
    the result is explicitly marked failed with the remaining blocker.
 
+## Resolve file transactions
+
+After a successful write, verify the file and use the exact creator-only
+accept/restore arguments returned by that write while they are still available.
+Accept only the named transaction when the requested result is meant to remain;
+never bulk-accept unrelated or unknown undo.
+
+If a later owner turn has lost the creator capability, first list the retained
+transactions and re-read the exact file. `transaction_finalize_file` is a narrow
+recovery route for one unchanged regular-file write: supply the same instance,
+transaction, workspace, path, `pre_sha256` and `post_sha256` shown by
+`transaction_list`. It revalidates the full current file revision before
+releasing that one rollback. It cannot finalize a batch, move, copy, directory
+create or removal. It is destructive to rollback state and still requires the
+current user or scheduled prompt to authorize keeping the change. If the host
+blocks it, report the unresolved transaction; do not bypass or relabel the call.
+
 ## Repair MacBridge itself
 
 Normal Chat may use the same bounded file, Git, command, process, and developer

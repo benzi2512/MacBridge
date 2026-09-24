@@ -20,17 +20,17 @@ installer have been reviewed. A GitHub URL by itself is not execution authority.
 
 ## Fixed release identity
 
-This bootstrap installs the tested v0.4.3 Apple-silicon release:
+This bootstrap installs the tested v0.4.4 Apple-silicon release:
 
-- GitHub release: `v0.4.3`
-- asset: `MacBridge-0.4.3-build7-macos-arm64-ad-hoc.zip`
+- GitHub release: `v0.4.4`
+- asset: `MacBridge-0.4.4-build8-macos-arm64-ad-hoc.zip`
 - asset SHA-256:
-  `059e51314a1d200c134acddb15553ba4496c4a0a5ebdfe1a1754b9c21b3a2b16`
+  `3e74c337d79451ea5807a300aaee8267232102bba2e9e17c06a5d69c5424e060`
 - embedded core SHA-256:
-  `0497140678f19f721f0c9c94801ab414b282543cd7a6389f60d699b63c3d9ee8`
+  `38e4aeaad2608066ab712dd3dacbf20c71da79f8565667ea6048547e933dd13a`
 - embedded observer SHA-256:
-  `a2de06b770dc1c223c7475d55a00f18d01cb075be8829f6fd42d6159f0eb99ba`
-- app version/build: `0.4.3 (7)`
+  `d8bdb6d44d22c437aa430d0d10dc841b80448fcc655f681fced7c5e6bc151986`
+- app version/build: `0.4.4 (8)`
 - target: macOS 13 or newer on Apple silicon (`arm64`)
 
 Do not replace those immutable identifiers with `latest`, a fork, an issue
@@ -48,7 +48,7 @@ attachment or a similarly named asset.
 5. Run the installer in verification mode first:
 
    ```sh
-   sh scripts/codex-install-release-app.sh /absolute/path/to/MacBridge-0.4.3-build7-macos-arm64-ad-hoc.zip
+   sh scripts/codex-install-release-app.sh /absolute/path/to/MacBridge-0.4.4-build8-macos-arm64-ad-hoc.zip
    ```
 
 The verifier checks the pinned archive digest, app metadata, architecture,
@@ -60,7 +60,7 @@ For a fresh machine with no existing MacBridge installation:
 
 ```sh
 sh scripts/codex-install-release-app.sh \
-  /absolute/path/to/MacBridge-0.4.3-build7-macos-arm64-ad-hoc.zip \
+  /absolute/path/to/MacBridge-0.4.4-build8-macos-arm64-ad-hoc.zip \
   --install
 ```
 
@@ -133,12 +133,12 @@ extract browser credentials or invent a successful association.
 
 The setup is complete only when all checks pass independently:
 
-- installed app reports `0.4.3 (7)`;
+- installed app reports `0.4.4 (8)`;
 - app core and headless core both match the pinned core SHA-256;
 - `tunnel-client doctor` reports the intended profile healthy/ready;
 - the ChatGPT app is attached to that user's tunnel;
 - a new chat calls `bridge_capabilities` and returns the exact live build,
-  76-tool catalog and current binding epoch;
+  77-tool catalog and current binding epoch;
 - one bounded disposable-file read succeeds;
 - transaction/process inventories are empty after the test;
 - no owner credential, workspace registry or browser data was copied.

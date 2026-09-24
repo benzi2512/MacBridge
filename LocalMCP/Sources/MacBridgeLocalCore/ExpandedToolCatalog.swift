@@ -39,7 +39,7 @@ enum ExpandedToolCatalog {
         let git: JSONObject = ["workspace_id": ws, "cwd": path,
                                "maximum_output_bytes": integer(1024, 262144)]
         return [
-            spec("tool_catalog", "Optional tool lookup: defaults to 13 starter tools; query/category finds up to 5 matches across all tools. names returns exact schemas; set limit to the current catalog count for the full index; detail=schemas requests full schemas. Filters intersect. Does not execute, load host functions or grant permission.",
+            spec("tool_catalog", "Optional tool lookup: defaults to 14 starter tools; query/category finds up to 5 matches across all tools. names returns exact schemas; set limit to the current catalog count for the full index; detail=schemas requests full schemas. Filters intersect. Does not execute, load host functions or grant permission.",
                  ["detail": choice(["schemas", "index"]), "names": array(text(128), 128),
                   "query": text(512), "category": choice(ToolDiscovery.categories), "limit": integer(1, 128)], []),
             spec("developer_inspect", "Codex Developer read-only gateway. inspect_repo returns bounded project markers and Git context; review_diff returns status and diff. Kept separate from command actions so a normal Chat can inspect without a write-capable schema. No added permission, network access or embedded model.",
